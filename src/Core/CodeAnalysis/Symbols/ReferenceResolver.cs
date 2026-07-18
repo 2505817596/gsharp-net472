@@ -58,6 +58,12 @@ public sealed class ReferenceResolver : IDisposable
     private readonly ImmutableArray<string> missingTransitiveReferences;
     private readonly bool skipForwardedTypes;
 
+    /// <summary>
+    /// Gets a value indicating whether the explicit reference set targets the
+    /// desktop .NET Framework surface (identified by its real <c>mscorlib</c>).
+    /// </summary>
+    public bool IsDesktopFrameworkReferenceSet => skipForwardedTypes;
+
     // Process-wide registry of original on-disk paths for assemblies loaded
     // via LoadFromByteArray (whose Assembly.Location is empty). Populated by
     // FallbackMetadataAssemblyResolver and consulted by TryGetAssemblyPath /

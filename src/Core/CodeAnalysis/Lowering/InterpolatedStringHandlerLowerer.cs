@@ -6,6 +6,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 using GSharp.Core.CodeAnalysis.Binding;
 using GSharp.Core.CodeAnalysis.Symbols;
 using GSharp.Core.CodeAnalysis.Syntax;
@@ -51,7 +52,13 @@ internal sealed class InterpolatedStringHandlerLowerer : NestedFunctionBodyRewri
     private static readonly MethodInfo AppendFormattedFormat = FindAppendFormatted(secondParam: typeof(string));
     private static readonly MethodInfo AppendFormattedAlignFormat = FindAppendFormatted(secondParam: typeof(int), thirdParam: typeof(string));
 
+    private readonly bool useLegacyStringFormat;
     private int counter;
+
+    private InterpolatedStringHandlerLowerer(bool useLegacyStringFormat)
+    {
+        this.useLegacyStringFormat = useLegacyStringFormat;
+    }
 
     /// <summary>
     /// Produces a copy of <paramref name="program"/> in which every interpolated
@@ -59,10 +66,11 @@ internal sealed class InterpolatedStringHandlerLowerer : NestedFunctionBodyRewri
     /// instance unchanged when no interpolation is present.
     /// </summary>
     /// <param name="program">The bound program to lower.</param>
+    /// <param name="useLegacyStringFormat">Whether ordinary interpolations should use the .NET Framework-compatible <c>String.Format</c> lowering.</param>
     /// <returns>The lowered program.</returns>
-    public static BoundProgram Lower(BoundProgram program)
+    public static BoundProgram Lower(BoundProgram program, bool useLegacyStringFormat = false)
     {
-        var lowerer = new InterpolatedStringHandlerLowerer();
+        var lowerer = new InterpolatedStringHandlerLowerer(useLegacyStringFormat);
         var changed = false;
 
         var functions = ImmutableDictionary.CreateBuilder<FunctionSymbol, BoundBlockStatement>();
@@ -141,6 +149,11 @@ internal sealed class InterpolatedStringHandlerLowerer : NestedFunctionBodyRewri
             return this.RewriteUserHandler(node, literalLength, formattedCount);
         }
 
+        if (useLegacyStringFormat)
+        {
+            return this.RewriteLegacyStringFormat(node);
+        }
+
         var (parts, leading) = this.PrepareParts(node);
 
         var handlerLocal = new LocalVariableSymbol($"<>interp{this.counter++}", isReadOnly: false, HandlerTypeSymbol);
@@ -214,6 +227,80 @@ internal sealed class InterpolatedStringHandlerLowerer : NestedFunctionBodyRewri
             ImmutableArray<BoundExpression>.Empty);
 
         return new BoundBlockExpression(node.Syntax, statements.ToImmutable(), result);
+    }
+
+    // .NET Framework has no DefaultInterpolatedStringHandler. Lower ordinary
+    // interpolations to the same String.Format(object[]) shape used by the
+    // binder's formattable-string support, preserving alignment and format
+    // clauses while avoiding a reference to the compiler host's CoreLib.
+    private BoundExpression RewriteLegacyStringFormat(BoundInterpolatedStringExpression node)
+    {
+        var (parts, leading) = this.PrepareParts(node);
+        var format = new StringBuilder();
+        var values = ImmutableArray.CreateBuilder<BoundExpression>();
+        foreach (var part in parts)
+        {
+            if (part.IsLiteral)
+            {
+                AppendEscapedLiteral(format, part.Literal);
+                continue;
+            }
+
+            var index = values.Count;
+            values.Add(part.Value);
+            format.Append('{').Append(index);
+            if (part.Alignment.HasValue)
+            {
+                format.Append(',').Append(part.Alignment.Value);
+            }
+
+            if (part.Format != null)
+            {
+                format.Append(':').Append(part.Format);
+            }
+
+            format.Append('}');
+        }
+
+        var elements = ImmutableArray.CreateBuilder<BoundExpression>(values.Count);
+        foreach (var value in values)
+        {
+            elements.Add(value.Type == TypeSymbol.Object
+                ? value
+                : new BoundConversionExpression(null, TypeSymbol.Object, value));
+        }
+
+        var args = new BoundArrayCreationExpression(
+            null,
+            ArrayTypeSymbol.Get(TypeSymbol.Object, elements.Count),
+            elements.ToImmutable());
+        var formatMethod = typeof(string).GetMethod("Format", new[] { typeof(string), typeof(object[]) });
+        var function = new ImportedFunctionSymbol(
+            formatMethod.Name,
+            new ImportedClassSymbol(typeof(string), declaration: null),
+            formatMethod,
+            declaration: null);
+        BoundExpression result = new BoundImportedCallExpression(
+            node.Syntax,
+            function,
+            ImmutableArray.Create<BoundExpression>(new BoundLiteralExpression(null, format.ToString()), args));
+
+        return leading.IsDefaultOrEmpty
+            ? result
+            : new BoundBlockExpression(node.Syntax, leading, result);
+    }
+
+    private static void AppendEscapedLiteral(StringBuilder builder, string text)
+    {
+        foreach (var c in text ?? string.Empty)
+        {
+            if (c is '{' or '}')
+            {
+                builder.Append(c);
+            }
+
+            builder.Append(c);
+        }
     }
 
     /// <summary>

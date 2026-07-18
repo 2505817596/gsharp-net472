@@ -383,7 +383,9 @@ public class Compilation
         // DefaultInterpolatedStringHandler pattern on the emit path only, before
         // the async/iterator rewriters and IL emission. The interpreter path is
         // untouched and renders the interpolation node directly.
-        program = Lowering.InterpolatedStringHandlerLowerer.Lower(program);
+        program = Lowering.InterpolatedStringHandlerLowerer.Lower(
+            program,
+            useLegacyStringFormat: References?.IsDesktopFrameworkReferenceSet == true);
 
         // Issue #452: spill side-effecting sub-expressions that sit in
         // emit-pipeline contexts which historically re-emitted them more
@@ -504,7 +506,9 @@ public class Compilation
         // DefaultInterpolatedStringHandler pattern on the emit path only, before
         // the async/iterator rewriters and IL emission. The interpreter path is
         // untouched and renders the interpolation node directly.
-        program = Lowering.InterpolatedStringHandlerLowerer.Lower(program);
+        program = Lowering.InterpolatedStringHandlerLowerer.Lower(
+            program,
+            useLegacyStringFormat: References?.IsDesktopFrameworkReferenceSet == true);
 
         // Issue #452: spill side-effecting sub-expressions that sit in
         // emit-pipeline contexts which historically re-emitted them more
