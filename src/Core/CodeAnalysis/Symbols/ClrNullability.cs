@@ -422,6 +422,20 @@ public static class ClrNullability
 
         var flags = ReadNullableFlags(declaration, enclosingMember);
 
+        // .NET Framework reference assemblies predate C# nullable-reference
+        // metadata. Their members consequently carry neither NullableAttribute
+        // nor NullableContextAttribute, but they were authored under the
+        // traditional non-null-by-default contract. Treating every such BCL
+        // result as `T?` makes ordinary net472 code unnecessarily require `!!`
+        // (for example, Stopwatch.StartNew()!!.ElapsedMilliseconds). Keep the
+        // existing nullable-by-default interpretation for unannotated modern
+        // and third-party assemblies; this compatibility rule is restricted to
+        // assemblies built against the desktop mscorlib.
+        if (flags.IsDefaultOrEmpty && IsDesktopFrameworkAssembly(enclosingMember))
+        {
+            return baseSymbol;
+        }
+
         // Issue #1354: the top-level reference position is non-null only when the
         // flags array explicitly marks it `1`; empty/oblivious/annotated → nullable.
         bool topNonNull = IsPositionNonNull(flags, 0);
@@ -436,6 +450,34 @@ public static class ClrNullability
         }
 
         return result;
+    }
+
+    private static bool IsDesktopFrameworkAssembly(MemberInfo enclosingMember)
+    {
+        var assembly = enclosingMember?.DeclaringType?.Assembly
+            ?? enclosingMember?.Module?.Assembly;
+        if (assembly == null)
+        {
+            return false;
+        }
+
+        if (string.Equals(assembly.GetName().Name, "mscorlib", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        try
+        {
+            return assembly.GetReferencedAssemblies().Any(reference =>
+                string.Equals(reference.Name, "mscorlib", StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            // MetadataLoadContext may be unable to inspect a malformed or
+            // incomplete assembly. Preserve the ordinary nullable-default in
+            // that case rather than guessing the target framework.
+            return false;
+        }
     }
 
     private static bool TryGetBoolAttributeValue(ParameterInfo parameter, string attributeFullName, out bool value)

@@ -136,19 +136,16 @@ public class SdkLayoutTests
     }
 
     [Fact]
-    public void Core_Targets_Prunes_Auto_Channels_Runtime_Assets_Without_Go_Extensions_Import()
+    public void Core_Targets_Adds_Channels_Runtime_Assets_For_NetFramework()
     {
         var path = Path.Combine(RepoRoot.SdkSourceDir, "build", "Gsharp.NET.Core.Sdk.targets");
         var text = File.ReadAllText(path);
 
-        // Restore has no source-content input, so the SDK restores Channels
-        // for netfx projects but removes its runtime assets from ordinary
-        // applications that have not opted into the Go extension surface.
-        Assert.Contains("_GsharpGoExtensionsSource", text, System.StringComparison.Ordinal);
-        Assert.Contains("import Gsharp.Extensions.Go", text, System.StringComparison.Ordinal);
+        // gsc records the resolved reference closure in emitted metadata, so
+        // Channels must remain copy-local whenever the SDK adds the package.
+        Assert.Contains("_GsharpAddChannelsPackage", text, System.StringComparison.Ordinal);
         Assert.Contains("_GsharpUserChannelsReference", text, System.StringComparison.Ordinal);
-        Assert.Contains("_GsharpPruneUnusedChannelsRuntimeAssets", text, System.StringComparison.Ordinal);
-        Assert.Contains("ReferenceCopyLocalPaths Remove", text, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("_GsharpPruneUnusedChannelsRuntimeAssets", text, System.StringComparison.Ordinal);
         Assert.Contains("@(PackageReference)", text, System.StringComparison.Ordinal);
     }
 

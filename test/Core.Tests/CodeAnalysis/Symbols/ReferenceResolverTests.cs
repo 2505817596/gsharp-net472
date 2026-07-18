@@ -3,10 +3,15 @@
 // </copyright>
 
 using System;
+using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using GSharp.Core.CodeAnalysis.Binding;
+using GSharp.Core.CodeAnalysis.Compilation;
 using GSharp.Core.CodeAnalysis.Symbols;
+using GSharp.Core.CodeAnalysis.Syntax;
+using GSharp.Core.CodeAnalysis.Text;
 using Xunit;
 
 namespace GSharp.Core.Tests.CodeAnalysis.Symbols;
@@ -333,6 +338,9 @@ public class ReferenceResolverTests
         var references = Directory
             .EnumerateFiles(frameworkRoot, "*.dll", SearchOption.AllDirectories)
             .Where(IsManagedAssembly)
+            // Match an SDK build, which also supplies Gsharp.Extensions and
+            // therefore activates the resolver's non-BCL fallback closure.
+            .Append(typeof(ReferenceResolverTests).Assembly.Location)
             .ToArray();
         Assert.Contains(mscorlib, references, StringComparer.OrdinalIgnoreCase);
         Assert.Contains(systemRuntime, references, StringComparer.OrdinalIgnoreCase);
@@ -341,6 +349,59 @@ public class ReferenceResolverTests
 
         Assert.True(resolver.TryResolveType("System.String", out var stringType));
         Assert.Equal("mscorlib", stringType.Assembly.GetName().Name);
+
+        // The SDK consumes not only type names but reflected members from this
+        // resolver. Console.WriteLine and Stopwatch.ElapsedMilliseconds match
+        // the ordinary imported-member calls a net472 G# application makes.
+        Assert.True(resolver.TryResolveType("System.Console", out var consoleType));
+        Assert.Contains(consoleType.GetMethods(), method => method.Name == "WriteLine");
+        var writeLineResolution = OverloadResolution.Resolve(
+            consoleType.GetMethods().Where(method => method.IsStatic && method.Name == "WriteLine"),
+            new[] { typeof(int) });
+        Assert.Equal(OverloadResolution.ResolutionOutcome.Resolved, writeLineResolution.Outcome);
+        var importedConsole = new ImportedClassSymbol(consoleType, declaration: null, references: resolver);
+        Assert.True(importedConsole.TryLookupFunction(
+            "WriteLine",
+            callExpression: null,
+            ImmutableArray.Create<BoundExpression>(new BoundLiteralExpression(null, 1, TypeSymbol.Int32)),
+            out _));
+
+        Assert.True(resolver.TryResolveType("System.Diagnostics.Stopwatch", out var stopwatchType));
+        Assert.NotNull(stopwatchType.GetProperty("ElapsedMilliseconds"));
+        Assert.NotNull(ClrTypeUtilities.SafeGetPropertyIncludingInterfaces(
+            stopwatchType,
+            "ElapsedMilliseconds",
+            BindingFlags.Public | BindingFlags.Instance));
+        var importedStopwatch = new ImportedClassSymbol(stopwatchType, declaration: null, references: resolver);
+        Assert.True(importedStopwatch.TryLookupFunction(
+            "StartNew",
+            callExpression: null,
+            ImmutableArray<BoundExpression>.Empty,
+            out var startNew));
+        Assert.Equal("System.Diagnostics.Stopwatch", startNew.Type.ClrType?.FullName);
+        Assert.IsNotType<NullableTypeSymbol>(startNew.Type);
+
+        var source = """
+            package p
+            import System
+            import System.Diagnostics
+            func main() {
+                var st = Stopwatch.StartNew()
+                Console.WriteLine(1)
+                Console.WriteLine(st.ElapsedMilliseconds)
+            }
+            """;
+        var tree = SyntaxTree.Parse(SourceText.From(source));
+        var compilation = new Compilation(resolver, tree);
+        var mainBody = compilation.BoundProgram.Functions
+            .Single(pair => pair.Key.Name == "main")
+            .Value;
+        var stopwatchVariable = Assert.IsType<BoundVariableDeclaration>(mainBody.Statements[0]).Variable;
+        Assert.Equal("System.Diagnostics.Stopwatch", stopwatchVariable.Type.ClrType?.FullName);
+        using var output = new MemoryStream();
+        var result = compilation.Emit(output);
+        Assert.DoesNotContain(result.Diagnostics, diagnostic =>
+            diagnostic.Id is "GS0158" or "GS0159");
     }
 
     private static bool IsManagedAssembly(string path)
