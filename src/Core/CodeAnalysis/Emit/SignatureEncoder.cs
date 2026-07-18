@@ -670,6 +670,24 @@ internal sealed class SignatureEncoder
 
     internal void EncodeClrType(SignatureTypeEncoder encoder, Type type)
     {
+        // Compiler helpers such as the Go channel lowering are reflected from
+        // the gsc host runtime. Before their signatures are written, project
+        // every host type into the compilation's reference context so a
+        // net472 output names mscorlib/System.Threading.Channels rather than
+        // the compiler host's System.Private.CoreLib.
+        // Keep compound shapes intact here. Their generic arguments may be
+        // host generic parameters (`!0` / `!!0`), which cannot be used to
+        // construct a MetadataLoadContext type. The branches below project
+        // only their open definitions and then encode each argument directly.
+        if (type is not null
+            && !type.HasElementType
+            && !type.IsConstructedGenericType
+            && !type.IsGenericTypeDefinition
+            && !type.IsGenericParameter)
+        {
+            type = this.MapToReferenceClrType(type);
+        }
+
         // ADR-0060 §13 / migration: same as EncodeTypeSymbol — a CLR `T&` (Type.IsByRef)
         // cannot be encoded into a SignatureTypeEncoder slot. Callers must arrange the
         // byref form via the parent encoder. Detect and fail loudly so the previously
@@ -783,7 +801,7 @@ internal sealed class SignatureEncoder
 
                 if (type.IsConstructedGenericType)
                 {
-                    var openDef = type.GetGenericTypeDefinition();
+                    var openDef = this.MapToReferenceClrType(type.GetGenericTypeDefinition());
                     var typeArgs = type.GetGenericArguments();
                     var genericInst = encoder.GenericInstantiation(
                         this.outer.memberRefs.GetTypeReference(openDef),
@@ -804,6 +822,7 @@ internal sealed class SignatureEncoder
                 // GenericInstantiation with its own type parameters as arguments.
                 if (type.IsGenericTypeDefinition)
                 {
+                    type = this.MapToReferenceClrType(type);
                     var typeParams = type.GetGenericArguments();
                     var genericInst = encoder.GenericInstantiation(
                         this.outer.memberRefs.GetTypeReference(type),
@@ -1131,9 +1150,19 @@ internal sealed class SignatureEncoder
             {
                 var hostArgs = hostType.GetGenericArguments();
                 var refArgs = new Type[hostArgs.Length];
+                var refParameters = openRef.GetGenericArguments();
                 for (var i = 0; i < hostArgs.Length; i++)
                 {
-                    refArgs[i] = this.MapToReferenceClrType(hostArgs[i]) ?? hostArgs[i];
+                    // A type-owned parameter such as the TWrite in
+                    // ChannelWriter<TWrite> cannot be passed from the host
+                    // runtime into an MLC generic definition. Use the target
+                    // definition's same-position parameter instead; the
+                    // signature encoder writes it as !N, preserving the
+                    // original generic-owner semantics.
+                    refArgs[i] = hostArgs[i].IsGenericParameter
+                        && hostArgs[i].DeclaringMethod == null
+                        ? refParameters[i]
+                        : this.MapToReferenceClrType(hostArgs[i]) ?? hostArgs[i];
                 }
 
                 return openRef.MakeGenericType(refArgs);

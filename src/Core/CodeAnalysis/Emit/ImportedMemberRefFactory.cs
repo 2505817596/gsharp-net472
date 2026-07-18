@@ -473,6 +473,26 @@ internal sealed class ImportedMemberRefFactory
 
     internal TypeReferenceHandle GetTypeReference(Type type)
     {
+        // Imported helper members (notably Go-channel lowering) are reflected
+        // from gsc's host runtime. TypeRefs must always name the active target
+        // framework's assembly identity, otherwise a net472 output acquires a
+        // System.Private.CoreLib 10 reference merely by calling Task or
+        // CancellationToken APIs. Compound/generic-parameter shapes are
+        // encoded by SignatureEncoder; only map a standalone definition here.
+        if (type is not null
+            && !type.IsGenericParameter
+            && !type.HasElementType
+            && !type.IsConstructedGenericType)
+        {
+            if (this.emitCtx.References.TryResolveType(
+                type.FullName ?? type.Name,
+                requireExternalVisibility: false,
+                out var mapped))
+            {
+                type = mapped;
+            }
+        }
+
         if (this.cache.TypeRefs.TryGetValue(type, out var existing))
         {
             return existing;

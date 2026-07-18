@@ -45,6 +45,9 @@ public class BuildTask : Microsoft.Build.Utilities.Task, ICancelableTask
     [Required]
     public string OutputName { get; set; }
 
+    /// <summary>Gets or sets the output extension selected by MSBuild (for example, <c>.dll</c> or <c>.exe</c>).</summary>
+    public string OutputExtension { get; set; }
+
     /// <summary>Gets or sets the temporary output (obj) path.</summary>
     [Required]
     public string TempOutputPath { get; set; }
@@ -124,9 +127,15 @@ public class BuildTask : Microsoft.Build.Utilities.Task, ICancelableTask
             return false;
         }
 
+        var outputExtension = string.IsNullOrEmpty(this.OutputExtension) ? ".dll" : this.OutputExtension;
+        if (!outputExtension.StartsWith(".", StringComparison.Ordinal))
+        {
+            outputExtension = "." + outputExtension;
+        }
+
         var args = new List<string>
         {
-            QuoteIfNeeded($"/out:{Path.Combine(this.OutputPath, this.OutputName)}.dll"),
+            QuoteIfNeeded($"/out:{Path.Combine(this.OutputPath, this.OutputName)}{outputExtension}"),
         };
         if (!string.IsNullOrEmpty(this.OutputName))
         {

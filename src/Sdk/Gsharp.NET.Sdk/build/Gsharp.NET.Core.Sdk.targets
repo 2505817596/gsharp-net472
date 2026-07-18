@@ -12,6 +12,52 @@
     <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);_GsharpGetRefAssemblyForPack</TargetsForTfmSpecificContentInPackage>
   </PropertyGroup>
 
+  <!-- The Go channel surface lowers to System.Threading.Channels. Desktop
+       .NET Framework does not provide it inbox. NuGet restore cannot make its
+       incremental decision from the content of a source file, so restore the
+       dependency for all netfx G# projects and prune its runtime assets later
+       unless a source file opts in with `import Gsharp.Extensions.Go`. This
+       means an application can add that import and build immediately, while an
+       application that does not opt in has no Channels DLLs in its output. -->
+  <Target Name="_GsharpAddChannelsPackage"
+          BeforeTargets="CollectPackageReferences;ResolvePackageAssets"
+          Condition=" '$(TargetFrameworkIdentifier)' == '.NETFramework' or
+                      $([System.String]::Copy('$(TargetFramework)').StartsWith('net4')) or
+                      $([System.String]::Copy('$(TargetFrameworks)').Contains('net4')) ">
+    <ItemGroup>
+      <_GsharpUserChannelsReference Include="@(PackageReference)"
+                                           Condition=" '%(PackageReference.Identity)' == 'System.Threading.Channels' and
+                                                       '%(PackageReference.GsharpAutoChannels)' != 'true' " />
+      <PackageReference Include="System.Threading.Channels"
+                        Version="8.0.0"
+                        Condition=" '@(_GsharpUserChannelsReference)' == '' ">
+        <GsharpAutoChannels>true</GsharpAutoChannels>
+      </PackageReference>
+    </ItemGroup>
+  </Target>
+
+  <Target Name="_GsharpPruneUnusedChannelsRuntimeAssets"
+          AfterTargets="ResolveAssemblyReferences"
+          BeforeTargets="CopyFilesMarkedCopyLocal"
+          Condition=" '$(TargetFrameworkIdentifier)' == '.NETFramework' ">
+    <ItemGroup>
+      <_GsharpGoExtensionsSource Include="@(Compile)"
+                                  Condition=" '%(Compile.Extension)' == '.gs' and
+                                              Exists('%(Compile.FullPath)') and
+                                              $([System.IO.File]::ReadAllText('%(Compile.FullPath)').Contains('import Gsharp.Extensions.Go')) " />
+      <_GsharpUserChannelsReference Include="@(PackageReference)"
+                                           Condition=" '%(PackageReference.Identity)' == 'System.Threading.Channels' and
+                                                       '%(PackageReference.GsharpAutoChannels)' != 'true' " />
+      <_GsharpUnusedChannelsRuntimeAsset Include="@(ReferenceCopyLocalPaths)"
+                                            Condition=" '@(_GsharpGoExtensionsSource)' == '' and
+                                                        '@(_GsharpUserChannelsReference)' == '' and
+                                                        ('%(ReferenceCopyLocalPaths.Filename)' == 'System.Threading.Channels' or
+                                                         '%(ReferenceCopyLocalPaths.Filename)' == 'System.Threading.Tasks.Extensions' or
+                                                         '%(ReferenceCopyLocalPaths.Filename)' == 'System.Runtime.CompilerServices.Unsafe') " />
+      <ReferenceCopyLocalPaths Remove="@(_GsharpUnusedChannelsRuntimeAsset)" />
+    </ItemGroup>
+  </Target>
+
   <!-- Phase 7.7b / Issue #855: set DocumentationFile here (in targets) where
        IntermediateOutputPath and TargetName are already resolved by the .NET SDK.
        Setting it in Sdk.props caused both properties to be empty, producing a
@@ -284,6 +330,7 @@
         GsharpCompilerFullPath="$(GsharpCompilerFullPath)"
         OutputPath="$(IntermediateOutputPath)"
         OutputName="$(TargetName)"
+        OutputExtension="$(TargetExt)"
         TempOutputPath="$(IntermediateOutputPath)"
         TargetFramework="$(TargetFramework)"
         BasePath="$(MSBuildProjectDirectory)"

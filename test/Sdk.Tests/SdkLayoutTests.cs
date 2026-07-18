@@ -104,6 +104,7 @@ public class SdkLayoutTests
         Assert.Equal("@(ReferencePathWithRefAssemblies)", attrs["References"]);
         Assert.Equal("$(OutputType)", attrs["OutputType"]);
         Assert.Equal("$(TargetFramework)", attrs["TargetFramework"]);
+        Assert.Equal("$(TargetExt)", attrs["OutputExtension"]);
 
         // Reference-assembly emit must be forwarded so MSBuild's
         // ProduceReferenceAssembly pipeline (which sets @(IntermediateRefAssembly)
@@ -132,6 +133,23 @@ public class SdkLayoutTests
         Assert.Contains("netstandard2.0", text, System.StringComparison.Ordinal);
         Assert.Contains("Microsoft.Build.Framework", text, System.StringComparison.Ordinal);
         Assert.Contains("Microsoft.Build.Utilities.Core", text, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Core_Targets_Prunes_Auto_Channels_Runtime_Assets_Without_Go_Extensions_Import()
+    {
+        var path = Path.Combine(RepoRoot.SdkSourceDir, "build", "Gsharp.NET.Core.Sdk.targets");
+        var text = File.ReadAllText(path);
+
+        // Restore has no source-content input, so the SDK restores Channels
+        // for netfx projects but removes its runtime assets from ordinary
+        // applications that have not opted into the Go extension surface.
+        Assert.Contains("_GsharpGoExtensionsSource", text, System.StringComparison.Ordinal);
+        Assert.Contains("import Gsharp.Extensions.Go", text, System.StringComparison.Ordinal);
+        Assert.Contains("_GsharpUserChannelsReference", text, System.StringComparison.Ordinal);
+        Assert.Contains("_GsharpPruneUnusedChannelsRuntimeAssets", text, System.StringComparison.Ordinal);
+        Assert.Contains("ReferenceCopyLocalPaths Remove", text, System.StringComparison.Ordinal);
+        Assert.Contains("@(PackageReference)", text, System.StringComparison.Ordinal);
     }
 
     [Fact]

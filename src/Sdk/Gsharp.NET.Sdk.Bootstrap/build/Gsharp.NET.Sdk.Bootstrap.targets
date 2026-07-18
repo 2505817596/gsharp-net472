@@ -115,6 +115,7 @@
         GsharpCompilerFullPath="$(GsharpCompilerFullPath)"
         OutputPath="$(IntermediateOutputPath)"
         OutputName="$(TargetName)"
+        OutputExtension="$(TargetExt)"
         TempOutputPath="$(IntermediateOutputPath)"
         TargetFramework="$(TargetFramework)"
         BasePath="$(MSBuildProjectDirectory)"

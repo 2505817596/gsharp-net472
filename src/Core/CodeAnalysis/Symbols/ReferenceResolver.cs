@@ -56,6 +56,7 @@ public sealed class ReferenceResolver : IDisposable
     private readonly ImmutableArray<Assembly> assemblies;
     private readonly MetadataLoadContext metadataContext;
     private readonly ImmutableArray<string> missingTransitiveReferences;
+    private readonly bool skipForwardedTypes;
 
     // Process-wide registry of original on-disk paths for assemblies loaded
     // via LoadFromByteArray (whose Assembly.Location is empty). Populated by
@@ -169,6 +170,10 @@ public sealed class ReferenceResolver : IDisposable
         this.assemblies = assemblies;
         this.metadataContext = metadataContext;
         this.missingTransitiveReferences = missingTransitiveReferences;
+        this.skipForwardedTypes = assemblies.Any(assembly => string.Equals(
+            assembly.GetName().Name,
+            "mscorlib",
+            StringComparison.OrdinalIgnoreCase));
         this.typeNameIndex = new Lazy<Dictionary<string, Type>>(
             this.BuildTypeNameIndex,
             System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
@@ -398,8 +403,25 @@ public sealed class ReferenceResolver : IDisposable
 
         var builder = ImmutableArray.CreateBuilder<Assembly>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hasMscorlib = paths.Any(p => string.Equals(
+            Path.GetFileNameWithoutExtension(p),
+            "mscorlib",
+            StringComparison.OrdinalIgnoreCase));
         foreach (var path in paths)
         {
+            // The .NET Framework reference-assembly set contains facade
+            // assemblies that forward every public type into mscorlib and the
+            // desktop framework assemblies. They remain in resolverPaths so
+            // MetadataLoadContext can honor an assembly reference to them, but
+            // indexing their exported types calls into the forwarder graph and
+            // recursively resolves System.Runtime <-> mscorlib. Do not make
+            // them primary enumerable references when the real desktop core
+            // library is present.
+            if (hasMscorlib && IsNetFrameworkFacadePath(path))
+            {
+                continue;
+            }
+
             try
             {
                 var asm = resolver.LoadFromPath(mlc, path);
@@ -773,7 +795,7 @@ public sealed class ReferenceResolver : IDisposable
         {
             identities.Add(asm.GetName().FullName);
             var names = ImmutableArray.CreateBuilder<string>();
-            foreach (var t in EnumerateDefinedAndForwardedTypes(asm))
+            foreach (var t in EnumerateDefinedAndForwardedTypes(asm, this.skipForwardedTypes))
             {
                 if (t.FullName is { } fullName)
                 {
@@ -979,7 +1001,7 @@ public sealed class ReferenceResolver : IDisposable
 
         foreach (var asm in assemblies)
         {
-            foreach (var t in EnumerateDefinedAndForwardedTypes(asm))
+            foreach (var t in EnumerateDefinedAndForwardedTypes(asm, this.skipForwardedTypes))
             {
                 AddToTypeNameIndex(index, t);
             }
@@ -996,7 +1018,7 @@ public sealed class ReferenceResolver : IDisposable
     // the eager BuildTypeNameIndex and the cache-export ExportMetadataIndex
     // consume it so the warm and cold name sets (and their first-writer-wins
     // precedence) are guaranteed to match.
-    private static IEnumerable<Type> EnumerateDefinedAndForwardedTypes(Assembly asm)
+    private static IEnumerable<Type> EnumerateDefinedAndForwardedTypes(Assembly asm, bool skipForwardedTypes)
     {
         Type[] definedTypes;
         try
@@ -1022,6 +1044,16 @@ public sealed class ReferenceResolver : IDisposable
             {
                 yield return t;
             }
+        }
+
+        // Desktop framework reference packs include the declaring assemblies
+        // alongside their facade forwarders. MetadataLoadContext can recurse
+        // indefinitely while enumerating that forwarding graph (notably once a
+        // netstandard2.0 library is also referenced), while every useful type
+        // is already represented by a definition in the complete closure.
+        if (skipForwardedTypes)
+        {
+            yield break;
         }
 
         Type[] forwardedTypes;
@@ -1110,17 +1142,30 @@ public sealed class ReferenceResolver : IDisposable
         var fileNames = paths.Select(Path.GetFileNameWithoutExtension)
                              .ToArray();
 
-        if (fileNames.Any(n => string.Equals(n, "System.Runtime", StringComparison.OrdinalIgnoreCase)))
-        {
-            return "System.Runtime";
-        }
-
         if (fileNames.Any(n => string.Equals(n, "mscorlib", StringComparison.OrdinalIgnoreCase)))
         {
             return "mscorlib";
         }
 
+        // .NET Framework 4.7.2 ships System.Runtime only as a facade.  Making
+        // that facade the MetadataLoadContext core assembly makes primitive
+        // type resolution chase its forwards back into mscorlib indefinitely.
+        // A real mscorlib must therefore win whenever both are present. Modern
+        // .NET reference packs do not include mscorlib, so System.Runtime
+        // remains their core assembly.
+        if (fileNames.Any(n => string.Equals(n, "System.Runtime", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "System.Runtime";
+        }
+
         return null;
+    }
+
+    private static bool IsNetFrameworkFacadePath(string path)
+    {
+        var directory = Path.GetDirectoryName(path);
+        return !string.IsNullOrEmpty(directory)
+            && string.Equals(Path.GetFileName(directory), "Facades", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

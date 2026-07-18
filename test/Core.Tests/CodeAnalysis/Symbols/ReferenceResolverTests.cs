@@ -3,7 +3,9 @@
 // </copyright>
 
 using System;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using GSharp.Core.CodeAnalysis.Symbols;
 using Xunit;
 
@@ -306,6 +308,56 @@ public class ReferenceResolverTests
         // cross-context identity mismatches the resolver exists to prevent).
         Assert.NotSame(typeof(string), stringType);
         Assert.NotSame(typeof(System.Console), consoleType);
+    }
+
+    [Fact]
+    public void WithReferences_NetFrameworkFacadeSet_UsesMscorlibAsCoreAssembly()
+    {
+        // A .NET Framework SDK reference set contains mscorlib plus a
+        // System.Runtime facade. The facade forwards primitive types to
+        // mscorlib, so selecting it as MetadataLoadContext's core assembly
+        // recursively resolves the forwarders until the compiler overflows
+        // the stack. This is the exact shape forwarded by an SDK net472 build.
+        const string frameworkRoot = @"C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2";
+        var mscorlib = Path.Combine(frameworkRoot, "mscorlib.dll");
+        var systemRuntime = Path.Combine(frameworkRoot, "Facades", "System.Runtime.dll");
+
+        if (!File.Exists(mscorlib) || !File.Exists(systemRuntime))
+        {
+            return;
+        }
+
+        // Mirror ResolveAssemblyReference's net472 closure: the desktop
+        // assemblies plus every facade. A two-file test misses forwarding
+        // cycles introduced by the other compatibility facades.
+        var references = Directory
+            .EnumerateFiles(frameworkRoot, "*.dll", SearchOption.AllDirectories)
+            .Where(IsManagedAssembly)
+            .ToArray();
+        Assert.Contains(mscorlib, references, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains(systemRuntime, references, StringComparer.OrdinalIgnoreCase);
+
+        using var resolver = ReferenceResolver.WithReferences(references);
+
+        Assert.True(resolver.TryResolveType("System.String", out var stringType));
+        Assert.Equal("mscorlib", stringType.Assembly.GetName().Name);
+    }
+
+    private static bool IsManagedAssembly(string path)
+    {
+        try
+        {
+            _ = AssemblyName.GetAssemblyName(path);
+            return true;
+        }
+        catch (BadImageFormatException)
+        {
+            return false;
+        }
+        catch (FileLoadException)
+        {
+            return false;
+        }
     }
 
     private static ReferenceResolver BuildMetadataLoadContextResolver()
