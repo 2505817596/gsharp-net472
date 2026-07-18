@@ -6,6 +6,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Runtime.CompilerServices;
@@ -61,6 +62,8 @@ Console.WriteLine(t.Result)
             Assert.NotNull(moveNext);
             var setStateMachine = smType.GetMethod("SetStateMachine", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             Assert.NotNull(setStateMachine);
+            var setStateMachineIl = setStateMachine!.GetMethodBody()!.GetILAsByteArray();
+            Assert.Contains((byte)OpCodes.Call.Value, setStateMachineIl);
 
             // Roslyn convention: SM types are nested-private inside declaring type.
             Assert.True(smType.IsNested, "SM type should be nested");

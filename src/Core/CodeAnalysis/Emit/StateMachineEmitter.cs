@@ -1418,14 +1418,31 @@ internal sealed class StateMachineEmitter
 
     /// <summary>
     /// Emits the <c>SetStateMachine(IAsyncStateMachine)</c> method for an
-    /// async state machine. For struct state machines, this is a no-op body.
+    /// async state machine. The state machine forwards the boxed state machine
+    /// instance to its async method builder, as required by the desktop .NET
+    /// Framework builders when an await first suspends.
     /// </summary>
     public void EmitStateMachineSetStateMachine(AsyncStateMachinePlan plan)
     {
         int bodyOffset = -1;
         if (!this.emitCtx.MetadataOnly)
         {
+            var smStruct = plan.StateMachine.MaterializeAsStructSymbol();
+            var builderInfo = plan.StateMachine.BuilderInfo;
+            var builderFieldHandle = this.resolveFieldToken(smStruct, plan.FieldMap.BuilderField);
+            var setStateMachineRef = this.getMethodEntityHandleForContainingType(
+                builderInfo.SetStateMachineMethod,
+                plan.FieldMap.BuilderField.Type);
+
             var il = new InstructionEncoder(new BlobBuilder());
+
+            // this.<>t__builder.SetStateMachine(stateMachine)
+            il.LoadArgument(0);
+            il.OpCode(ILOpCode.Ldflda);
+            il.Token(builderFieldHandle);
+            il.LoadArgument(1);
+            il.OpCode(ILOpCode.Call);
+            il.Token(setStateMachineRef);
             il.OpCode(ILOpCode.Ret);
             bodyOffset = this.emitCtx.MethodBodyStream.AddMethodBody(il, maxStack: MaxStackTracker.ComputeMaxStack(il));
         }
