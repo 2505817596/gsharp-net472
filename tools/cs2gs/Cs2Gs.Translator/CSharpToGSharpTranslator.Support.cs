@@ -40,7 +40,13 @@ public sealed partial class CSharpToGSharpTranslator
 
             public HashSet<string> FieldsAsPrimaryParameters { get; init; } = new HashSet<string>();
 
-            public HashSet<string> PropertiesAsPrimaryParameters { get; init; } = new HashSet<string>();
+            /// <summary>
+            /// Gets the exact property symbols consumed by primary-constructor
+            /// lifting. Symbol identity is required because ordinary and explicit-
+            /// interface properties may legally share a simple name.
+            /// </summary>
+            public HashSet<IPropertySymbol> PropertiesAsPrimaryParameters { get; init; } =
+                new HashSet<IPropertySymbol>(SymbolEqualityComparer.Default);
 
             /// <summary>
             /// Gets the auto-properties whose inline initializer is NOT a
@@ -54,17 +60,18 @@ public sealed partial class CSharpToGSharpTranslator
             /// semantics), while the primary constructor's parameter list
             /// stays limited to constant-default/required members.
             /// </summary>
-            public HashSet<string> PropertiesAsBodyFields { get; init; } = new HashSet<string>();
+            public HashSet<IPropertySymbol> PropertiesAsBodyFields { get; init; } =
+                new HashSet<IPropertySymbol>(SymbolEqualityComparer.Default);
 
             public Dictionary<string, GExpression> FieldInitializers { get; init; } =
                 new Dictionary<string, GExpression>();
 
             /// <summary>
             /// Gets the initializer expressions for <see cref="PropertiesAsBodyFields"/>
-            /// (issue #2281), keyed by property name.
+            /// (issue #2281), keyed by exact property symbol.
             /// </summary>
-            public Dictionary<string, GExpression> BodyFieldInitializers { get; init; } =
-                new Dictionary<string, GExpression>();
+            public Dictionary<IPropertySymbol, GExpression> BodyFieldInitializers { get; init; } =
+                new Dictionary<IPropertySymbol, GExpression>(SymbolEqualityComparer.Default);
 
             /// <summary>
             /// Gets the constructor-body assignments that could not be hoisted to a
@@ -75,6 +82,46 @@ public sealed partial class CSharpToGSharpTranslator
             /// </summary>
             public IReadOnlyList<GStatement> ResidualInitStatements { get; init; } =
                 new List<GStatement>();
+        }
+
+        private sealed class StructConstructorPlan
+        {
+            public StructConstructorPlan(
+                IMethodSymbol constructor,
+                IReadOnlyList<StructMemberInitialization> initializations,
+                bool fixedInitializersAreDeclaredOnType)
+            {
+                this.Constructor = constructor;
+                this.Initializations = initializations;
+                this.FixedInitializersAreDeclaredOnType = fixedInitializersAreDeclaredOnType;
+            }
+
+            public IMethodSymbol Constructor { get; }
+
+            public IReadOnlyList<StructMemberInitialization> Initializations { get; }
+
+            public bool FixedInitializersAreDeclaredOnType { get; }
+        }
+
+        private sealed class StructMemberInitialization
+        {
+            public StructMemberInitialization(string memberName, int parameterOrdinal)
+            {
+                this.MemberName = memberName;
+                this.ParameterOrdinal = parameterOrdinal;
+            }
+
+            public StructMemberInitialization(string memberName, ExpressionSyntax fixedExpression)
+            {
+                this.MemberName = memberName;
+                this.FixedExpression = fixedExpression;
+            }
+
+            public string MemberName { get; }
+
+            public int? ParameterOrdinal { get; }
+
+            public ExpressionSyntax FixedExpression { get; }
         }
 
         // Issue #1971: groups extended property subpatterns (`{ A.B: 0, A.C: 1 }`,

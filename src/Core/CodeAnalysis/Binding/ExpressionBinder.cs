@@ -266,6 +266,24 @@ internal sealed partial class ExpressionBinder
         return conversions.BindConversion(syntax, targetType);
     }
 
+    private bool TryBindLambdaExpressionWithTargetType(
+        ExpressionSyntax syntax,
+        TypeSymbol targetType,
+        out BoundExpression bound)
+    {
+        // Keep event handlers and assignment RHS binding on one target-typing path.
+        bound = null;
+        if (syntax is not LambdaExpressionSyntax lambda
+            || targetType == null
+            || !MemberLookup.TryGetLambdaTargetFunctionTypeFromSymbol(targetType, out var targetFunctionType))
+        {
+            return false;
+        }
+
+        bound = lambdas.BindLambdaExpression(lambda, targetFunctionType);
+        return true;
+    }
+
     internal BoundExpression BindExpression(ExpressionSyntax syntax, bool canBeVoid = false)
     {
         var result = BindExpressionpublic(syntax);
@@ -995,6 +1013,11 @@ internal sealed partial class ExpressionBinder
     /// <summary>ADR-0039: Determines whether an expression is an lvalue (can have its address taken).</summary>
     internal static bool IsLvalue(BoundExpression expression)
     {
+        if (expression is BoundBlockExpression block)
+        {
+            return IsLvalue(block.Expression);
+        }
+
         return expression is BoundVariableExpression
             or BoundFieldAccessExpression
             or BoundIndexExpression

@@ -141,8 +141,7 @@ internal sealed partial class ExpressionBinder
                             return staticGroup;
                         }
 
-                        Diagnostics.ReportUnableToFindMember(ne.Location, ne.IdentifierToken.Text);
-                        return new BoundErrorExpression(null);
+                        return BindExtensionMethodGroupOrError(receiver, ne);
                     }
 
                     // Stream B: static field/property read on imported type.
@@ -307,7 +306,7 @@ internal sealed partial class ExpressionBinder
                         return inheritedClrGroup;
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, ne.IdentifierToken.Text);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null && receiver.Type is EnumSymbol)
                 {
@@ -322,7 +321,7 @@ internal sealed partial class ExpressionBinder
                         return enumClrGroup;
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, ne.IdentifierToken.Text);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null && receiver.Type is InterfaceSymbol ifaceSym)
                 {
@@ -396,7 +395,7 @@ internal sealed partial class ExpressionBinder
                         }
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, ne.IdentifierToken.Text);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null && receiver.Type is TupleTypeSymbol tupleSym)
                 {
@@ -409,8 +408,7 @@ internal sealed partial class ExpressionBinder
                         return new BoundTupleElementAccessExpression(null, receiver, tupleSym, oneBased - 1);
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, memberName);
-                    return new BoundErrorExpression(null);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null && receiver.Type is NullableTypeSymbol nullableSym
                     && nullableSym.UnderlyingType?.ClrType is { IsValueType: true } nullableInnerClr
@@ -436,8 +434,7 @@ internal sealed partial class ExpressionBinder
                         return nullableGroup;
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, nullableMemberName);
-                    return new BoundErrorExpression(null);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null && receiver.Type is NullableTypeSymbol openNullableSym
                     && openNullableSym.UnderlyingType is TypeParameterSymbol openTp
@@ -479,16 +476,20 @@ internal sealed partial class ExpressionBinder
                         return openNullableGroup;
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, openNullableMemberName);
-                    return new BoundErrorExpression(null);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
-                else if (receiver != null && receiver.Type != null && receiver.Type is not NullableTypeSymbol && receiver.Type.ClrType != null)
+                else if (receiver != null
+                    && receiver.Type?.ClrType != null
+                    && (receiver.Type is not NullableTypeSymbol
+                        || receiver is BoundClrPropertyAccessExpression))
                 {
                     // Phase 4 exit: read a public instance property or field on
                     // a CLR receiver (e.g. `lst.Count`, `sb.Length`,
                     // `kvp.Key`). Static members are reached through
-                    // ImportedClassSymbol; this path covers instances. Nullable
-                    // receivers must be narrowed or use `?.` before this path.
+                    // ImportedClassSymbol; this path covers instances. Permit a
+                    // chained CLR member whose oblivious metadata made its
+                    // result nullable, while explicit nullable variables still
+                    // require narrowing or `?.`.
                     var clrReceiverType = receiver.Type.ClrType;
                     var memberName = ne.IdentifierToken.Text;
 
@@ -536,8 +537,7 @@ internal sealed partial class ExpressionBinder
                         return instanceGroup;
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, memberName);
-                    return new BoundErrorExpression(null);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null
                     && receiver.Type is SliceTypeSymbol or ArrayTypeSymbol
@@ -561,8 +561,7 @@ internal sealed partial class ExpressionBinder
                         return new BoundClrPropertyAccessExpression(null, receiver, arrayProp, ClrNullability.GetPropertyTypeSymbol(arrayProp));
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, arrayMemberName);
-                    return new BoundErrorExpression(null);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else if (receiver != null && receiver.Type is TypeParameterSymbol tpRecv)
                 {
@@ -580,18 +579,65 @@ internal sealed partial class ExpressionBinder
                         return tpMember;
                     }
 
-                    Diagnostics.ReportUnableToFindMember(ne.Location, ne.IdentifierToken.Text);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
                 else
                 {
-                    Diagnostics.ReportUnableToFindMember(ne.Location, ne.IdentifierToken.Text);
+                    return BindExtensionMethodGroupOrError(receiver, ne);
                 }
-
-                return new BoundErrorExpression(null);
 
             default:
                 return new BoundErrorExpression(null);
         }
+    }
+
+    /// <summary>
+    /// Issue #2452: binds a receiver-style extension method reference used as a
+    /// value (<c>receiver.Extension</c>) after ordinary fields, properties, and
+    /// instance methods have all failed lookup. Calls already resolve extensions
+    /// through the overload resolver; method-group lookup must use the same
+    /// symbol tables instead of treating the name as a missing property.
+    /// </summary>
+    private BoundExpression BindExtensionMethodGroupOrError(BoundExpression receiver, NameExpressionSyntax name)
+    {
+        if (receiver != null)
+        {
+            var userCandidates = scope.TryLookupExtensionFunctions(receiver.Type, name.IdentifierToken.Text);
+            if (!userCandidates.IsDefaultOrEmpty)
+            {
+                if (userCandidates.Length == 1
+                    && userCandidates[0] is { IsExtension: true, TypeParameters.IsDefaultOrEmpty: true } single
+                    && single.Parameters.Length > 0)
+                {
+                    var parameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>(single.Parameters.Length - 1);
+                    for (var i = 1; i < single.Parameters.Length; i++)
+                    {
+                        parameterTypes.Add(single.Parameters[i].Type);
+                    }
+
+                    var functionType = FunctionTypeSymbol.Get(
+                        parameterTypes.MoveToImmutable(),
+                        single.Type ?? TypeSymbol.Void);
+                    return new BoundMethodGroupExpression(name, receiver, single, functionType);
+                }
+
+                return new BoundMethodGroupExpression(name, receiver, userCandidates);
+            }
+
+            var importedCandidates = this.memberLookup.CollectImportedExtensionMethods(name.IdentifierToken.Text);
+            if (importedCandidates.Count > 0)
+            {
+                return new BoundClrMethodGroupExpression(
+                    name,
+                    receiver,
+                    declaringType: null,
+                    name.IdentifierToken.Text,
+                    importedCandidates.ToImmutableArray());
+            }
+        }
+
+        Diagnostics.ReportUnableToFindMember(name.Location, name.IdentifierToken.Text);
+        return new BoundErrorExpression(null);
     }
 
     /// <summary>
@@ -752,7 +798,11 @@ internal sealed partial class ExpressionBinder
         return new BoundNullConditionalAccessExpression(null, receiver, capture, whenNotNull, resultType, resultSlot);
     }
 
-    private BoundExpression BindIndexAgainstTarget(BoundExpression target, ExpressionSyntax indexSyntax, TextLocation targetLocation)
+    private BoundExpression BindIndexAgainstTarget(
+        BoundExpression target,
+        ExpressionSyntax indexSyntax,
+        TextLocation targetLocation,
+        BoundExpression boundIndexOverride = null)
     {
         // ADR-0122 / issue #1014: pointer indexing `p[i]` == `*(p + i)`.
         if (target.Type is PointerTypeSymbol pointerTarget)
@@ -766,7 +816,7 @@ internal sealed partial class ExpressionBinder
                 return new BoundErrorExpression(null);
             }
 
-            var pointerIndex = BindExpression(indexSyntax);
+            var pointerIndex = boundIndexOverride ?? BindExpression(indexSyntax);
             if (pointerIndex is BoundErrorExpression)
             {
                 return pointerIndex;
@@ -774,7 +824,9 @@ internal sealed partial class ExpressionBinder
 
             if (!IsPointerOffsetType(pointerIndex.Type))
             {
-                pointerIndex = conversions.BindConversion(indexSyntax, TypeSymbol.NInt);
+                pointerIndex = boundIndexOverride != null
+                    ? conversions.BindConversion(indexSyntax.Location, pointerIndex, TypeSymbol.NInt)
+                    : conversions.BindConversion(indexSyntax, TypeSymbol.NInt);
             }
 
             var elementPointer = LowerPointerOffset(target, pointerTarget, pointerIndex, subtract: false);
@@ -790,7 +842,13 @@ internal sealed partial class ExpressionBinder
 
         // Issue #1022: a from-end index (`a[^n]`) reads the single element
         // `length - n`.
-        if (indexSyntax is FromEndIndexExpressionSyntax fromEndSyntax)
+        if (boundIndexOverride != null
+            && ClrTypeUtilities.AreSame(boundIndexOverride.Type?.ClrType, typeof(System.Index)))
+        {
+            return BindSystemIndexAccess(target, boundIndexOverride, targetLocation);
+        }
+
+        if (boundIndexOverride == null && indexSyntax is FromEndIndexExpressionSyntax fromEndSyntax)
         {
             return BindFromEndIndex(target, fromEndSyntax, targetLocation);
         }
@@ -802,8 +860,10 @@ internal sealed partial class ExpressionBinder
         // expression in the ordinary index paths below to avoid re-binding.
         // `default`/interpolated index syntaxes can never be a range value and
         // keep their dedicated conversion handling, so they are not pre-bound.
-        BoundExpression boundIndex = null;
-        if (indexSyntax is not DefaultExpressionSyntax && indexSyntax is not InterpolatedStringExpressionSyntax)
+        BoundExpression boundIndex = boundIndexOverride;
+        if (boundIndex == null
+            && indexSyntax is not DefaultExpressionSyntax
+            && indexSyntax is not InterpolatedStringExpressionSyntax)
         {
             boundIndex = BindExpression(indexSyntax);
             if (boundIndex is BoundErrorExpression)
@@ -814,6 +874,11 @@ internal sealed partial class ExpressionBinder
             if (IsSystemRangeType(boundIndex.Type))
             {
                 return BindRangeValueSlice(target, boundIndex, targetLocation);
+            }
+
+            if (ClrTypeUtilities.AreSame(boundIndex.Type.ClrType, typeof(System.Index)))
+            {
+                return BindSystemIndexAccess(target, boundIndex, targetLocation);
             }
         }
 
@@ -872,21 +937,31 @@ internal sealed partial class ExpressionBinder
         if (target.Type is NullabilityAnnotatedTypeSymbol annotIdx && annotIdx.ClrType is System.Type clrAnnotIdx)
         {
             var idxArgsAnnot = ImmutableArray.Create(BoundIndexArg());
-            if (this.memberLookup.TryResolveClrIndexer(clrAnnotIdx, idxArgsAnnot, out var idxPropAnnot, out var resolvedIdxArgsAnnot))
+            if (this.memberLookup.TryResolveClrIndexer(target.Type, clrAnnotIdx, idxArgsAnnot, out var idxPropAnnot, out var resolvedIdxArgsAnnot))
             {
                 var elemTypeAnnot = annotIdx.GetTypeArgumentSymbolForClrType(idxPropAnnot.PropertyType);
-                return ConversionClassifier.AutoDereferenceRefReturn(new BoundClrIndexExpression(null, target, idxPropAnnot, resolvedIdxArgsAnnot, elemTypeAnnot));
+                var convertedIdxArgsAnnot = BindClrIndexerArguments(
+                    target.Type,
+                    idxPropAnnot,
+                    resolvedIdxArgsAnnot,
+                    indexSyntax.Location);
+                return ConversionClassifier.AutoDereferenceRefReturn(new BoundClrIndexExpression(null, target, idxPropAnnot, convertedIdxArgsAnnot, elemTypeAnnot));
             }
         }
         else if ((target.Type is ImportedTypeSymbol || target.Type is StructSymbol) && target.Type.ClrType is System.Type clrTarget)
         {
             var idxArgs = ImmutableArray.Create(BoundIndexArg());
-            if (this.memberLookup.TryResolveClrIndexer(clrTarget, idxArgs, out var idxProp, out var resolvedIdxArgs))
+            if (this.memberLookup.TryResolveClrIndexer(target.Type, clrTarget, idxArgs, out var idxProp, out var resolvedIdxArgs))
             {
                 var elementType = target.Type is ImportedTypeSymbol imported
                     ? MapErasedIndexerElementType(imported, idxProp)
                     : ClrNullability.GetPropertyTypeSymbol(idxProp);
-                return ConversionClassifier.AutoDereferenceRefReturn(new BoundClrIndexExpression(null, target, idxProp, resolvedIdxArgs, elementType));
+                var convertedIdxArgs = BindClrIndexerArguments(
+                    target.Type,
+                    idxProp,
+                    resolvedIdxArgs,
+                    indexSyntax.Location);
+                return ConversionClassifier.AutoDereferenceRefReturn(new BoundClrIndexExpression(null, target, idxProp, convertedIdxArgs, elementType));
             }
         }
 
@@ -1124,7 +1199,8 @@ internal sealed partial class ExpressionBinder
                 $"Failed to declare synthesized index-assignment target local '{tempName}'.");
         }
 
-        var declaration = new BoundVariableDeclaration(outerSyntax, tempVar, boundReceiver);
+        var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+        statements.Add(new BoundVariableDeclaration(outerSyntax, tempVar, boundReceiver));
 
         BoundExpression assignment;
         if (compoundOperatorToken != null)
@@ -1136,11 +1212,43 @@ internal sealed partial class ExpressionBinder
                 return new BoundErrorExpression(null);
             }
 
+            BoundExpression sharedIndex = null;
+            if (indexSyntax is FromEndIndexExpressionSyntax)
+            {
+                _ = TryBindSystemIndexValue(indexSyntax, out var boundSystemIndex);
+                var indexLocal = DeclareRangeTemp("index", boundSystemIndex.Type, boundSystemIndex, statements);
+                sharedIndex = new BoundVariableExpression(null, indexLocal);
+            }
+
             var tempRef = new BoundVariableExpression(null, tempVar);
-            var indexRead = BindIndexAgainstTarget(tempRef, indexSyntax, diagnosticLocation);
+            var indexRead = BindIndexAgainstTarget(tempRef, indexSyntax, diagnosticLocation, sharedIndex);
             if (indexRead is BoundErrorExpression)
             {
                 return indexRead;
+            }
+
+            if (sharedIndex == null
+                && TryCaptureCompoundIndexArgument(ref indexRead, statements, out var capturedIndex))
+            {
+                sharedIndex = capturedIndex;
+            }
+            else if (sharedIndex == null
+                && indexSyntax is not DefaultExpressionSyntax
+                && indexSyntax is not RangeExpressionSyntax)
+            {
+                var boundIndex = BindExpression(indexSyntax);
+                if (boundIndex is BoundErrorExpression)
+                {
+                    return boundIndex;
+                }
+
+                var indexLocal = DeclareRangeTemp("index", boundIndex.Type, boundIndex, statements);
+                sharedIndex = new BoundVariableExpression(null, indexLocal);
+                indexRead = BindIndexAgainstTarget(tempRef, indexSyntax, diagnosticLocation, sharedIndex);
+                if (indexRead is BoundErrorExpression)
+                {
+                    return indexRead;
+                }
             }
 
             var rhsBound = BindExpression(compoundRhsSyntax);
@@ -1165,7 +1273,12 @@ internal sealed partial class ExpressionBinder
                 return new BoundErrorExpression(null);
             }
 
-            assignment = BindIndexedAssignmentToVariableWithBoundValue(tempVar, indexSyntax, combined, diagnosticLocation);
+            assignment = BindIndexedAssignmentToVariableWithBoundValue(
+                tempVar,
+                indexSyntax,
+                combined,
+                diagnosticLocation,
+                sharedIndex);
         }
         else if (boundValueOverride != null)
         {
@@ -1181,7 +1294,73 @@ internal sealed partial class ExpressionBinder
             return assignment;
         }
 
-        return new BoundBlockExpression(outerSyntax, ImmutableArray.Create<BoundStatement>(declaration), assignment);
+        return new BoundBlockExpression(outerSyntax, statements.ToImmutable(), assignment);
+    }
+
+    private bool TryCaptureCompoundIndexArgument(
+        ref BoundExpression indexRead,
+        ImmutableArray<BoundStatement>.Builder statements,
+        out BoundExpression capturedIndex)
+    {
+        BoundExpression Capture(BoundExpression argument)
+        {
+            var indexLocal = DeclareRangeTemp("index", argument.Type, argument, statements);
+            return new BoundVariableExpression(null, indexLocal);
+        }
+
+        switch (indexRead)
+        {
+            case BoundClrIndexExpression clrIndex when clrIndex.Arguments.Length == 1:
+                capturedIndex = Capture(clrIndex.Arguments[0]);
+                indexRead = new BoundClrIndexExpression(
+                    null,
+                    clrIndex.Target,
+                    clrIndex.Indexer,
+                    ImmutableArray.Create(capturedIndex),
+                    clrIndex.Type);
+                return true;
+
+            case BoundDereferenceExpression { Operand: BoundClrIndexExpression clrRefIndex }
+                when clrRefIndex.Arguments.Length == 1:
+                capturedIndex = Capture(clrRefIndex.Arguments[0]);
+                indexRead = new BoundDereferenceExpression(
+                    null,
+                    new BoundClrIndexExpression(
+                        null,
+                        clrRefIndex.Target,
+                        clrRefIndex.Indexer,
+                        ImmutableArray.Create(capturedIndex),
+                        clrRefIndex.Type));
+                return true;
+
+            case BoundIndexExpression builtInIndex:
+                capturedIndex = Capture(builtInIndex.Index);
+                indexRead = new BoundIndexExpression(
+                    null,
+                    builtInIndex.Target,
+                    capturedIndex,
+                    builtInIndex.Type);
+                return true;
+
+            case BoundUserInstanceCallExpression userIndex when userIndex.Arguments.Length == 1:
+                capturedIndex = Capture(userIndex.Arguments[0]);
+                indexRead = new BoundUserInstanceCallExpression(
+                    null,
+                    userIndex.Receiver,
+                    userIndex.Method,
+                    ImmutableArray.Create(capturedIndex),
+                    userIndex.Type,
+                    userIndex.ConstrainedReceiverTypeParameter,
+                    userIndex.ConstrainedInterfaceType)
+                {
+                    MethodTypeArguments = userIndex.MethodTypeArguments,
+                };
+                return true;
+
+            default:
+                capturedIndex = null;
+                return false;
+        }
     }
 
     private bool TrySplitAtLeftmostNullConditional(
@@ -1232,10 +1411,11 @@ internal sealed partial class ExpressionBinder
         VariableSymbol variable,
         ExpressionSyntax indexSyntax,
         BoundExpression boundValue,
-        TextLocation diagnosticLocation)
+        TextLocation diagnosticLocation,
+        BoundExpression boundIndexOverride = null)
     {
         return BindIndexedAssignmentToVariableCore(
-            variable, indexSyntax, valueSyntax: null, boundValueOverride: boundValue, diagnosticLocation);
+            variable, indexSyntax, valueSyntax: null, boundValueOverride: boundValue, diagnosticLocation, boundIndexOverride);
     }
 
     private BoundExpression BindIndexedAssignmentToVariableCore(
@@ -1243,7 +1423,8 @@ internal sealed partial class ExpressionBinder
         ExpressionSyntax indexSyntax,
         ExpressionSyntax valueSyntax,
         BoundExpression boundValueOverride,
-        TextLocation diagnosticLocation)
+        TextLocation diagnosticLocation,
+        BoundExpression boundIndexOverride = null)
     {
         BoundExpression BindValue(TypeSymbol elementType)
         {
@@ -1255,10 +1436,30 @@ internal sealed partial class ExpressionBinder
             return conversions.BindConversion(valueSyntax, elementType);
         }
 
+        if (boundIndexOverride != null
+            && ClrTypeUtilities.AreSame(boundIndexOverride.Type?.ClrType, typeof(System.Index)))
+        {
+            return BindSystemIndexAssignment(variable, boundIndexOverride, BindValue, diagnosticLocation);
+        }
+
+        if (boundIndexOverride == null && TryBindSystemIndexValue(indexSyntax, out var systemIndex))
+        {
+            return BindSystemIndexAssignment(variable, systemIndex, BindValue, diagnosticLocation);
+        }
+
+        BoundExpression BindIndexValue() => boundIndexOverride ?? BindExpression(indexSyntax);
+
+        BoundExpression ConvertIndexValue(TypeSymbol targetType) =>
+            boundIndexOverride != null
+                ? conversions.BindConversion(indexSyntax.Location, boundIndexOverride, targetType)
+                : conversions.BindConversion(indexSyntax, targetType);
+
         var element = GetIndexElementType(variable.Type);
         if (element != null)
         {
-            var index = BindArrayElementIndex(indexSyntax);
+            var index = boundIndexOverride != null
+                ? ConvertArrayElementIndex(indexSyntax.Location, boundIndexOverride)
+                : BindArrayElementIndex(indexSyntax);
             var value = BindValue(element);
             return new BoundIndexAssignmentExpression(null, variable, index, value, element);
         }
@@ -1275,7 +1476,7 @@ internal sealed partial class ExpressionBinder
                 return new BoundErrorExpression(null);
             }
 
-            var pointerIndex = BindExpression(indexSyntax);
+            var pointerIndex = BindIndexValue();
             if (pointerIndex is BoundErrorExpression)
             {
                 return pointerIndex;
@@ -1283,7 +1484,9 @@ internal sealed partial class ExpressionBinder
 
             if (!IsPointerOffsetType(pointerIndex.Type))
             {
-                pointerIndex = conversions.BindConversion(indexSyntax, TypeSymbol.NInt);
+                pointerIndex = boundIndexOverride != null
+                    ? conversions.BindConversion(indexSyntax.Location, pointerIndex, TypeSymbol.NInt)
+                    : conversions.BindConversion(indexSyntax, TypeSymbol.NInt);
             }
 
             var elementPointer = LowerPointerOffset(new BoundVariableExpression(null, variable), pointerType, pointerIndex, subtract: false);
@@ -1295,7 +1498,7 @@ internal sealed partial class ExpressionBinder
         // value bound to V.
         if (variable.Type is MapTypeSymbol mapType)
         {
-            var keyExpr = conversions.BindConversion(indexSyntax, mapType.KeyType);
+            var keyExpr = ConvertIndexValue(mapType.KeyType);
             var valExpr = BindValue(mapType.ValueType);
             return new BoundIndexAssignmentExpression(null, variable, keyExpr, valExpr, mapType.ValueType);
         }
@@ -1305,8 +1508,8 @@ internal sealed partial class ExpressionBinder
         // Issue #209: honour inner-position nullable flags when present.
         if (variable.Type is NullabilityAnnotatedTypeSymbol annotWr && variable.Type.ClrType is System.Type clrAnnotWr)
         {
-            var idxArgsAnnotWr = ImmutableArray.Create(BindExpression(indexSyntax));
-            if (this.memberLookup.TryResolveClrIndexer(clrAnnotWr, idxArgsAnnotWr, out var idxPropAnnotWr, out var resolvedIdxArgsAnnotWr))
+            var idxArgsAnnotWr = ImmutableArray.Create(BindIndexValue());
+            if (this.memberLookup.TryResolveClrIndexer(variable.Type, clrAnnotWr, idxArgsAnnotWr, out var idxPropAnnotWr, out var resolvedIdxArgsAnnotWr))
             {
                 if (!idxPropAnnotWr.CanWrite)
                 {
@@ -1316,14 +1519,25 @@ internal sealed partial class ExpressionBinder
 
                 var valueTypeAnnotWr = annotWr.GetTypeArgumentSymbolForClrType(idxPropAnnotWr.PropertyType);
                 var boundValueAnnotWr = BindValue(valueTypeAnnotWr);
-                return new BoundClrIndexAssignmentExpression(null, variable, idxPropAnnotWr, resolvedIdxArgsAnnotWr, boundValueAnnotWr, valueTypeAnnotWr);
+                var convertedIdxArgsAnnotWr = BindClrIndexerArguments(
+                    variable.Type,
+                    idxPropAnnotWr,
+                    resolvedIdxArgsAnnotWr,
+                    indexSyntax.Location);
+                return new BoundClrIndexAssignmentExpression(null, variable, idxPropAnnotWr, convertedIdxArgsAnnotWr, boundValueAnnotWr, valueTypeAnnotWr);
             }
         }
         else if ((variable.Type is ImportedTypeSymbol || variable.Type is StructSymbol) && variable.Type.ClrType is System.Type clrTarget)
         {
-            var idxArgs = ImmutableArray.Create(BindExpression(indexSyntax));
-            if (this.memberLookup.TryResolveClrIndexer(clrTarget, idxArgs, out var idxProp, out var resolvedIdxArgs))
+            var idxArgs = ImmutableArray.Create(BindIndexValue());
+            if (this.memberLookup.TryResolveClrIndexer(variable.Type, clrTarget, idxArgs, out var idxProp, out var resolvedIdxArgs))
             {
+                var convertedIdxArgs = BindClrIndexerArguments(
+                    variable.Type,
+                    idxProp,
+                    resolvedIdxArgs,
+                    indexSyntax.Location);
+
                 // ADR-0056 §2: span element write. `Span[T]` has no `set_Item`; its
                 // indexer is a `ref T`-returning getter and writes go through that
                 // managed pointer. Detect the ref-returning getter and store through
@@ -1340,9 +1554,14 @@ internal sealed partial class ExpressionBinder
                             return new BoundErrorExpression(null);
                         }
 
-                        var pointeeType = TypeSymbol.FromClrType(refGetter.ReturnType.GetElementType()!);
+                        var resolvedElementType = variable.Type is ImportedTypeSymbol importedRefReturn
+                            ? MapErasedIndexerElementType(importedRefReturn, idxProp)
+                            : ResolveIndexerElementType(variable.Type, idxProp);
+                        var pointeeType = resolvedElementType is ByRefTypeSymbol byRef
+                            ? byRef.PointeeType
+                            : TypeSymbol.FromClrType(refGetter.ReturnType.GetElementType()!);
                         var refValue = BindValue(pointeeType);
-                        return new BoundClrIndexAssignmentExpression(null, variable, idxProp, resolvedIdxArgs, refValue, pointeeType);
+                        return new BoundClrIndexAssignmentExpression(null, variable, idxProp, convertedIdxArgs, refValue, pointeeType);
                     }
 
                     Diagnostics.ReportTypeNotIndexable(diagnosticLocation, variable.Type);
@@ -1365,7 +1584,7 @@ internal sealed partial class ExpressionBinder
                     ? MapErasedIndexerElementType(imported, idxProp)
                     : ClrNullability.GetPropertyTypeSymbol(idxProp);
                 var boundValue = BindValue(valueType);
-                return new BoundClrIndexAssignmentExpression(null, variable, idxProp, resolvedIdxArgs, boundValue, valueType);
+                return new BoundClrIndexAssignmentExpression(null, variable, idxProp, convertedIdxArgs, boundValue, valueType);
             }
         }
 
@@ -1389,7 +1608,7 @@ internal sealed partial class ExpressionBinder
                 ? Binder.SubstituteType(writeIndexer.Type, writeSubstitution, scope.References.MapClrTypeToReferences)
                 : writeIndexer.Type;
 
-            var indexArg = conversions.BindConversion(indexSyntax, paramType);
+            var indexArg = ConvertIndexValue(paramType);
             var value = BindValue(elementType);
             return new BoundUserInstanceCallExpression(
                 null,
@@ -1419,7 +1638,7 @@ internal sealed partial class ExpressionBinder
                 ? Binder.SubstituteType(writeIfaceIndexer.Type, writeIfaceSubstitution, scope.References.MapClrTypeToReferences)
                 : writeIfaceIndexer.Type;
 
-            var indexArg = conversions.BindConversion(indexSyntax, paramType);
+            var indexArg = ConvertIndexValue(paramType);
             var value = BindValue(elementType);
             return new BoundUserInstanceCallExpression(
                 null,
@@ -1434,6 +1653,22 @@ internal sealed partial class ExpressionBinder
         }
 
         return new BoundErrorExpression(null);
+    }
+
+    private ImmutableArray<BoundExpression> BindClrIndexerArguments(
+        TypeSymbol targetType,
+        PropertyInfo indexer,
+        ImmutableArray<BoundExpression> arguments,
+        TextLocation diagnosticLocation)
+    {
+        var converted = ImmutableArray.CreateBuilder<BoundExpression>(arguments.Length);
+        for (var i = 0; i < arguments.Length; i++)
+        {
+            var parameterType = MemberLookup.GetIndexerParameterTypeSymbol(targetType, indexer, i);
+            converted.Add(conversions.BindConversion(diagnosticLocation, arguments[i], parameterType));
+        }
+
+        return converted.MoveToImmutable();
     }
 
     private static TypeSymbol MapErasedIndexerElementType(ImportedTypeSymbol target, PropertyInfo closedIndexer)
@@ -1457,10 +1692,7 @@ internal sealed partial class ExpressionBinder
         {
             try
             {
-                var openIndexer = ClrTypeUtilities.SafeGetProperty(
-                    openDefinition,
-                    closedIndexer.Name,
-                    BindingFlags.Public | BindingFlags.Instance);
+                var openIndexer = MemberLookup.FindOpenIndexerDefinition(openDefinition, closedIndexer);
                 if (openIndexer?.PropertyType is System.Type openElement)
                 {
                     // ADR-0056 §1/§2: a ref-returning indexer (e.g. `Span[T]`)
@@ -1835,14 +2067,50 @@ internal sealed partial class ExpressionBinder
             return new BoundErrorExpression(null);
         }
 
+        _ = TryBindSystemIndexValue(fromEnd, out var indexValue);
+        return BindSystemIndexAccess(target, indexValue, targetLocation);
+    }
+
+    private bool TryBindSystemIndexValue(ExpressionSyntax syntax, out BoundExpression indexValue)
+    {
+        if (syntax is FromEndIndexExpressionSyntax fromEnd)
+        {
+            var indexCtor = typeof(System.Index).GetConstructor(new[] { typeof(int), typeof(bool) });
+            var indexSym = TypeSymbol.FromClrType(typeof(System.Index));
+            var offset = conversions.BindConversion(fromEnd.Operand, TypeSymbol.Int32);
+            indexValue = new BoundClrConstructorCallExpression(
+                null,
+                typeof(System.Index),
+                indexCtor,
+                ImmutableArray.Create<BoundExpression>(offset, new BoundLiteralExpression(null, true)),
+                indexSym);
+            return true;
+        }
+
+        var bound = BindExpression(syntax);
+        if (bound is not BoundErrorExpression && ClrTypeUtilities.AreSame(bound.Type.ClrType, typeof(System.Index)))
+        {
+            indexValue = bound;
+            return true;
+        }
+
+        indexValue = null;
+        return false;
+    }
+
+    private BoundExpression BindSystemIndexAccess(BoundExpression target, BoundExpression indexValue, TextLocation targetLocation)
+    {
         var element = GetIndexElementType(target.Type);
         if (element != null)
         {
             var statements = ImmutableArray.CreateBuilder<BoundStatement>();
             var srcLocal = DeclareRangeTemp("src", target.Type, target, statements);
-            var idx = MakeFromEndOffset(fromEnd, new BoundLenExpression(null, new BoundVariableExpression(null, srcLocal)));
+            var idx = BuildSystemIndexOffset(
+                indexValue,
+                new BoundLenExpression(null, new BoundVariableExpression(null, srcLocal)),
+                statements);
             var read = new BoundIndexExpression(null, new BoundVariableExpression(null, srcLocal), idx, element);
-            return new BoundBlockExpression(fromEnd, statements.ToImmutable(), read);
+            return new BoundBlockExpression(null, statements.ToImmutable(), read);
         }
 
         var clrType = target.Type.ClrType;
@@ -1850,38 +2118,170 @@ internal sealed partial class ExpressionBinder
         {
             if (TryFindIndexIndexer(clrType, out var indexIndexer))
             {
-                var indexCtor = typeof(System.Index).GetConstructor(new[] { typeof(int), typeof(bool) });
-                var indexSym = TypeSymbol.FromClrType(typeof(System.Index));
-                var offset = conversions.BindConversion(fromEnd.Operand, TypeSymbol.Int32);
-                var indexValue = new BoundClrConstructorCallExpression(
-                    null,
-                    typeof(System.Index),
-                    indexCtor,
-                    ImmutableArray.Create<BoundExpression>(offset, new BoundLiteralExpression(null, true)),
-                    indexSym);
                 var resultType = ResolveIndexerElementType(target.Type, indexIndexer);
-                return new BoundClrIndexExpression(fromEnd, target, indexIndexer, ImmutableArray.Create<BoundExpression>(indexValue), resultType);
+                return ConversionClassifier.AutoDereferenceRefReturn(
+                    new BoundClrIndexExpression(null, target, indexIndexer, ImmutableArray.Create(indexValue), resultType));
             }
 
             if (TryFindCountedIntIndexer(clrType, out var lengthMember, out var intIndexer))
             {
                 var statements = ImmutableArray.CreateBuilder<BoundStatement>();
                 var srcLocal = DeclareRangeTemp("src", target.Type, target, statements);
-                var lengthExpr = new BoundClrPropertyAccessExpression(null, new BoundVariableExpression(null, srcLocal), lengthMember, TypeSymbol.Int32);
-                var idx = MakeFromEndOffset(fromEnd, lengthExpr);
+                var srcRef = new BoundVariableExpression(null, srcLocal);
+                var lengthExpr = new BoundClrPropertyAccessExpression(null, srcRef, lengthMember, TypeSymbol.Int32);
+                var idx = BuildSystemIndexOffset(indexValue, lengthExpr, statements);
                 var resultType = ResolveIndexerElementType(target.Type, intIndexer);
-                var read = new BoundClrIndexExpression(
+                var read = ConversionClassifier.AutoDereferenceRefReturn(
+                    new BoundClrIndexExpression(
+                        null,
+                        new BoundVariableExpression(null, srcLocal),
+                        intIndexer,
+                        ImmutableArray.Create<BoundExpression>(idx),
+                        resultType));
+                return new BoundBlockExpression(null, statements.ToImmutable(), read);
+            }
+        }
+
+        if (target.Type is StructSymbol userTarget
+            && TryGetUserIndexer(userTarget, out var userIndexer, out var substitution)
+            && userIndexer.Parameters.Length == 1
+            && userIndexer.GetterSymbol != null)
+        {
+            var parameterType = substitution != null
+                ? Binder.SubstituteType(userIndexer.Parameters[0].Type, substitution, scope.References.MapClrTypeToReferences)
+                : userIndexer.Parameters[0].Type;
+            if (ClrTypeUtilities.AreSame(parameterType.ClrType, typeof(System.Index)))
+            {
+                var resultType = substitution != null
+                    ? Binder.SubstituteType(userIndexer.Type, substitution, scope.References.MapClrTypeToReferences)
+                    : userIndexer.Type;
+                return new BoundUserInstanceCallExpression(
                     null,
-                    new BoundVariableExpression(null, srcLocal),
-                    intIndexer,
-                    ImmutableArray.Create<BoundExpression>(idx),
+                    target,
+                    userIndexer.GetterSymbol,
+                    ImmutableArray.Create(conversions.BindConversion(targetLocation, indexValue, parameterType)),
                     resultType);
-                return new BoundBlockExpression(fromEnd, statements.ToImmutable(), read);
             }
         }
 
         Diagnostics.ReportTypeNotIndexable(targetLocation, target.Type);
         return new BoundErrorExpression(null);
+    }
+
+    private BoundExpression BindSystemIndexAssignment(
+        VariableSymbol variable,
+        BoundExpression indexValue,
+        Func<TypeSymbol, BoundExpression> bindValue,
+        TextLocation diagnosticLocation)
+    {
+        var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+
+        var element = GetIndexElementType(variable.Type);
+        if (element != null)
+        {
+            var idx = BuildSystemIndexOffset(
+                indexValue,
+                new BoundLenExpression(null, new BoundVariableExpression(null, variable)),
+                statements);
+            var assignment = new BoundIndexAssignmentExpression(null, variable, idx, bindValue(element), element);
+            return new BoundBlockExpression(null, statements.ToImmutable(), assignment);
+        }
+
+        var clrType = variable.Type.ClrType;
+        if (clrType != null)
+        {
+            PropertyInfo indexer;
+            ImmutableArray<BoundExpression> arguments;
+            if (TryFindIndexIndexer(clrType, out indexer))
+            {
+                arguments = ImmutableArray.Create(indexValue);
+            }
+            else if (TryFindCountedIntIndexer(clrType, out var lengthMember, out indexer))
+            {
+                var lengthExpr = new BoundClrPropertyAccessExpression(
+                    null,
+                    new BoundVariableExpression(null, variable),
+                    lengthMember,
+                    TypeSymbol.Int32);
+                arguments = ImmutableArray.Create(BuildSystemIndexOffset(indexValue, lengthExpr, statements));
+            }
+            else
+            {
+                Diagnostics.ReportTypeNotIndexable(diagnosticLocation, variable.Type);
+                return new BoundErrorExpression(null);
+            }
+
+            var getter = indexer.GetGetMethod(nonPublic: false);
+            var valueType = ResolveIndexerElementType(variable.Type, indexer);
+            if (!indexer.CanWrite)
+            {
+                if (getter == null || !getter.ReturnType.IsByRef)
+                {
+                    Diagnostics.ReportTypeNotIndexable(diagnosticLocation, variable.Type);
+                    return new BoundErrorExpression(null);
+                }
+
+                if (IsReadOnlyRefReturn(indexer, getter))
+                {
+                    Diagnostics.ReportCannotAssignReadOnlySpanElement(diagnosticLocation, variable.Type);
+                    return new BoundErrorExpression(null);
+                }
+
+                valueType = valueType is ByRefTypeSymbol byRef ? byRef.PointeeType : valueType;
+            }
+
+            return new BoundBlockExpression(
+                null,
+                statements.ToImmutable(),
+                new BoundClrIndexAssignmentExpression(
+                    null,
+                    variable,
+                    indexer,
+                    arguments,
+                    bindValue(valueType),
+                    valueType));
+        }
+
+        if (variable.Type is StructSymbol userTarget
+            && TryGetUserIndexer(userTarget, out var userIndexer, out var substitution)
+            && userIndexer.Parameters.Length == 1
+            && userIndexer.SetterSymbol != null)
+        {
+            var parameterType = substitution != null
+                ? Binder.SubstituteType(userIndexer.Parameters[0].Type, substitution, scope.References.MapClrTypeToReferences)
+                : userIndexer.Parameters[0].Type;
+            if (ClrTypeUtilities.AreSame(parameterType.ClrType, typeof(System.Index)))
+            {
+                var valueType = substitution != null
+                    ? Binder.SubstituteType(userIndexer.Type, substitution, scope.References.MapClrTypeToReferences)
+                    : userIndexer.Type;
+                return new BoundUserInstanceCallExpression(
+                    null,
+                    new BoundVariableExpression(null, variable),
+                    userIndexer.SetterSymbol,
+                    ImmutableArray.Create(
+                        conversions.BindConversion(diagnosticLocation, indexValue, parameterType),
+                        bindValue(valueType)));
+            }
+        }
+
+        Diagnostics.ReportTypeNotIndexable(diagnosticLocation, variable.Type);
+        return new BoundErrorExpression(null);
+    }
+
+    private BoundExpression BuildSystemIndexOffset(
+        BoundExpression indexValue,
+        BoundExpression length,
+        ImmutableArray<BoundStatement>.Builder statements)
+    {
+        var indexLocal = DeclareRangeTemp("index", indexValue.Type, indexValue, statements);
+        var getOffset = typeof(System.Index).GetMethod("GetOffset", new[] { typeof(int) });
+        return new BoundImportedInstanceCallExpression(
+            null,
+            new BoundVariableExpression(null, indexLocal),
+            getOffset,
+            TypeSymbol.Int32,
+            ImmutableArray.Create(length));
     }
 
     // `length - n` for a from-end index `^n`.

@@ -27,7 +27,8 @@ public sealed partial class CSharpToGSharpTranslator
             TypeDeclarationKind ownerKind,
             ConstructorLift lift,
             IReadOnlyList<(string Name, GExpression Value)> propertyCtorInits,
-            IReadOnlyCollection<string> primaryCtorParamNames = null)
+            IReadOnlyCollection<string> primaryCtorParamNames = null,
+            IReadOnlyCollection<ConstructorDeclarationSyntax> callSiteLoweredStructConstructors = null)
         {
             switch (member)
             {
@@ -87,7 +88,9 @@ public sealed partial class CSharpToGSharpTranslator
                     break;
 
                 case PropertyDeclarationSyntax property:
-                    if (lift.PropertiesAsPrimaryParameters.Contains(property.Identifier.Text))
+                    var propertySymbol = this.context.GetDeclaredSymbol(property) as IPropertySymbol;
+                    if (propertySymbol != null &&
+                        lift.PropertiesAsPrimaryParameters.Contains(propertySymbol))
                     {
                         break;
                     }
@@ -96,12 +99,12 @@ public sealed partial class CSharpToGSharpTranslator
                     // to a body field (see PropertiesAsBodyFields) emits as a plain
                     // `let Name Type = initializer` field rather than a primary-
                     // constructor parameter or a G# `prop`.
-                    if (lift.PropertiesAsBodyFields.Contains(property.Identifier.Text))
+                    if (propertySymbol != null &&
+                        lift.PropertiesAsBodyFields.Contains(propertySymbol))
                     {
-                        GExpression bodyFieldInit = lift.BodyFieldInitializers[property.Identifier.Text];
-                        GTypeReference bodyFieldType = this.context.GetDeclaredSymbol(property) is IPropertySymbol bodyFieldPropSymbol
-                            ? this.typeMapper.Map(bodyFieldPropSymbol.Type, this.context, property.Identifier.GetLocation())
-                            : null;
+                        GExpression bodyFieldInit = lift.BodyFieldInitializers[propertySymbol];
+                        GTypeReference bodyFieldType =
+                            this.typeMapper.Map(propertySymbol.Type, this.context, property.Identifier.GetLocation());
                         yield return (
                             new FieldDeclaration(
                                 BindingKind.Let,
@@ -119,7 +122,7 @@ public sealed partial class CSharpToGSharpTranslator
                     // defining part is dropped in favor of its implementation
                     // part (which translates normally), and an unimplemented
                     // partial-property definition is elided outright.
-                    if (this.context.GetDeclaredSymbol(property) is IPropertySymbol { IsPartialDefinition: true })
+                    if (propertySymbol is { IsPartialDefinition: true })
                     {
                         break;
                     }
@@ -154,6 +157,11 @@ public sealed partial class CSharpToGSharpTranslator
                     break;
 
                 case ConstructorDeclarationSyntax ctor:
+                    if (callSiteLoweredStructConstructors?.Contains(ctor) == true)
+                    {
+                        break;
+                    }
+
                     // T2: a fully-lifted constructor is dropped entirely; its field
                     // initialization moved to field initializers / primary-ctor
                     // parameters (ADR-0115 §B.3). Assignments whose RHS reads an
@@ -451,7 +459,9 @@ public sealed partial class CSharpToGSharpTranslator
                     SanitizeIdentifier(declarator.Identifier.Text),
                     type,
                     MapVisibility(symbol, this.context, node),
-                    this.MapAttributes(node.AttributeLists));
+                    this.MapAttributes(node.AttributeLists),
+                    isOpen: this.IsMemberEmittedOpen(symbol, symbol?.IsOverride == true),
+                    isOverride: symbol?.IsOverride == true);
 
                 yield return (declaration, symbol != null && symbol.IsStatic);
             }
@@ -569,7 +579,9 @@ public sealed partial class CSharpToGSharpTranslator
                 this.MapAttributes(node.AttributeLists),
                 addBody,
                 removeBody,
-                explicitInterfaceType: explicitInterfaceEventType);
+                explicitInterfaceType: explicitInterfaceEventType,
+                isOpen: this.IsMemberEmittedOpen(symbol, symbol?.IsOverride == true),
+                isOverride: symbol?.IsOverride == true);
 
             return (declaration, symbol != null && symbol.IsStatic);
         }
@@ -631,52 +643,6 @@ public sealed partial class CSharpToGSharpTranslator
         private static bool IsUnsignedIntegerSpecialType(SpecialType type) =>
             type is SpecialType.System_Byte or SpecialType.System_UInt16
                 or SpecialType.System_UInt32 or SpecialType.System_UInt64;
-
-        /// <summary>
-        /// Determines whether a C# method override ultimately overrides a base
-        /// method that is defined outside the translated source (e.g. an
-        /// <see cref="object"/> virtual such as <c>ToString</c>, or a framework
-        /// base like <c>System.IO.Stream.Read</c>). G# does not treat the virtual
-        /// members of metadata (non-source) types as <c>open</c>, so re-declaring
-        /// them must omit the <c>override</c> modifier (OD-T5; otherwise
-        /// GS0183/GS0184). The plain <c>func</c> form binds as the override.
-        /// </summary>
-        private static bool OverridesExternalBaseMethod(IMethodSymbol method)
-        {
-            IMethodSymbol baseMethod = method.OverriddenMethod;
-            if (baseMethod == null)
-            {
-                return false;
-            }
-
-            while (baseMethod.OverriddenMethod != null)
-            {
-                baseMethod = baseMethod.OverriddenMethod;
-            }
-
-            return baseMethod.DeclaringSyntaxReferences.IsEmpty;
-        }
-
-        /// <summary>
-        /// Property counterpart of <see cref="OverridesExternalBaseMethod"/>: a C#
-        /// property override (e.g. <c>Stream.CanRead</c>) whose root base property
-        /// is defined outside the translated source must drop <c>override</c>.
-        /// </summary>
-        private static bool OverridesExternalBaseProperty(IPropertySymbol property)
-        {
-            IPropertySymbol baseProperty = property.OverriddenProperty;
-            if (baseProperty == null)
-            {
-                return false;
-            }
-
-            while (baseProperty.OverriddenProperty != null)
-            {
-                baseProperty = baseProperty.OverriddenProperty;
-            }
-
-            return baseProperty.DeclaringSyntaxReferences.IsEmpty;
-        }
 
         private IEnumerable<(GMember Member, bool IsStatic)> TranslateField(
             FieldDeclarationSyntax field,
@@ -1028,7 +994,7 @@ public sealed partial class CSharpToGSharpTranslator
                 body = this.BuildAsyncVoidHandlerWrapperBody(parameters, body, node.GetLocation());
             }
 
-            bool isOverride = symbol != null && symbol.IsOverride && !OverridesExternalBaseMethod(symbol);
+            bool isOverride = symbol != null && symbol.IsOverride;
 
             // Interface members are implicitly abstract in C#; in canonical G# the
             // members of an `interface` carry no modifier (the `open` keyword is for
@@ -1801,7 +1767,7 @@ public sealed partial class CSharpToGSharpTranslator
                 accessors = new List<PropertyAccessor>();
             }
 
-            bool isOverride = symbol != null && symbol.IsOverride && !OverridesExternalBaseProperty(symbol);
+            bool isOverride = symbol != null && symbol.IsOverride;
 
             // Interface members are implicitly abstract; canonical G# interface
             // members carry no `open` modifier (ADR-0115 §B.6).

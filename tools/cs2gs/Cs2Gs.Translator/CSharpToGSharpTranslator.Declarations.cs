@@ -1115,36 +1115,56 @@ public sealed partial class CSharpToGSharpTranslator
                 ? autoPropertyLift
                 : this.AnalyzeConstructorLift(node, mergedMembers, symbol, kind.Value);
 
-            // Issue #1990: a G# `struct`/`data struct` can NEVER carry an
-            // explicit `init(...)` constructor — the parser only accepts it on a
-            // `class` header (`DeclarationBinder.BindConstructors` early-returns
-            // for a non-class type). ADR-0115 §B.5 and §B.14 document this as a
-            // BY-DESIGN restriction: a G# value aggregate admits no explicit
-            // `init` at all, full stop — it is constructed only via primary
-            // constructors and struct literals. The lift above only drops the
-            // explicit constructor for the single-ctor, fully-liftable shape; a
-            // struct with MULTIPLE instance constructors — or one unliftable
-            // constructor (e.g. it reads an instance member, or reassigns a
-            // field) — leaves `lift.DropConstructor` false. There is no
-            // canonical G# form for this C# shape (silently downgrading the
-            // type to a `class` would flip value semantics to reference
-            // semantics — `Equals`, `default(T)`, copy-vs-alias, and boxing all
-            // change — which is exactly the kind of guess ADR-0115 §B forbids).
-            // Per the translator's "never guess" rule, record this as a loud,
-            // structured unsupported-construct gap instead and drop the type
-            // from the emitted output, same as the `unsupported aggregate kind`
-            // path above: a human must either rework the C# source to a single
-            // liftable constructor, explicitly accept a documented class
-            // downgrade, or file a G# language-gap issue to allow explicit
-            // `init` on a struct.
+            // Issues #1990/#2435: G# value aggregates have no explicit `init`
+            // member, but a C# struct constructor whose complete effect is a
+            // once-only set of member assignments can still be represented at
+            // every call site as a struct literal. Keep the struct and omit those
+            // constructor declarations; BuildObjectCreationCore resolves the
+            // actual overload and replays its analyzed plan. If even one
+            // constructor has logic the literal cannot preserve, diagnose the
+            // whole unsupported shape explicitly rather than silently dropping
+            // the type or changing value semantics via a class downgrade.
+            HashSet<ConstructorDeclarationSyntax> callSiteLoweredStructConstructors = null;
             if (!lift.DropConstructor &&
                 (kind == TypeDeclarationKind.Struct || kind == TypeDeclarationKind.DataStruct) &&
                 mergedMembers.OfType<ConstructorDeclarationSyntax>().Any(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword)))
             {
-                this.context.ReportUnsupported(
-                    node,
-                    $"'{node.Identifier.Text}' has no canonical G# form: it is a '{(kind == TypeDeclarationKind.DataStruct ? "record struct" : "struct")}' with multiple and/or unliftable instance constructors, and a G# struct/data struct admits no explicit 'init(...)' constructor by design (ADR-0115 §B.5, §B.14; issue #1990). Silently mapping it to a class would change value semantics to reference semantics (Equals/GetHashCode become reference-identity, default(T) becomes null, copies become aliases, storage becomes heap-allocated), so it is not auto-translated. Rework the C# type to a single liftable constructor, explicitly accept a documented class downgrade and re-author it as a class, or file a G# language-gap issue requesting explicit 'init' support on structs.");
-                return null;
+                callSiteLoweredStructConstructors = new HashSet<ConstructorDeclarationSyntax>();
+                string unsupportedConstructorReason = null;
+                foreach (ConstructorDeclarationSyntax ctor in mergedMembers
+                    .OfType<ConstructorDeclarationSyntax>()
+                    .Where(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword)))
+                {
+                    using IDisposable modelScope = this.context.UseSemanticModelFor(ctor.SyntaxTree);
+                    var ctorSymbol = this.context.GetDeclaredSymbol(ctor) as IMethodSymbol;
+                    if (!this.TryAnalyzeStructConstructor(
+                        ctorSymbol,
+                        symbol,
+                        out _,
+                        out unsupportedConstructorReason))
+                    {
+                        break;
+                    }
+
+                    callSiteLoweredStructConstructors.Add(ctor);
+                }
+
+                int instanceConstructorCount = mergedMembers
+                    .OfType<ConstructorDeclarationSyntax>()
+                    .Count(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword));
+                if (callSiteLoweredStructConstructors.Count != instanceConstructorCount)
+                {
+                    this.context.ReportUnsupported(
+                        node,
+                        $"'{node.Identifier.Text}' has no canonical G# form: it is a '{(kind == TypeDeclarationKind.DataStruct ? "record struct" : "struct")}' with an instance constructor that cannot be lowered to call-site struct literals. {unsupportedConstructorReason} A G# struct/data struct admits no explicit 'init(...)' constructor by design (ADR-0115 §B.5, §B.14; issues #1990 and #2435). Silently mapping it to a class would change value semantics to reference semantics (Equals/GetHashCode become reference-identity, default(T) becomes null, copies become aliases, storage becomes heap-allocated), so it is not auto-translated.");
+                    return null;
+                }
+
+                this.context.Report(new TranslationDiagnostic(
+                    nameof(SyntaxKind.ConstructorDeclaration),
+                    $"struct '{node.Identifier.Text}' constructor overloads are lowered at their call sites to G# struct literals because G# value aggregates have no explicit 'init(...)' members (issue #2435).",
+                    node.GetLocation(),
+                    TranslationSeverity.Info));
             }
 
             // Issue #2003: a primary-constructor parameter (native C#12 shape or
@@ -1192,7 +1212,13 @@ public sealed partial class CSharpToGSharpTranslator
                 // in a different `SyntaxTree`; resolve it (and everything nested
                 // inside it) through that tree's own semantic model.
                 using IDisposable modelScope = this.context.UseSemanticModelFor(member.SyntaxTree);
-                foreach ((GMember translated, bool isStatic) in this.TranslateMember(member, kind.Value, lift, propertyCtorInits, primaryCtorParamNames))
+                foreach ((GMember translated, bool isStatic) in this.TranslateMember(
+                    member,
+                    kind.Value,
+                    lift,
+                    propertyCtorInits,
+                    primaryCtorParamNames,
+                    callSiteLoweredStructConstructors))
                 {
                     // A C# operator overload translates to a receiver-clause
                     // `func (a T) operator <op>(...)`; like every receiver-clause
@@ -1426,9 +1452,10 @@ public sealed partial class CSharpToGSharpTranslator
             }
 
             var primaryParameters = new List<Parameter>();
-            var propertiesAsParams = new HashSet<string>();
-            var propertiesAsBodyFields = new HashSet<string>();
-            var bodyFieldInitializers = new Dictionary<string, GExpression>();
+            var propertiesAsParams = new HashSet<IPropertySymbol>(SymbolEqualityComparer.Default);
+            var propertiesAsBodyFields = new HashSet<IPropertySymbol>(SymbolEqualityComparer.Default);
+            var bodyFieldInitializers =
+                new Dictionary<IPropertySymbol, GExpression>(SymbolEqualityComparer.Default);
             foreach (PropertyDeclarationSyntax prop in eligible)
             {
                 if (this.context.GetDeclaredSymbol(prop) is not IPropertySymbol propSymbol ||
@@ -1472,8 +1499,8 @@ public sealed partial class CSharpToGSharpTranslator
                     // parameter) reuses that machinery — the required/optional
                     // machinery on the primary constructor itself never needs
                     // to represent a non-constant value at all.
-                    propertiesAsBodyFields.Add(prop.Identifier.Text);
-                    bodyFieldInitializers[prop.Identifier.Text] = this.TranslateExpression(prop.Initializer.Value);
+                    propertiesAsBodyFields.Add(propSymbol);
+                    bodyFieldInitializers[propSymbol] = this.TranslateExpression(prop.Initializer.Value);
                     continue;
                 }
 
@@ -1482,7 +1509,7 @@ public sealed partial class CSharpToGSharpTranslator
                     : null;
 
                 primaryParameters.Add(new Parameter(SanitizeIdentifier(prop.Identifier.Text), type, defaultValue: defaultValue));
-                propertiesAsParams.Add(prop.Identifier.Text);
+                propertiesAsParams.Add(propSymbol);
             }
 
             if (primaryParameters.Count == 0 && propertiesAsBodyFields.Count == 0)
@@ -1490,7 +1517,10 @@ public sealed partial class CSharpToGSharpTranslator
                 return ConstructorLift.None;
             }
 
-            var reportedNames = propertiesAsParams.Concat(propertiesAsBodyFields).OrderBy(n => n, StringComparer.Ordinal);
+            var reportedNames = propertiesAsParams
+                .Concat(propertiesAsBodyFields)
+                .Select(p => p.Name)
+                .OrderBy(n => n, StringComparer.Ordinal);
             this.context.Report(new TranslationDiagnostic(
                 nameof(SyntaxKind.RecordDeclaration),
                 $"record '{record.Identifier.Text}' is canonicalized to a 'data class'/'data struct': body auto-property data member(s) {string.Join(", ", reportedNames)} become primary-constructor parameter fields (now public and mutable), or — for a non-constant initializer that cannot be a valid G# optional-parameter default — a plain body field carrying that initializer (ADR-0115 §B.3/§B.4, issue #2228, issue #2281).",
@@ -1564,7 +1594,9 @@ public sealed partial class CSharpToGSharpTranslator
                 return ConstructorLift.None;
             }
 
-            var paramToTarget = new Dictionary<IParameterSymbol, (string Name, ITypeSymbol Type, bool IsProperty)>(SymbolEqualityComparer.Default);
+            var paramToTarget =
+                new Dictionary<IParameterSymbol, (string Name, ITypeSymbol Type, IPropertySymbol Property)>(
+                    SymbolEqualityComparer.Default);
             var fieldInitializers = new Dictionary<string, GExpression>();
             var residualInitStatements = new List<GStatement>();
 
@@ -1586,7 +1618,7 @@ public sealed partial class CSharpToGSharpTranslator
                     // constructor parameter named after the member.
                     string targetName;
                     ITypeSymbol targetType;
-                    bool targetIsProperty;
+                    IPropertySymbol targetProperty;
                     ISymbol leftSymbol = this.context.GetSymbolInfo(assignment.Left).Symbol;
                     if (leftSymbol is IFieldSymbol fieldSymbol &&
                         !fieldSymbol.IsStatic &&
@@ -1594,7 +1626,7 @@ public sealed partial class CSharpToGSharpTranslator
                     {
                         targetName = fieldSymbol.Name;
                         targetType = fieldSymbol.Type;
-                        targetIsProperty = false;
+                        targetProperty = null;
                     }
                     else if (leftSymbol is IPropertySymbol propertySymbol &&
                         !propertySymbol.IsStatic &&
@@ -1602,7 +1634,7 @@ public sealed partial class CSharpToGSharpTranslator
                     {
                         targetName = propertySymbol.Name;
                         targetType = propertySymbol.Type;
-                        targetIsProperty = true;
+                        targetProperty = propertySymbol;
 
                         // OD-T1: G# primary-constructor parameters are NOT
                         // properties, so a *class* that copies a constructor
@@ -1637,7 +1669,7 @@ public sealed partial class CSharpToGSharpTranslator
                             return ConstructorLift.None;
                         }
 
-                        paramToTarget[paramSymbol] = (targetName, targetType, targetIsProperty);
+                        paramToTarget[paramSymbol] = (targetName, targetType, targetProperty);
                         continue;
                     }
 
@@ -1668,7 +1700,7 @@ public sealed partial class CSharpToGSharpTranslator
                     // is rejected). A constant assignment to a property therefore
                     // cannot be lifted to a member initializer; keep the explicit
                     // 'init' so its body faithfully assigns the property.
-                    if (targetIsProperty)
+                    if (targetProperty != null)
                     {
                         return ConstructorLift.None;
                     }
@@ -1718,10 +1750,10 @@ public sealed partial class CSharpToGSharpTranslator
 
             var primaryParameters = new List<Parameter>();
             var fieldsAsParams = new HashSet<string>();
-            var propertiesAsParams = new HashSet<string>();
+            var propertiesAsParams = new HashSet<IPropertySymbol>(SymbolEqualityComparer.Default);
             foreach (IParameterSymbol param in ctorSymbol.Parameters)
             {
-                (string Name, ITypeSymbol Type, bool IsProperty) target = paramToTarget[param];
+                (string Name, ITypeSymbol Type, IPropertySymbol Property) target = paramToTarget[param];
                 GTypeReference type = this.typeMapper.Map(target.Type, this.context, param.Locations.FirstOrDefault());
 
                 // Issue #914 (oblivious sink): a T2-lifted primary-constructor
@@ -1739,9 +1771,9 @@ public sealed partial class CSharpToGSharpTranslator
                 type = this.PromoteDelegateParameterInvokedWithNull(type, param);
                 GExpression liftedDefault = this.BuildOptionalParameterDefault(param, type, node);
                 primaryParameters.Add(new Parameter(SanitizeIdentifier(target.Name), type, defaultValue: liftedDefault));
-                if (target.IsProperty)
+                if (target.Property != null)
                 {
-                    propertiesAsParams.Add(target.Name);
+                    propertiesAsParams.Add(target.Property);
                 }
                 else
                 {
@@ -1749,7 +1781,10 @@ public sealed partial class CSharpToGSharpTranslator
                 }
             }
 
-            var allParamNames = fieldsAsParams.Concat(propertiesAsParams).OrderBy(n => n).ToList();
+            var allParamNames = fieldsAsParams
+                .Concat(propertiesAsParams.Select(p => p.Name))
+                .OrderBy(n => n)
+                .ToList();
             if (allParamNames.Count > 0)
             {
                 this.context.Report(new TranslationDiagnostic(
