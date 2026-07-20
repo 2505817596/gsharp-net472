@@ -527,7 +527,7 @@ public sealed partial class CSharpToGSharpTranslator
         {
             GExpression translated = this.TranslateExpression(recv);
 
-            if (this.ReceiverNeedsNullForgiveness(recv)
+            if (this.ReceiverNeedsNullForgiveness(recv, isDereferenceReceiver: true)
                 || this.ReceiverIsNullableReferenceFieldOrProperty(recv))
             {
                 translated = new NonNullAssertionExpression(translated);
@@ -713,9 +713,10 @@ public sealed partial class CSharpToGSharpTranslator
         }
 
         // True when <paramref name="member"/> binds to an extension method whose
-        // (reduced) `this` parameter is nullable-annotated (`this T? x`). Such a
-        // method is designed to accept a null receiver, so the translated call must
-        // keep the declared-nullable receiver rather than forgive it to non-null.
+        // (reduced) `this` parameter is nullable-annotated (`this T? x`) or was
+        // promoted nullable by oblivious analysis. Such a method is designed to
+        // accept a null receiver, so the translated call must keep that nullable
+        // receiver rather than forgive it to non-null.
         private bool MemberBindsToNullableThisExtension(MemberAccessExpressionSyntax member)
         {
             if (this.context.GetSymbolInfo(member).Symbol is not IMethodSymbol method)
@@ -732,6 +733,7 @@ public sealed partial class CSharpToGSharpTranslator
             IParameterSymbol thisParameter = unreduced.Parameters[0];
             return thisParameter.Type.IsReferenceType
                 ? thisParameter.NullableAnnotation == NullableAnnotation.Annotated
+                    || this.ShouldPromoteToNullableReference(thisParameter)
                 : thisParameter.Type.OriginalDefinition?.SpecialType == SpecialType.System_Nullable_T;
         }
 
@@ -756,13 +758,97 @@ public sealed partial class CSharpToGSharpTranslator
             return translated;
         }
 
+        // Issue #2511: element-access arguments are call-like value sinks too.
+        // Apply the established forgiveness predicate only when Roslyn bound the
+        // argument to a non-null reference parameter that cs2gs will keep
+        // non-null. Arrays and numeric/string/span indices therefore stay on
+        // their existing paths, explicitly nullable indexer contracts remain
+        // untouched, and nullable-enabled projects receive no new assertions.
+        // A genuinely null oblivious key follows the existing `!!` bridge
+        // policy and fails at runtime before the index operation.
+        private GExpression TranslateIndexArgumentWithNullForgiveness(ArgumentSyntax argument)
+        {
+            GExpression translated = this.TranslateExpression(argument.Expression);
+            if (!this.IsObliviousCompilation()
+                || !this.IndexArgumentTargetsNonNullableReference(argument)
+                || !this.IndexArgumentValueNeedsNullForgiveness(argument.Expression))
+            {
+                return translated;
+            }
+
+            GExpression assertionOperand = argument.Expression is ConditionalExpressionSyntax
+                or SwitchExpressionSyntax
+                or ConditionalAccessExpressionSyntax
+                    ? new ParenthesizedExpression(translated)
+                    : translated;
+            return new NonNullAssertionExpression(assertionOperand);
+        }
+
+        private bool IndexArgumentValueNeedsNullForgiveness(ExpressionSyntax value)
+        {
+            if (value is PostfixUnaryExpressionSyntax
+                    { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression }
+                || this.IsWithinExpressionTreeLambda(value))
+            {
+                return false;
+            }
+
+            if (this.ReceiverNeedsNullForgiveness(value))
+            {
+                return true;
+            }
+
+            switch (value)
+            {
+                case ParenthesizedExpressionSyntax parenthesized:
+                    return this.IndexArgumentValueNeedsNullForgiveness(parenthesized.Expression);
+
+                case ConditionalExpressionSyntax conditional:
+                    return this.IndexArgumentValueNeedsNullForgiveness(conditional.WhenTrue)
+                        || this.IndexArgumentValueNeedsNullForgiveness(conditional.WhenFalse);
+
+                case SwitchExpressionSyntax switchExpression:
+                    return switchExpression.Arms.Any(arm =>
+                        this.IndexArgumentValueNeedsNullForgiveness(arm.Expression));
+
+                case ConditionalAccessExpressionSyntax:
+                    return true;
+            }
+
+            ISymbol symbol = this.context.GetSymbolInfo(value).Symbol;
+            return symbol is IFieldSymbol or IPropertySymbol or ILocalSymbol or IParameterSymbol or IMethodSymbol
+                && this.IsNullablePromotedValue(value)
+                && !this.IsDominatedByNullCheckGuard(value, symbol);
+        }
+
+        private bool IndexArgumentTargetsNonNullableReference(ArgumentSyntax argument)
+        {
+            if (this.context.SemanticModel.GetOperation(argument) is not IArgumentOperation
+                {
+                    Parameter: { } parameter,
+                })
+            {
+                return false;
+            }
+
+            return this.ParameterWillRemainNonNullableReference(parameter);
+        }
+
+        private bool ParameterWillRemainNonNullableReference(IParameterSymbol parameter)
+        {
+            return this.TargetWillRemainNonNullableReference(parameter.Type, parameter);
+        }
+
         /// <summary>
-        /// Determines whether <paramref name="recv"/> is a declared-nullable
-        /// reference receiver that Roslyn's flow analysis has narrowed to non-null,
-        /// and therefore needs a G# <c>!!</c> assertion (see
+        /// Determines whether <paramref name="recv"/> needs a G# <c>!!</c>
+        /// assertion because it is either a declared-nullable reference narrowed
+        /// non-null by flow or an ordinary dereference receiver whose declaration
+        /// was promoted nullable by oblivious analysis (see
         /// <see cref="TranslateReceiverWithNullForgiveness"/>).
         /// </summary>
-        private bool ReceiverNeedsNullForgiveness(ExpressionSyntax recv)
+        private bool ReceiverNeedsNullForgiveness(
+            ExpressionSyntax recv,
+            bool isDereferenceReceiver = false)
         {
             // `expr!` already lowers to a `NonNullAssertionExpression`; never
             // double-assert. `this`/`base`, a null literal, and a `?.` conditional
@@ -775,6 +861,40 @@ public sealed partial class CSharpToGSharpTranslator
                 or ConditionalAccessExpressionSyntax)
             {
                 return false;
+            }
+
+            // Issue #2496: `!!` is a runtime-only G# operator and therefore is
+            // never representable inside an expression tree (GS0473). Use the
+            // lambda's semantic converted type rather than call/constructor
+            // syntax so this covers overload-selected Expression<TDelegate>
+            // parameters, generic expression sinks, fluent APIs, and nested
+            // quoted lambdas uniformly. A user-authored C# suppression (`expr!`)
+            // has already returned above and still translates to `!!`, preserving
+            // the compiler's expression-tree restriction diagnostic.
+            if (this.IsWithinExpressionTreeLambda(recv))
+            {
+                return false;
+            }
+
+            // Issue #2504/#2496: a method group or lambda is the callable value
+            // itself, never the nullable value produced by invoking it. External
+            // oblivious-return forgiveness belongs at the callable's result
+            // contract, not as `MethodGroup!!` on the delegate conversion seam.
+            if (this.IsCallableValueExpression(recv))
+            {
+                return false;
+            }
+
+            // Issue #2506: the oblivious analysis promotes a same-project
+            // method/property/indexer declaration when its VALUE can be null.
+            // An ordinary C# dereference of that value still means
+            // throw-on-null, so the corresponding G# receiver needs one `!!`.
+            // Keep this receiver-only: a method group is the callable value
+            // rather than its return, and a promoted call forwarded as a return
+            // or argument must remain `T?` instead of being blanket-forgiven.
+            if (isDereferenceReceiver && this.ReceiverValueIsPromotedNullable(recv))
+            {
+                return true;
             }
 
             // Issue #2164: the classic lazy-singleton pattern initializes a
@@ -852,6 +972,16 @@ public sealed partial class CSharpToGSharpTranslator
             // implicitly (oblivious, unchecked), so asserting `!!` here is the
             // minimal bridge, not a widening of the interface contract.
             if (this.IsUnguardedForwardOfTaintedValueInReturnPreservingBody(recv))
+            {
+                return true;
+            }
+
+            // Issue #2496: once callable values stop borrowing their synthesized
+            // method symbol's return taint, a runtime delegate lambda still needs
+            // the old, legitimate bridge at its RESULT seam. Keep that bridge
+            // narrowly target-typed to a non-null delegate return contract. The
+            // expression-tree guard above deliberately excludes quoted lambdas.
+            if (this.IsUnguardedForwardOfTaintedValueAsRuntimeLambdaResult(recv))
             {
                 return true;
             }
@@ -956,6 +1086,102 @@ public sealed partial class CSharpToGSharpTranslator
             // too, so its flow-proven uses need the same assertion for consistency.
             return declared.NullableAnnotation == NullableAnnotation.Annotated
                 || this.ShouldPromoteToNullableReference(symbol);
+        }
+
+        private bool ReceiverValueIsPromotedNullable(ExpressionSyntax expression)
+        {
+            if (!this.IsObliviousCompilation())
+            {
+                return false;
+            }
+
+            switch (expression)
+            {
+                case ParenthesizedExpressionSyntax parenthesized:
+                    return this.ReceiverValueIsPromotedNullable(parenthesized.Expression);
+
+                case CastExpressionSyntax cast:
+                    ITypeSymbol castTarget = this.context.GetTypeInfo(cast.Type).Type;
+                    ITypeSymbol castSource = this.context.GetTypeInfo(cast.Expression).Type;
+                    return castTarget != null
+                        && castSource != null
+                        && this.context.Compilation.ClassifyConversion(castSource, castTarget).IsReference
+                        && this.ReceiverValueIsPromotedNullable(cast.Expression);
+
+                case AwaitExpressionSyntax awaited:
+                    return this.AwaitedReceiverValueIsPromotedNullable(awaited.Expression);
+
+                case ConditionalExpressionSyntax conditional:
+                    return this.ReceiverValueIsPromotedNullable(conditional.WhenTrue)
+                        || this.ReceiverValueIsPromotedNullable(conditional.WhenFalse);
+
+                case SwitchExpressionSyntax switchExpression:
+                    return switchExpression.Arms.Any(arm =>
+                        this.ReceiverValueIsPromotedNullable(arm.Expression));
+
+                // `a ?? b` is non-null whenever `b` is non-null; only the
+                // fallback value can make the coalesced receiver nullable.
+                case BinaryExpressionSyntax coalesce
+                    when coalesce.IsKind(SyntaxKind.CoalesceExpression):
+                    return this.ReceiverValueIsPromotedNullable(coalesce.Right);
+
+                case InvocationExpressionSyntax invocation
+                    when this.context.GetSymbolInfo(invocation).Symbol is IMethodSymbol method:
+                    // Method-return taint on Task<T>/ValueTask<T> widens the
+                    // awaited T, not the non-null task envelope itself.
+                    return !IsTaskLikeEnvelope(method.ReturnType)
+                        && this.ShouldPromoteToNullableReference(method);
+
+                case ElementAccessExpressionSyntax elementAccess:
+                    return this.context.GetSymbolInfo(elementAccess).Symbol is IPropertySymbol indexer
+                        && this.ShouldPromoteToNullableReference(indexer);
+
+                case IdentifierNameSyntax:
+                case MemberAccessExpressionSyntax:
+                    ISymbol symbol = this.context.GetSymbolInfo(expression).Symbol;
+                    return symbol is IFieldSymbol or IPropertySymbol or ILocalSymbol or IParameterSymbol
+                        && this.ShouldPromoteToNullableReference(symbol);
+
+                default:
+                    return false;
+            }
+        }
+
+        private bool AwaitedReceiverValueIsPromotedNullable(ExpressionSyntax expression)
+        {
+            switch (expression)
+            {
+                case ParenthesizedExpressionSyntax parenthesized:
+                    return this.AwaitedReceiverValueIsPromotedNullable(parenthesized.Expression);
+
+                case CastExpressionSyntax cast:
+                    return this.AwaitedReceiverValueIsPromotedNullable(cast.Expression);
+
+                case ConditionalExpressionSyntax conditional:
+                    return this.AwaitedReceiverValueIsPromotedNullable(conditional.WhenTrue)
+                        || this.AwaitedReceiverValueIsPromotedNullable(conditional.WhenFalse);
+
+                case InvocationExpressionSyntax invocation
+                    when this.context.GetSymbolInfo(invocation).Symbol is IMethodSymbol method:
+                    return IsTaskLikeEnvelope(method.ReturnType)
+                        && this.ShouldPromoteToNullableReference(method);
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsTaskLikeEnvelope(ITypeSymbol type)
+        {
+            if (type is not INamedTypeSymbol named
+                || !named.IsGenericType
+                || named.TypeArguments.Length != 1
+                || named.Name is not ("Task" or "ValueTask"))
+            {
+                return false;
+            }
+
+            return named.ContainingNamespace.ToDisplayString() == "System.Threading.Tasks";
         }
 
         // Issue #2164: true when <paramref name="recv"/> reads a nullable
@@ -1410,13 +1636,6 @@ public sealed partial class CSharpToGSharpTranslator
                 return false;
             }
 
-            ITypeSymbol parameterType = parameter.Type;
-            if (parameterType is not { IsReferenceType: true }
-                || parameterType.NullableAnnotation == NullableAnnotation.Annotated)
-            {
-                return false;
-            }
-
             // If cs2gs will ALSO promote the bound parameter to nullable (the
             // ordinary same-project method case above), the argument already
             // widens `T? -> T?` with no `!!` required — forcing one here would
@@ -1442,11 +1661,96 @@ public sealed partial class CSharpToGSharpTranslator
             // symbol category entirely and leaves the same-project method
             // case (whose parameter genuinely has a declaring syntax node
             // here) unaffected.
-            bool parameterDeclaredInThisCompilation = parameter.DeclaringSyntaxReferences
-                .Any(reference => this.context.Compilation.ContainsSyntaxTree(reference.SyntaxTree));
+            return this.ParameterWillRemainNonNullableReference(parameter);
+        }
 
-            return !(parameterDeclaredInThisCompilation
-                && this.ShouldPromoteToNullableReference(parameter));
+        private bool IsUnguardedForwardOfTaintedValueAsRuntimeLambdaResult(ExpressionSyntax use)
+        {
+            if (!this.IsObliviousCompilation()
+                || this.IsWithinExpressionTreeLambda(use)
+                || this.FindResultLambda(use) is not { } lambda
+                || this.GetLambdaTargetDelegateType(lambda) is not { DelegateInvokeMethod: { } invoke }
+                || invoke.ReturnType is not { IsReferenceType: true }
+                || invoke.ReturnType.NullableAnnotation == NullableAnnotation.Annotated)
+            {
+                return false;
+            }
+
+            bool returnDeclaredInThisCompilation = invoke.DeclaringSyntaxReferences
+                .Any(reference => this.context.Compilation.ContainsSyntaxTree(reference.SyntaxTree));
+            if (returnDeclaredInThisCompilation
+                && this.ShouldPromoteToNullableReference(invoke))
+            {
+                return false;
+            }
+
+            return this.IsNullablePromotedValue(use)
+                || IsObliviousExternalNullableMember(this.context.GetSymbolInfo(use).Symbol);
+        }
+
+        private AnonymousFunctionExpressionSyntax FindResultLambda(ExpressionSyntax use)
+        {
+            SyntaxNode node = use;
+            while (node.Parent is ParenthesizedExpressionSyntax)
+            {
+                node = node.Parent;
+            }
+
+            if (node.Parent is AnonymousFunctionExpressionSyntax expressionLambda
+                && expressionLambda.Body == node)
+            {
+                return expressionLambda;
+            }
+
+            if (node.Parent is not ReturnStatementSyntax returnStatement)
+            {
+                return null;
+            }
+
+            for (SyntaxNode ancestor = returnStatement.Parent; ancestor != null; ancestor = ancestor.Parent)
+            {
+                if (ancestor is AnonymousFunctionExpressionSyntax lambda)
+                {
+                    return lambda;
+                }
+
+                if (ancestor is LocalFunctionStatementSyntax or BaseMethodDeclarationSyntax)
+                {
+                    return null;
+                }
+            }
+
+            return null;
+        }
+
+        private bool IsWithinExpressionTreeLambda(SyntaxNode node) =>
+            node.AncestorsAndSelf()
+                .OfType<AnonymousFunctionExpressionSyntax>()
+                .Any(lambda => this.IsExpressionTreeLambda(lambda));
+
+        private bool IsExpressionTreeLambda(AnonymousFunctionExpressionSyntax lambda) =>
+            this.context.GetTypeInfo(lambda).ConvertedType is INamedTypeSymbol converted
+                && converted.IsGenericType
+                && converted.OriginalDefinition.MetadataName == "Expression`1"
+                && converted.ContainingNamespace?.ToDisplayString() == "System.Linq.Expressions"
+                && converted.TypeArguments.Length == 1
+                && converted.TypeArguments[0].TypeKind == TypeKind.Delegate;
+
+        private INamedTypeSymbol GetLambdaTargetDelegateType(AnonymousFunctionExpressionSyntax lambda)
+        {
+            if (this.context.GetTypeInfo(lambda).ConvertedType is not INamedTypeSymbol converted)
+            {
+                return null;
+            }
+
+            if (converted.TypeKind == TypeKind.Delegate)
+            {
+                return converted;
+            }
+
+            return this.IsExpressionTreeLambda(lambda)
+                ? converted.TypeArguments[0] as INamedTypeSymbol
+                : null;
         }
 
         // Walks outward from <paramref name="use"/> through parentheses to find

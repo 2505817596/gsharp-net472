@@ -92,10 +92,17 @@ internal sealed partial class ExpressionBinder
             // reporting an immediate "unable to find member". Non-+/-
             // operators (issue #2154) can never be an event, so skip straight
             // to the compound-assignment fallback.
-            if (isEventCapableOperator && TypeMemberModel.TryGetStaticEvent(staticStruct, eventName, out var ev))
+            if (isEventCapableOperator
+                && TypeMemberModel.TryGetStaticEventIncludingInherited(staticStruct, eventName, out var ev, out var eventOwner))
             {
-                var userHandler = BindEventSubscriptionHandler(syntax.Value, ev.Type);
-                return new BoundEventSubscriptionExpression(null, receiver: null, staticStruct, ev, userHandler, isAdd);
+                if (!AccessibilityChecker.IsAccessible(ev.Accessibility, eventOwner, function))
+                {
+                    Diagnostics.ReportMemberInaccessible(eventNameSyntax.Location, ev.Name, eventOwner.Name, ev.Accessibility);
+                }
+
+                var eventType = eventOwner.SubstituteMemberType(ev.Type);
+                var userHandler = BindEventSubscriptionHandler(syntax.Value, eventType);
+                return new BoundEventSubscriptionExpression(null, receiver: null, eventOwner, ev, userHandler, isAdd, eventType);
             }
 
             // ADR-0053: `Type.StaticField op= rhs` / `Type.StaticProp op= rhs`.
@@ -106,8 +113,16 @@ internal sealed partial class ExpressionBinder
                 return compoundResult;
             }
 
-            Diagnostics.ReportUnableToFindMember(eventNameSyntax.Location, eventName);
-            return new BoundErrorExpression(null);
+            if (TypeMemberModel.GetNearestImportedBase(staticStruct)?.ClrType is Type importedBaseClr)
+            {
+                receiverClrType = importedBaseClr;
+                flags = BindingFlags.Public | BindingFlags.Static;
+            }
+            else
+            {
+                Diagnostics.ReportUnableToFindMember(eventNameSyntax.Location, eventName);
+                return new BoundErrorExpression(null);
+            }
         }
         else if (accessor.LeftPart is NameExpressionSyntax ifaceLeftName
             && scope.TryLookupTypeAlias(ifaceLeftName.IdentifierToken.Text, out var ifaceTypeAlias)
@@ -143,7 +158,20 @@ internal sealed partial class ExpressionBinder
             // TYPE, resolved to the constructed symbol (mirroring the READ /
             // simple-write paths) rather than bound as element access, and the
             // carried construction drives per-construction emit/storage.
-            _ = ctorImported;
+            if (ctorStruct != null
+                && isEventCapableOperator
+                && TypeMemberModel.TryGetStaticEventIncludingInherited(ctorStruct, eventName, out var ctorEvent, out var ctorEventOwner))
+            {
+                if (!AccessibilityChecker.IsAccessible(ctorEvent.Accessibility, ctorEventOwner, function))
+                {
+                    Diagnostics.ReportMemberInaccessible(eventNameSyntax.Location, ctorEvent.Name, ctorEventOwner.Name, ctorEvent.Accessibility);
+                }
+
+                var eventType = ctorEventOwner.SubstituteMemberType(ctorEvent.Type);
+                var handler = BindEventSubscriptionHandler(syntax.Value, eventType);
+                return new BoundEventSubscriptionExpression(null, receiver: null, ctorEventOwner, ctorEvent, handler, isAdd, eventType);
+            }
+
             if (ctorStruct != null
                 && TryBindUserTypeStaticCompoundAssignment(ctorStruct, eventNameSyntax, syntax, baseOpSyntaxKind, out var ctorStructCompound))
             {
@@ -156,8 +184,22 @@ internal sealed partial class ExpressionBinder
                 return ctorCompound;
             }
 
-            Diagnostics.ReportUnableToFindMember(eventNameSyntax.Location, eventName);
-            return new BoundErrorExpression(null);
+            if (ctorStruct != null
+                && TypeMemberModel.GetNearestImportedBase(ctorStruct)?.ClrType is Type constructedImportedBase)
+            {
+                receiverClrType = constructedImportedBase;
+                flags = BindingFlags.Public | BindingFlags.Static;
+            }
+            else if (ctorImported != null)
+            {
+                receiverClrType = ctorImported.ClassType;
+                flags = BindingFlags.Public | BindingFlags.Static;
+            }
+            else
+            {
+                Diagnostics.ReportUnableToFindMember(eventNameSyntax.Location, eventName);
+                return new BoundErrorExpression(null);
+            }
         }
         else
         {
@@ -179,6 +221,24 @@ internal sealed partial class ExpressionBinder
                 return new BoundEventSubscriptionExpression(null, boundReceiver, userStruct, ev, userHandler, isAdd);
             }
 
+            // Issue #2519: a class-constrained type parameter exposes the same
+            // instance event surface as its constraint's fields, properties,
+            // and methods. TypeMemberModel walks inherited events; retain the
+            // constraint as the event owner while the receiver remains T.
+            if (isEventCapableOperator
+                && boundReceiver.Type is TypeParameterSymbol { ClassConstraint: StructSymbol classConstraint }
+                && TypeMemberModel.TryGetEvent(classConstraint, eventName, out var constrainedUserEvent))
+            {
+                var constrainedHandler = BindEventSubscriptionHandler(syntax.Value, constrainedUserEvent.Type);
+                return new BoundEventSubscriptionExpression(
+                    null,
+                    boundReceiver,
+                    classConstraint,
+                    constrainedUserEvent,
+                    constrainedHandler,
+                    isAdd);
+            }
+
             // ADR-0149 follow-up (issue #2370): event subscription through an
             // INTERFACE-typed receiver (`b: IFoo; b.Changed += h`). Interfaces
             // could always declare events, but no call-site binding ever
@@ -196,6 +256,53 @@ internal sealed partial class ExpressionBinder
                 return new BoundEventSubscriptionExpression(null, boundReceiver, userIface, ifaceEv, ifaceHandler, isAdd);
             }
 
+            if (isEventCapableOperator
+                && boundReceiver.Type is TypeParameterSymbol tpReceiver
+                && tpReceiver.ClrInterfaceConstraint is TypeSymbol clrInterfaceConstraint
+                && clrInterfaceConstraint.ClrType is Type clrInterface
+                && clrInterface.IsInterface)
+            {
+                var constrainedEvent = ClrTypeUtilities.SafeGetEventIncludingInterfaces(
+                    clrInterface,
+                    eventName,
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (constrainedEvent != null)
+                {
+                    var constrainedHandlerType = constrainedEvent.EventHandlerType;
+                    var constrainedHandlerTypeSymbol = MemberLookup.GetClrEventHandlerTypeSymbol(
+                        clrInterfaceConstraint,
+                        constrainedEvent);
+                    var constrainedBoundHandler = BindEventSubscriptionHandler(syntax.Value, constrainedHandlerTypeSymbol);
+                    BoundExpression constrainedConvertedHandler;
+                    if (constrainedBoundHandler is BoundFunctionLiteralExpression
+                        || constrainedBoundHandler is BoundMethodGroupExpression
+                        || constrainedBoundHandler is BoundClrMethodGroupExpression
+                        || (constrainedBoundHandler.Type is FunctionTypeSymbol constrainedFunction
+                            && IsSignatureCompatibleWithDelegate(constrainedFunction, constrainedHandlerType)))
+                    {
+                        constrainedConvertedHandler = constrainedBoundHandler;
+                    }
+                    else
+                    {
+                        constrainedConvertedHandler = conversions.BindConversion(
+                            syntax.Value.Location,
+                            constrainedBoundHandler,
+                            constrainedHandlerTypeSymbol);
+                    }
+
+                    return new BoundClrEventSubscriptionExpression(
+                        null,
+                        boundReceiver,
+                        constrainedEvent,
+                        constrainedConvertedHandler,
+                        isAdd,
+                        tpReceiver,
+                        MemberLookup.GetClrMemberDeclaringTypeSymbol(
+                            clrInterfaceConstraint,
+                            constrainedEvent));
+                }
+            }
+
             receiverClrType = boundReceiver.Type?.ClrType;
             if (receiverClrType == null)
             {
@@ -208,6 +315,19 @@ internal sealed partial class ExpressionBinder
                 {
                     var compoundResult = TryBindChainedCompoundAssignment(
                         compoundStruct, boundReceiver, eventName, eventNameSyntax, syntax, baseOpSyntaxKind);
+                    if (compoundResult != null)
+                    {
+                        return compoundResult;
+                    }
+                }
+
+                // Issue #2519: use the class constraint as the member surface
+                // for `T.member op= value`, matching simple reads/writes and
+                // method/event lookup through the same constrained receiver.
+                if (boundReceiver.Type is TypeParameterSymbol { ClassConstraint: StructSymbol compoundConstraint })
+                {
+                    var compoundResult = TryBindChainedCompoundAssignment(
+                        compoundConstraint, boundReceiver, eventName, eventNameSyntax, syntax, baseOpSyntaxKind);
                     if (compoundResult != null)
                     {
                         return compoundResult;
@@ -531,9 +651,8 @@ internal sealed partial class ExpressionBinder
     // struct/enum. Build the symbolic awaiter type (`TaskAwaiter[U]`) so the
     // emitted awaiter pool field and `GetAwaiter()`/`GetResult()` call sites
     // agree on `!!0`/`!0` instead of the erased `object`.
-    private static bool IsAwaiterTypeArgumentCandidate(TypeSymbol a) =>
-        a is StructSymbol or InterfaceSymbol or EnumSymbol or TypeParameterSymbol
-        || (a is NullableTypeSymbol nt && nt.UnderlyingType is StructSymbol or InterfaceSymbol or EnumSymbol or TypeParameterSymbol);
+    private static bool IsAwaiterTypeArgumentCandidate(TypeSymbol a)
+        => TypeSymbol.RequiresSymbolicProjection(a);
 
     private static TypeSymbol TryGetAwaiterTypeSymbol(TypeSymbol awaitableType)
     {

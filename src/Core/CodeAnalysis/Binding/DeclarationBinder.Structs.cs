@@ -60,6 +60,11 @@ internal sealed partial class DeclarationBinder
                 }
             }
 
+            // Issue #2519: aggregate shells carry bare type parameters so every
+            // same-compilation constraint target can be published first.
+            // Resolve constraints now, with the declaring shell and all sibling
+            // source type shells visible, before binding signatures and members.
+            ResolveTypeParameterConstraints(syntax.TypeParameterList, structSymbol.TypeParameters);
             BindStructDeclarationBodyCore(syntax, package, structSymbol);
         }
         finally
@@ -566,8 +571,8 @@ internal sealed partial class DeclarationBinder
         // Phase 3.B.3 sub-step 3 + 3.B.4: resolve the optional `: X, Y, Z` clause.
         // Each identifier is either the (single) base class or an interface
         // implemented by this class. A base class, if present, must be the
-        // first identifier. Declaration order rules apply: base/interfaces
-        // must be declared before this type.
+        // first identifier. All same-compilation type shells are already
+        // declared, and the global binder orders class bodies base-first.
         StructSymbol baseClassSymbol = null;
         TypeSymbol importedBaseType = null;
         var implementedInterfaces = ImmutableArray.CreateBuilder<InterfaceSymbol>();

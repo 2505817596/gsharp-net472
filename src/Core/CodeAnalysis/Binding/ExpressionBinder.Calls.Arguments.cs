@@ -1123,7 +1123,13 @@ internal sealed partial class ExpressionBinder
             extensionArgumentNames = withReceiver;
         }
 
-        var candidates = this.memberLookup.CollectImportedExtensionMethods(methodName);
+        var extensionSymbolicArgs = MemberLookup.BuildSymbolicArgTypeVector(
+            receiver?.Type,
+            ImmutableArray.CreateRange(arguments.Select(a => a?.Type)));
+        var candidates = MemberLookup.ExcludeErasureOnlyEnumCandidates(
+            this.memberLookup.CollectImportedExtensionMethods(methodName),
+            extensionSymbolicArgs,
+            extensionArgumentNames).ToList();
         if (candidates.Count == 0)
         {
             return false;
@@ -1189,7 +1195,6 @@ internal sealed partial class ExpressionBinder
         // method-type-args may then surface a symbolic return like
         // `[]T` from `[]T{}.ToArray()` instead of the erased
         // `object[]`.
-        var extensionSymbolicArgs = MemberLookup.BuildSymbolicArgTypeVector(receiver?.Type, ImmutableArray.CreateRange(arguments.Select(a => a?.Type)));
         var extensionSymbolicTypeArgs = MemberLookup.BuildSymbolicMethodTypeArgs(best, typeArgSymbols, extensionSymbolicArgs);
         var extensionTypeArgSymbolsForCall = !extensionSymbolicTypeArgs.IsDefault ? extensionSymbolicTypeArgs : typeArgSymbols;
         var returnOverride = ResolveImportedGenericReturnType(best, typeArgSymbols)
@@ -2648,8 +2653,10 @@ internal sealed partial class ExpressionBinder
         // recovered by projecting through the constructed constraint interface;
         // a concrete return (e.g. IComparable.CompareTo -> int32) falls back to
         // the direct CLR mapping.
-        var returnType = ResolveInstanceReturnTypeFromReceiver(constraintInterface, method)
-            ?? MapClrMethodReturnType(method);
+        var returnType = MemberLookup.GetClrMethodReturnTypeSymbol(constraintInterface, method);
+        var declaringInterface = MemberLookup.GetClrMemberDeclaringTypeSymbol(
+            constraintInterface,
+            method);
 
         // Issue #1852: re-lower each interpolated-string argument whose
         // resolved parameter is IFormattable/FormattableString-shaped to
@@ -2685,7 +2692,7 @@ internal sealed partial class ExpressionBinder
             refKinds,
             default,
             constrainedReceiverTypeParameter: tp,
-            constrainedInterfaceType: constraintInterface);
+            constrainedInterfaceType: declaringInterface);
         return true;
     }
 

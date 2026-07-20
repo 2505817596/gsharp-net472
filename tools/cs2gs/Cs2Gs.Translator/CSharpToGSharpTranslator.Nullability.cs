@@ -121,7 +121,21 @@ public sealed partial class CSharpToGSharpTranslator
 
         private GTypeReference PromoteIfUsedAsNullable(GTypeReference type, ISymbol symbol)
         {
-            if (type == null || type.IsNullable)
+            if (type == null)
+            {
+                return type;
+            }
+
+            ITypeSymbol declaredType = symbol switch
+            {
+                IPropertySymbol property => property.Type,
+                IFieldSymbol field => field.Type,
+                ILocalSymbol local => local.Type,
+                IParameterSymbol parameter => parameter.Type,
+                _ => null,
+            };
+            type = this.PromoteTupleDeclarationIfTainted(type, declaredType, symbol);
+            if (type.IsNullable)
             {
                 return type;
             }
@@ -204,7 +218,7 @@ public sealed partial class CSharpToGSharpTranslator
                 return envelope;
             }
 
-            GTypeReference promotedInner = this.PromoteTupleReturnIfTainted(
+            GTypeReference promotedInner = this.PromoteTupleDeclarationIfTainted(
                 named.TypeArguments[0], awaitedType, symbol);
             promotedInner = this.PromoteAwaitedReturnIfTainted(
                 promotedInner, awaitedType, symbol);
@@ -214,15 +228,15 @@ public sealed partial class CSharpToGSharpTranslator
                 : new NamedTypeReference(named.Name, new[] { promotedInner });
         }
 
-        // Issue #2469: tuple return leaves are independent declaration sinks.
+        // Issue #2469/#2490: tuple leaves are independent declaration sinks.
         // Their evidence lives in ObliviousNullabilityAnalyzer's element-path
-        // graph so tuple literals, forwarded tuple values, nested tuples,
-        // conditionals/switches, async envelopes, and contracts all converge on
-        // the same per-position answer.
-        private GTypeReference PromoteTupleReturnIfTainted(
+        // graph so tuple returns, parameters, locals, fields/properties, nested
+        // tuples, async envelopes, and contracts all converge on the same
+        // per-position answer.
+        private GTypeReference PromoteTupleDeclarationIfTainted(
             GTypeReference mapped,
             ITypeSymbol returnType,
-            IMethodSymbol symbol)
+            ISymbol symbol)
         {
             if (!this.IsObliviousCompilation()
                 || mapped is not TupleTypeReference tuple
@@ -238,7 +252,7 @@ public sealed partial class CSharpToGSharpTranslator
         private GTypeReference PromoteTupleElements(
             TupleTypeReference tuple,
             INamedTypeSymbol tupleType,
-            IMethodSymbol symbol,
+            ISymbol symbol,
             List<int> path)
         {
             var elements = new List<GTypeReference>(tuple.ElementTypes.Count);
@@ -295,7 +309,29 @@ public sealed partial class CSharpToGSharpTranslator
                 return false;
             }
 
+            // Issue #2496: an anonymous function or method group is a callable
+            // value, not the value returned when that callable is invoked.
+            // Roslyn binds a lambda to a synthesized IMethodSymbol, so asking the
+            // oblivious-nullability fixpoint about that symbol can otherwise
+            // mistake return-position taint for nullability of the delegate /
+            // Expression<TDelegate> object itself. Keep callable-value
+            // nullability separate; lambda result contracts are handled at the
+            // lambda body seam instead.
+            if (this.IsCallableValueExpression(expression))
+            {
+                return false;
+            }
+
             if (this.IsNullableInitializer(expression))
+            {
+                return true;
+            }
+
+            if (ObliviousNullabilityAnalyzer.IsTupleElementTainted(
+                this.context.Compilation,
+                expression,
+                this.context.SemanticModel,
+                this.context.SiblingCompilations))
             {
                 return true;
             }
@@ -307,6 +343,17 @@ public sealed partial class CSharpToGSharpTranslator
                     this.ShouldPromoteToNullableReference(symbol),
                 _ => false,
             };
+        }
+
+        private bool IsCallableValueExpression(ExpressionSyntax expression)
+        {
+            while (expression is ParenthesizedExpressionSyntax parenthesized)
+            {
+                expression = parenthesized.Expression;
+            }
+
+            return expression is AnonymousFunctionExpressionSyntax
+                || this.context.SemanticModel.GetMemberGroup(expression).Length > 0;
         }
 
         // Issue #914 (oblivious sink): promote the arrow (delegate) parameter
@@ -578,6 +625,26 @@ public sealed partial class CSharpToGSharpTranslator
             return symbol is IMethodSymbol
                 ? false
                 : this.IsUsedAsNullable(symbol, this.GetNullabilityScope(symbol));
+        }
+
+        // Issue #2521: sink lowering must use the target contract that G# will
+        // actually bind, not consumer-side taint recorded for an imported
+        // symbol. Only declarations emitted by this compilation can have their
+        // contract widened by this compilation's promotion result. Project
+        // references and CLR metadata retain their already-emitted contract.
+        private bool TargetWillRemainNonNullableReference(ITypeSymbol targetType, ISymbol targetSymbol)
+        {
+            if (targetType is not { IsReferenceType: true }
+                || targetType.NullableAnnotation == NullableAnnotation.Annotated)
+            {
+                return false;
+            }
+
+            bool targetDeclaredInThisCompilation = targetSymbol?.DeclaringSyntaxReferences
+                .Any(reference => this.context.Compilation.ContainsSyntaxTree(reference.SyntaxTree)) == true;
+
+            return !(targetDeclaredInThisCompilation
+                && this.ShouldPromoteToNullableReference(targetSymbol));
         }
 
         // The syntax region a symbol's null usage is searched in: the whole

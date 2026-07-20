@@ -1648,7 +1648,16 @@ public abstract class BoundTreeRewriter
         }
 
         var receiver = RewriteExpression(node.Receiver);
-        return receiver == node.Receiver ? node : new BoundClrPropertyAccessExpression(null, receiver, node.Member, node.Type);
+        return receiver == node.Receiver
+            ? node
+            : new BoundClrPropertyAccessExpression(
+                null,
+                receiver,
+                node.Member,
+                node.Type,
+                node.StaticContainerType,
+                node.ConstrainedReceiverTypeParameter,
+                node.ConstrainedInterfaceType);
     }
 
     /// <summary>Rewrites a CLR property/field write (static or instance).</summary>
@@ -1663,7 +1672,14 @@ public abstract class BoundTreeRewriter
             return node;
         }
 
-        return new BoundClrPropertyAssignmentExpression(null, receiver, node.Member, value, node.Type);
+        return new BoundClrPropertyAssignmentExpression(
+            null,
+            receiver,
+            node.Member,
+            value,
+            node.Type,
+            node.ConstrainedReceiverTypeParameter,
+            node.ConstrainedInterfaceType);
     }
 
     /// <summary>Rewrites a CLR event subscription (Stream B′).</summary>
@@ -1678,7 +1694,14 @@ public abstract class BoundTreeRewriter
             return node;
         }
 
-        return new BoundClrEventSubscriptionExpression(null, receiver, node.Event, handler, node.IsAdd);
+        return new BoundClrEventSubscriptionExpression(
+            null,
+            receiver,
+            node.Event,
+            handler,
+            node.IsAdd,
+            node.ConstrainedReceiverTypeParameter,
+            node.ConstrainedInterfaceType);
     }
 
     /// <summary>Rewrites a user-defined event subscription expression (ADR-0052).</summary>
@@ -1693,7 +1716,7 @@ public abstract class BoundTreeRewriter
             return node;
         }
 
-        return new BoundEventSubscriptionExpression(null, receiver, node.StructType, node.Event, handler, node.IsAdd);
+        return new BoundEventSubscriptionExpression(null, receiver, node.StructType, node.Event, handler, node.IsAdd, node.EventType);
     }
 
     /// <summary>Rewrites a CLR binary operator call (Stream C).</summary>
@@ -1776,7 +1799,14 @@ public abstract class BoundTreeRewriter
         }
 
         var args = builder?.ToImmutable() ?? node.Arguments;
-        return new BoundClrIndexExpression(null, target, node.Indexer, args, node.Type);
+        return new BoundClrIndexExpression(
+            null,
+            target,
+            node.Indexer,
+            args,
+            node.Type,
+            node.ConstrainedReceiverTypeParameter,
+            node.ConstrainedInterfaceType);
     }
 
     /// <summary>Rewrites a CLR indexer write.</summary>
@@ -1814,10 +1844,26 @@ public abstract class BoundTreeRewriter
         var args = builder?.ToImmutable() ?? node.Arguments;
         if (targetExpr != null)
         {
-            return BoundClrIndexAssignmentExpression.WithExpressionTarget(null, targetExpr, node.Indexer, args, value, node.Type);
+            return BoundClrIndexAssignmentExpression.WithExpressionTarget(
+                null,
+                targetExpr,
+                node.Indexer,
+                args,
+                value,
+                node.Type,
+                node.ConstrainedReceiverTypeParameter,
+                node.ConstrainedInterfaceType);
         }
 
-        return new BoundClrIndexAssignmentExpression(null, node.Target, node.Indexer, args, value, node.Type);
+        return new BoundClrIndexAssignmentExpression(
+            null,
+            node.Target,
+            node.Indexer,
+            args,
+            value,
+            node.Type,
+            node.ConstrainedReceiverTypeParameter,
+            node.ConstrainedInterfaceType);
     }
 
     /// <summary>Rewrites an instance-method call on a user-defined class.</summary>
@@ -1975,7 +2021,7 @@ public abstract class BoundTreeRewriter
                 return node;
             }
 
-            return BoundFieldAssignmentExpression.WithExpressionReceiver(null, receiverExpr, node.StructType, node.Field, value);
+            return BoundFieldAssignmentExpression.WithExpressionReceiver(null, receiverExpr, node.StructType, node.Field, value, node.ResultType);
         }
 
         if (value == node.Value)
@@ -1991,7 +2037,7 @@ public abstract class BoundTreeRewriter
         // static routing and mis-codegen/crash.
         return node.InterfaceType != null
             ? new BoundFieldAssignmentExpression(null, node.Field, node.InterfaceType, value)
-            : new BoundFieldAssignmentExpression(null, node.Receiver, node.StructType, node.Field, value);
+            : new BoundFieldAssignmentExpression(null, node.Receiver, node.StructType, node.Field, value, node.ResultType);
     }
 
     /// <summary>Rewrites a property read (ADR-0051).</summary>
@@ -2092,8 +2138,8 @@ public abstract class BoundTreeRewriter
         }
 
         return node.FunctionType != null
-            ? new BoundMethodGroupExpression(node.Syntax, receiver, node.Function, node.FunctionType)
-            : new BoundMethodGroupExpression(node.Syntax, receiver, node.Candidates);
+            ? new BoundMethodGroupExpression(node.Syntax, receiver, node.Function, node.FunctionType, node.StaticOwnerType)
+            : new BoundMethodGroupExpression(node.Syntax, receiver, node.Candidates, node.StaticOwnerType);
     }
 
     /// <summary>Rewrites a CLR method-group expression (issue #337).</summary>

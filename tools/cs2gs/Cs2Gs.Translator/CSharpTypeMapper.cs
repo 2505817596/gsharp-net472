@@ -122,6 +122,14 @@ public sealed class CSharpTypeMapper
     private HashSet<string> importedNamespaceNames;
 
     /// <summary>
+    /// Issue #2509: constraint slots must disambiguate metadata/metadata
+    /// homonyms as well as source collisions. Ordinary type positions retain
+    /// the existing source-authored collision policy to avoid gratuitously
+    /// qualifying framework types that share a name across BCL namespaces.
+    /// </summary>
+    private bool qualifyMetadataImportCollisions;
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="CSharpTypeMapper"/> class
     /// with a private, unshared anonymous-type registry (every prior call
     /// site's behavior — used by standalone/single-file callers such as
@@ -298,6 +306,48 @@ public sealed class CSharpTypeMapper
             && (type.IsReferenceType || type is ITypeParameterSymbol);
         GTypeReference mapped = this.MapCore(type, context, location);
         return nullableReference ? WithNullable(mapped, true) : mapped;
+    }
+
+    /// <summary>
+    /// Maps a type used in G#'s legacy generic-constraint slot. The slot uses
+    /// the canonical semantic name/type arguments but does not accept an outer
+    /// nullable marker, so a C# nullable constraint annotation is reported and
+    /// dropped while nested nullable type arguments remain intact.
+    /// </summary>
+    /// <param name="type">The bound C# constraint type.</param>
+    /// <param name="context">The translation context that accumulates diagnostics.</param>
+    /// <param name="location">The originating C# constraint location.</param>
+    /// <returns>The canonical G# constraint type reference.</returns>
+    public GTypeReference MapConstraintType(
+        ITypeSymbol type,
+        TranslationContext context,
+        Location location)
+    {
+        bool previous = this.qualifyMetadataImportCollisions;
+        this.qualifyMetadataImportCollisions = true;
+        GTypeReference mapped;
+        try
+        {
+            mapped = this.Map(type, context, location);
+        }
+        finally
+        {
+            this.qualifyMetadataImportCollisions = previous;
+        }
+
+        if (!mapped.IsNullable)
+        {
+            return mapped;
+        }
+
+        string message = $"constraint type '{type.ToDisplayString()}' has a nullable annotation; " +
+            "G#'s generic-constraint slot has no nullable form, so the outer annotation is dropped.";
+        context.Report(new TranslationDiagnostic(
+            nameof(SyntaxKind.TypeParameterConstraintClause),
+            message,
+            location,
+            TranslationSeverity.Info));
+        return WithNullable(mapped, false);
     }
 
     /// <summary>
@@ -706,7 +756,9 @@ public sealed class CSharpTypeMapper
     // simple key — so the nested type must be qualified `Container.Nested` to
     // resolve correctly. This is now safe to emit in every position (generic
     // arguments, type clauses, struct literals) thanks to the issue #1174
-    // language fix, so the qualified form round-trips under gsc.
+    // language fix, so the qualified form round-trips under gsc. Issue #2509
+    // additionally prefixes the namespace when the OUTERMOST containing type
+    // itself collides across imported packages.
     private string QualifiedTypeName(INamedTypeSymbol named, TranslationContext context)
     {
         if (named.ContainingType == null)
@@ -725,15 +777,14 @@ public sealed class CSharpTypeMapper
             // the reference to the right type instead of whichever homonym
             // happens to resolve first.
             //
-            // The imported-namespace scan is gated on `named` itself being
-            // SOURCE-declared: a pure-BCL/metadata reference (e.g. `List<T>`)
-            // must never trip it — the runtime ships the same forwarded type
-            // across several referenced assemblies (facade + implementation),
-            // which otherwise looks like a spurious homonym and would qualify
-            // every common framework type. Only a type this project actually
-            // AUTHORS can be the accidental collision the issue describes.
+            // Constraint mapping also enables this scan for metadata/metadata
+            // collisions (issue #2509). Ordinary positions retain the
+            // source-authored gate so common framework types are not qualified
+            // spuriously.
+            bool scanImportedNamespaces = named.Locations.Any(l => l.IsInSource)
+                || this.qualifyMetadataImportCollisions;
             bool ambiguous = this.HasSourceHomonym(named, context)
-                || (named.Locations.Any(l => l.IsInSource) && this.HasImportedNamespaceHomonym(named, context));
+                || (scanImportedNamespaces && this.HasImportedNamespaceHomonym(named, context));
             if (!ambiguous)
             {
                 return simpleName;
@@ -760,7 +811,15 @@ public sealed class CSharpTypeMapper
         }
 
         this.TrackShortenedNamespace(outermost);
-        return string.Join(".", parts);
+        string nestedName = string.Join(".", parts);
+        bool scanOutermostImports = outermost.Locations.Any(l => l.IsInSource)
+            || this.qualifyMetadataImportCollisions;
+        bool outermostAmbiguous = this.HasSourceHomonym(outermost, context)
+            || (scanOutermostImports && this.HasImportedNamespaceHomonym(outermost, context));
+        return outermostAmbiguous
+            && outermost.ContainingNamespace is { IsGlobalNamespace: false } outerNamespace
+                ? $"{outerNamespace.ToDisplayString()}.{nestedName}"
+                : nestedName;
     }
 
     /// <summary>
@@ -809,7 +868,9 @@ public sealed class CSharpTypeMapper
     /// compilation-wide source-only census, this walks only the namespaces
     /// this file actually imports — cheap even when a referenced assembly
     /// (e.g. a translated sibling project) is huge — and covers a homonym
-    /// declared in metadata rather than source.
+    /// declared in metadata rather than source. Issue #2509 extends this to a
+    /// metadata type colliding with a different metadata type; symbols in the
+    /// same namespace/package are not import collisions.
     /// </summary>
     private bool HasImportedNamespaceHomonym(INamedTypeSymbol named, TranslationContext context)
     {
@@ -828,10 +889,23 @@ public sealed class CSharpTypeMapper
             // original definitions so `Box<Label>` correctly matches `Box<T>`.
             foreach (INamedTypeSymbol candidate in candidateNamespace.GetTypeMembers(named.Name))
             {
-                if (!SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, named.OriginalDefinition))
+                if (SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, named.OriginalDefinition))
                 {
-                    return true;
+                    continue;
                 }
+
+                // Types in the same namespace/package are not an import
+                // collision. This also filters facade/implementation symbols
+                // for the same forwarded metadata type, and same-namespace
+                // generic-arity overloads such as IComparable/IComparable<T>
+                // that the type arguments already disambiguate.
+                if (candidate.ContainingNamespace?.ToDisplayString()
+                    == named.ContainingNamespace?.ToDisplayString())
+                {
+                    continue;
+                }
+
+                return true;
             }
         }
 
@@ -998,7 +1072,8 @@ public sealed class CSharpTypeMapper
             .Select(p => this.Map(p.Type, context, location))
             .ToList();
 
-        ITypeSymbol returnType = invoke.ReturnType;
+        ITypeSymbol declaredReturnType = invoke.ReturnType;
+        ITypeSymbol returnType = declaredReturnType;
         bool isAsync = false;
 
         // A delegate returning Task / Task<T> maps to the async arrow form
@@ -1014,10 +1089,98 @@ public sealed class CSharpTypeMapper
         var returns = new List<GTypeReference>();
         if (returnType != null && returnType.SpecialType != SpecialType.System_Void)
         {
-            returns.Add(this.Map(returnType, context, location));
+            GTypeReference mappedReturn = this.Map(returnType, context, location);
+
+            // Issue #2504: every structural projection of a source named
+            // delegate must consume the same Invoke-return taint as the named
+            // declaration itself. Task<T> arrows expose the unwrapped T result;
+            // ValueTask<T> remains an explicit envelope in the existing mapper,
+            // so promote its inner result in place.
+            if (declaredReturnType is INamedTypeSymbol { IsGenericType: true, TypeArguments.Length: 1 } taskLike
+                && taskLike.Name == "ValueTask"
+                && taskLike.ContainingNamespace?.ToDisplayString() == "System.Threading.Tasks"
+                && mappedReturn is NamedTypeReference { TypeArguments.Count: 1 } valueTaskMapped)
+            {
+                GTypeReference promotedInner = this.PromoteDelegateReturnPosition(
+                    valueTaskMapped.TypeArguments[0],
+                    taskLike.TypeArguments[0],
+                    invoke,
+                    context,
+                    new List<int>());
+                mappedReturn = ReferenceEquals(promotedInner, valueTaskMapped.TypeArguments[0])
+                    ? mappedReturn
+                    : new NamedTypeReference(valueTaskMapped.Name, new[] { promotedInner });
+            }
+            else
+            {
+                mappedReturn = this.PromoteDelegateReturnPosition(
+                    mappedReturn,
+                    returnType,
+                    invoke,
+                    context,
+                    new List<int>());
+            }
+
+            returns.Add(mappedReturn);
         }
 
         return new ArrowTypeReference(parameters, returns, isAsync);
+    }
+
+    private GTypeReference PromoteDelegateReturnPosition(
+        GTypeReference mapped,
+        ITypeSymbol returnType,
+        IMethodSymbol invoke,
+        TranslationContext context,
+        List<int> tuplePath)
+    {
+        if (context.Compilation.Options.NullableContextOptions != NullableContextOptions.Disable)
+        {
+            return mapped;
+        }
+
+        if (mapped is TupleTypeReference mappedTuple
+            && returnType is INamedTypeSymbol { IsTupleType: true } tupleType
+            && mappedTuple.ElementTypes.Count == tupleType.TupleElements.Length)
+        {
+            bool changed = false;
+            var elements = new List<GTypeReference>(mappedTuple.ElementTypes.Count);
+            for (int index = 0; index < mappedTuple.ElementTypes.Count; index++)
+            {
+                tuplePath.Add(index);
+                GTypeReference element = this.PromoteDelegateReturnPosition(
+                    mappedTuple.ElementTypes[index],
+                    tupleType.TupleElements[index].Type,
+                    invoke,
+                    context,
+                    tuplePath);
+                tuplePath.RemoveAt(tuplePath.Count - 1);
+                changed |= !ReferenceEquals(element, mappedTuple.ElementTypes[index]);
+                elements.Add(element);
+            }
+
+            return changed
+                ? new TupleTypeReference(elements) { IsNullable = mappedTuple.IsNullable }
+                : mapped;
+        }
+
+        bool tainted = tuplePath.Count == 0
+            ? ObliviousNullabilityAnalyzer.IsTainted(
+                context.Compilation,
+                invoke,
+                context.SiblingCompilations)
+            : ObliviousNullabilityAnalyzer.IsTupleElementTainted(
+                context.Compilation,
+                invoke,
+                tuplePath,
+                context.SiblingCompilations);
+
+        return tainted
+            && !mapped.IsNullable
+            && returnType is { IsReferenceType: true }
+            && returnType.NullableAnnotation != NullableAnnotation.Annotated
+                ? WithNullable(mapped, true)
+                : mapped;
     }
 }
 
