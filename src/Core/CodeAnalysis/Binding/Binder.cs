@@ -892,8 +892,69 @@ public sealed class Binder
             }
         }
 
-        foreach (var (structSyntax, structSymbol) in declaredStructs)
+        // Issue #2489: shells make base types resolvable up front, but override
+        // validation also needs the base type's members. Bind same-compilation
+        // base classes before their derived classes, independent of tree/source
+        // order.
+        var declarationsByName = declaredStructs
+            .Select((declaration, index) => (declaration.Symbol.Name, Index: index))
+            .GroupBy(entry => entry.Name, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Select(entry => entry.Index).ToList(), StringComparer.Ordinal);
+        var bindingState = new byte[declaredStructs.Count];
+        var bindingOrder = new List<int>(declaredStructs.Count);
+
+        void AddBaseFirst(int index)
         {
+            if (bindingState[index] == 2)
+            {
+                return;
+            }
+
+            if (bindingState[index] == 1)
+            {
+                return;
+            }
+
+            bindingState[index] = 1;
+            var (syntax, symbol) = declaredStructs[index];
+            TypeClauseSyntax baseType = syntax.BaseTypeClauses.Count > 0
+                ? syntax.BaseTypeClauses[0]
+                : syntax.BaseTypeIdentifier == null
+                    ? null
+                    : new TypeClauseSyntax(syntax.SyntaxTree, syntax.BaseTypeIdentifier);
+            var baseName = baseType?.QualifierIdentifierTokens.LastOrDefault()?.Text
+                ?? baseType?.Identifier?.Text;
+            if (symbol.IsClass && baseName != null && declarationsByName.TryGetValue(baseName, out var candidates))
+            {
+                var requestedPackage = baseType.HasQualifier
+                    ? baseType.DottedName[..^(baseName.Length + 1)]
+                    : symbol.PackageName;
+                var matchingPackage = candidates.Where(candidate =>
+                    declaredStructs[candidate].Symbol.IsClass &&
+                    declaredStructs[candidate].Symbol.PackageName == requestedPackage).ToList();
+                var baseIndex = matchingPackage.Count == 1
+                    ? matchingPackage[0]
+                    : candidates.Count(candidate => declaredStructs[candidate].Symbol.IsClass) == 1
+                        ? candidates.Single(candidate => declaredStructs[candidate].Symbol.IsClass)
+                        : -1;
+                if (baseIndex >= 0)
+                {
+                    AddBaseFirst(baseIndex);
+                }
+            }
+
+            bindingState[index] = 2;
+            bindingOrder.Add(index);
+        }
+
+        for (var i = 0; i < declaredStructs.Count; i++)
+        {
+            AddBaseFirst(i);
+        }
+
+        foreach (var index in bindingOrder)
+        {
+            var (structSyntax, structSymbol) = declaredStructs[index];
             var owningPackage = packageByTree[structSyntax.SyntaxTree];
             RunWithPackage(owningPackage, structSyntax.SyntaxTree, () => binder.declarations.BindStructDeclarationBody(structSyntax, owningPackage, structSymbol));
         }
@@ -2882,7 +2943,7 @@ public sealed class Binder
         {
             var clrArgs = new System.Type[syntax.TypeArguments.Count];
             var symbolicArgs = ImmutableArray.CreateBuilder<TypeSymbol>(syntax.TypeArguments.Count);
-            var hasTypeParameterArg = false;
+            var hasSymbolicArg = false;
             for (var i = 0; i < syntax.TypeArguments.Count; i++)
             {
                 var ta = BindTypeClause(syntax.TypeArguments[i]);
@@ -2911,9 +2972,9 @@ public sealed class Binder
                 // CLR shape so member / index / conversion resolution keeps
                 // working, while the symbolic `[T]` is preserved on the result
                 // for inference, substitution, and erased emit.
-                if (TypeSymbol.ContainsTypeParameter(ta) || TypeSymbol.ContainsSameCompilationUserType(ta))
+                if (TypeSymbol.RequiresSymbolicProjection(ta))
                 {
-                    hasTypeParameterArg = true;
+                    hasSymbolicArg = true;
 
                     // Issue #2391: source enums use Int32 as their established
                     // CLR ride-through. Preserve that surrogate when closing
@@ -2921,8 +2982,17 @@ public sealed class Binder
                     // struct-constrained interface leaves Nullable<T> member
                     // signatures unconstructable and hides parameterized
                     // methods from overload resolution.
-                    var erasedArgument = ta is EnumSymbol ? typeof(int) : typeof(object);
-                    clrArgs[i] = scope.References.MapClrTypeToReferences(erasedArgument);
+                    if (TypeSymbol.ContainsTypeParameter(ta) || TypeSymbol.ContainsSameCompilationUserType(ta))
+                    {
+                        var erasedArgument = ta is EnumSymbol ? typeof(int) : typeof(object);
+                        clrArgs[i] = scope.References.MapClrTypeToReferences(erasedArgument);
+                    }
+                    else
+                    {
+                        clrArgs[i] = ResolveClrTypeForGenericArg(ta)
+                            ?? scope.References.MapClrTypeToReferences(ta.ClrType);
+                    }
+
                     continue;
                 }
 
@@ -2938,7 +3008,7 @@ public sealed class Binder
             try
             {
                 var closed = clrOpenType.MakeGenericType(clrArgs);
-                if (hasTypeParameterArg)
+                if (hasSymbolicArg)
                 {
                     // #313 / #671: keep the symbolic type arguments alongside
                     // the type-erased closed CLR shape so call-site inference,
@@ -3269,12 +3339,20 @@ public sealed class Binder
             // references. Issue #1506: each segment now drives its own preferred
             // arity from its own type-argument list.
             var preferredArity = syntax.SegmentHasTypeArguments(i) ? syntax.GetSegmentTypeArguments(i).Count : -1;
-            if (!scope.TryLookupNestedTypeAlias(definitions[i - 1], segmentTexts[i], preferredArity, out var nested))
+            if (scope.TryLookupNestedTypeAlias(definitions[i - 1], segmentTexts[i], preferredArity, out var nested))
+            {
+                definitions[i] = nested;
+            }
+            else if (definitions[i - 1] is StructSymbol containerStruct
+                && scope.TryLookupNestedTypeAliasIncludingInherited(containerStruct, segmentTexts[i], preferredArity, out var inheritedNested, out var declaringContainer))
+            {
+                definitions[i - 1] = declaringContainer;
+                definitions[i] = inheritedNested;
+            }
+            else
             {
                 return null;
             }
-
-            definitions[i] = nested;
         }
 
         // The chain resolved to a user nested type. Construct generic segments
@@ -3701,7 +3779,7 @@ public sealed class Binder
 
         var clrArgs = new Type[targetArity];
         var symbolicArgs = ImmutableArray.CreateBuilder<TypeSymbol>(targetArity);
-        var hasTypeParameterArg = false;
+        var hasSymbolicArg = false;
         for (var i = 0; i < targetArity; i++)
         {
             var ta = BindTypeClause(syntax.TypeArguments[i]);
@@ -3725,7 +3803,7 @@ public sealed class Binder
             // formed while the symbolic argument is preserved alongside.
             if (TypeSymbol.ContainsTypeParameter(ta))
             {
-                hasTypeParameterArg = true;
+                hasSymbolicArg = true;
                 clrArgs[i] = scope.References.MapClrTypeToReferences(typeof(object));
                 continue;
             }
@@ -3734,7 +3812,7 @@ public sealed class Binder
             // System.Object (same as type parameters above).
             if (ta.ClrType == null)
             {
-                hasTypeParameterArg = true;
+                hasSymbolicArg = true;
                 clrArgs[i] = scope.References.MapClrTypeToReferences(typeof(object));
                 continue;
             }
@@ -3745,7 +3823,7 @@ public sealed class Binder
         try
         {
             var closed = clrType.MakeGenericType(clrArgs);
-            if (hasTypeParameterArg)
+            if (hasSymbolicArg)
             {
                 return ImportedTypeSymbol.GetConstructed(closed, clrType, symbolicArgs.MoveToImmutable());
             }
@@ -3950,7 +4028,7 @@ public sealed class Binder
 
         var clrArgs = new Type[argSyntaxes.Count];
         var symbolicArgs = ImmutableArray.CreateBuilder<TypeSymbol>(argSyntaxes.Count);
-        var hasTypeParameterArg = false;
+        var hasSymbolicArg = false;
         for (var i = 0; i < argSyntaxes.Count; i++)
         {
             var ta = BindTypeClause(argSyntaxes[i]);
@@ -3970,10 +4048,15 @@ public sealed class Binder
 
             // #313 / #671: in-scope type parameters and user types without a
             // ClrType project onto System.Object under the type-erased model.
-            if (TypeSymbol.ContainsTypeParameter(ta) || TypeSymbol.ContainsSameCompilationUserType(ta) || ta.ClrType == null)
+            if (TypeSymbol.RequiresSymbolicProjection(ta) || ta.ClrType == null)
             {
-                hasTypeParameterArg = true;
-                clrArgs[i] = scope.References.MapClrTypeToReferences(typeof(object));
+                hasSymbolicArg = true;
+                clrArgs[i] = TypeSymbol.ContainsTypeParameter(ta)
+                    || TypeSymbol.ContainsSameCompilationUserType(ta)
+                    || ta.ClrType == null
+                        ? scope.References.MapClrTypeToReferences(typeof(object))
+                        : ResolveClrTypeForGenericArg(ta)
+                            ?? scope.References.MapClrTypeToReferences(ta.ClrType);
                 continue;
             }
 
@@ -3983,7 +4066,7 @@ public sealed class Binder
         try
         {
             var closed = nestedDef.MakeGenericType(clrArgs);
-            if (hasTypeParameterArg)
+            if (hasSymbolicArg)
             {
                 return ImportedTypeSymbol.GetConstructed(closed, nestedDef, symbolicArgs.MoveToImmutable());
             }
@@ -4325,9 +4408,14 @@ public sealed class Binder
                 return;
             }
 
-            // First seen value wins. Cross-arg consistency is verified later
-            // by the post-substitution argument-type check.
-            if (!substitution.ContainsKey(tp))
+            // Join compatible nullable-reference evidence across arguments.
+            // The post-substitution applicability check still rejects genuine
+            // type conflicts.
+            if (substitution.TryGetValue(tp, out var existing))
+            {
+                substitution[tp] = MemberLookup.MergeInferredTypeArgument(existing, argumentType);
+            }
+            else
             {
                 substitution[tp] = argumentType;
             }
@@ -5155,9 +5243,9 @@ public sealed class Binder
 
         if (type is TypeParameterSymbol tp)
         {
-            // Propagate: if the source type parameter carries `class`, so
-            // does this substitution.
-            return tp.HasReferenceTypeConstraint;
+            // A class-base constraint proves the parameter is reference-shaped
+            // just as strongly as the explicit `class` flag.
+            return tp.HasReferenceTypeConstraint || tp.ClassConstraint != null;
         }
 
         if (type is StructSymbol structSym)
@@ -5467,7 +5555,9 @@ public sealed class Binder
         }
 
         var openDefName = constraintClr.GetGenericTypeDefinition().FullName;
-        var constraintArgs = (constraint as ImportedTypeSymbol)?.TypeArguments ?? ImmutableArray<TypeSymbol>.Empty;
+        var constraintArgs = MemberLookup.GetImportedTypeSymbol(constraint)?.TypeArguments
+            ?? ImmutableArray<TypeSymbol>.Empty;
+        var constraintClrArgs = constraintClr.GetGenericArguments();
 
         foreach (var candidate in EnumerateSelfAndInterfaces(typeArgClr))
         {
@@ -5477,7 +5567,12 @@ public sealed class Binder
                 continue;
             }
 
-            if (GenericConstraintArgumentsMatch(candidate.GetGenericArguments(), constraintArgs, tp, typeArgClr))
+            if (GenericConstraintArgumentsMatch(
+                candidate.GetGenericArguments(),
+                constraintArgs,
+                constraintClrArgs,
+                tp,
+                typeArgClr))
             {
                 return true;
             }
@@ -5502,10 +5597,14 @@ public sealed class Binder
     private static bool GenericConstraintArgumentsMatch(
         Type[] candidateArgs,
         ImmutableArray<TypeSymbol> constraintArgs,
+        Type[] constraintClrArgs,
         TypeParameterSymbol tp,
         Type typeArgClr)
     {
-        if (constraintArgs.IsDefaultOrEmpty || candidateArgs.Length != constraintArgs.Length)
+        var expectedCount = !constraintArgs.IsDefaultOrEmpty
+            ? constraintArgs.Length
+            : constraintClrArgs?.Length ?? 0;
+        if (expectedCount == 0 || candidateArgs.Length != expectedCount)
         {
             return false;
         }
@@ -5515,9 +5614,11 @@ public sealed class Binder
             // A self-referential constraint argument (the constrained parameter
             // itself) is expected to be the type argument; any other argument is
             // matched against its own resolved CLR type.
-            var expectedName = constraintArgs[i] is TypeParameterSymbol cArgTp && ReferenceEquals(cArgTp, tp)
-                ? typeArgClr.FullName
-                : constraintArgs[i].ClrType?.FullName;
+            var expectedName = !constraintArgs.IsDefaultOrEmpty
+                ? (constraintArgs[i] is TypeParameterSymbol cArgTp && ReferenceEquals(cArgTp, tp)
+                    ? typeArgClr.FullName
+                    : constraintArgs[i].ClrType?.FullName)
+                : constraintClrArgs[i].FullName;
 
             if (expectedName == null
                 || !string.Equals(candidateArgs[i].FullName, expectedName, StringComparison.Ordinal))

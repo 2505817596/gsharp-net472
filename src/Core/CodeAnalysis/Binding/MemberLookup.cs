@@ -862,8 +862,7 @@ internal sealed class MemberLookup
             // symbolic slice here the call's return would collapse to the
             // erased `object[]` and fail to convert to `[]Foo` (GS0155). Mirror
             // the generic-type branch below, which already honours #903.
-            if (TypeSymbol.ContainsTypeParameter(mappedElement)
-                || TypeSymbol.ContainsSameCompilationUserType(mappedElement))
+            if (TypeSymbol.RequiresSymbolicProjection(mappedElement))
             {
                 return SliceTypeSymbol.Get(mappedElement);
             }
@@ -878,8 +877,7 @@ internal sealed class MemberLookup
         {
             var openPointee = openClr.GetElementType();
             var mappedPointee = MapOpenClrTypeToSymbolic(openPointee, openDefinition, typeArguments, openMethodDefinition, methodTypeArguments);
-            if (TypeSymbol.ContainsTypeParameter(mappedPointee)
-                || TypeSymbol.ContainsSameCompilationUserType(mappedPointee))
+            if (TypeSymbol.RequiresSymbolicProjection(mappedPointee))
             {
                 return ByRefTypeSymbol.Get(mappedPointee);
             }
@@ -904,8 +902,7 @@ internal sealed class MemberLookup
                 openMethodDefinition,
                 methodTypeArguments);
 
-            if (TypeSymbol.ContainsTypeParameter(mappedUnderlying)
-                || TypeSymbol.ContainsSameCompilationUserType(mappedUnderlying))
+            if (TypeSymbol.RequiresSymbolicProjection(mappedUnderlying))
             {
                 return NullableTypeSymbol.Get(mappedUnderlying);
             }
@@ -931,8 +928,7 @@ internal sealed class MemberLookup
                 // receiver keep the `Check` element identity instead of
                 // collapsing to the type-erased `IEnumerable<object>` (which
                 // for a value-type element is not even a legal up-cast).
-                if (TypeSymbol.ContainsTypeParameter(mapped)
-                    || TypeSymbol.ContainsSameCompilationUserType(mapped))
+                if (TypeSymbol.RequiresSymbolicProjection(mapped))
                 {
                     anyParam = true;
                 }
@@ -1102,7 +1098,7 @@ internal sealed class MemberLookup
         // erased `TSource` to `object`, so a generic return like `Single() →
         // TSource` would otherwise surface as `object` and lose the `Check`
         // identity (breaking `net.Id`). The symbolic projection recovers it.
-        return TypeSymbol.ContainsTypeParameter(mapped) || TypeSymbol.ContainsSameCompilationUserType(mapped)
+        return TypeSymbol.RequiresSymbolicProjection(mapped)
             ? mapped
             : null;
     }
@@ -1162,8 +1158,7 @@ internal sealed class MemberLookup
             // recovered from a `List[Check]` receiver) does too — the closed
             // CLR method erased it to `object`, so without the symbolic vector
             // the call's return type / lambda parameter type would be `object`.
-            if (inferred[i] != null
-                && (TypeSymbol.ContainsTypeParameter(inferred[i]) || TypeSymbol.ContainsSameCompilationUserType(inferred[i])))
+            if (TypeSymbol.RequiresSymbolicProjection(inferred[i]))
             {
                 anySymbolic = true;
                 break;
@@ -1210,6 +1205,322 @@ internal sealed class MemberLookup
         }
 
         return b.MoveToImmutable();
+    }
+
+    /// <summary>
+    /// Issue #2494: removes imported method candidates that are applicable only
+    /// because a same-compilation enum was projected to its temporary CLR
+    /// <c>int32</c> representation. The projection is a lookup aid; it is not a
+    /// source-language enum-to-integer conversion. Open generic parameter
+    /// positions remain eligible so the existing symbolic substitution path can
+    /// recover the enum identity for the selected method and its return type.
+    /// </summary>
+    /// <param name="candidates">The imported candidates to filter.</param>
+    /// <param name="symbolicArgTypes">Symbolic argument types in candidate parameter order.</param>
+    /// <param name="argumentNames">Optional source argument names aligned with <paramref name="symbolicArgTypes"/>.</param>
+    /// <param name="symbolicReceiverType">The symbolic instance receiver, used to reopen an erased constructed declaring type.</param>
+    /// <returns>Candidates that do not require an enum-erasure-only match.</returns>
+    public static IEnumerable<MethodInfo> ExcludeErasureOnlyEnumCandidates(
+        IEnumerable<MethodInfo> candidates,
+        ImmutableArray<TypeSymbol> symbolicArgTypes,
+        IReadOnlyList<string> argumentNames = null,
+        TypeSymbol symbolicReceiverType = null)
+    {
+        if (candidates == null || symbolicArgTypes.IsDefaultOrEmpty)
+        {
+            return candidates ?? Enumerable.Empty<MethodInfo>();
+        }
+
+        return candidates.Where(candidate => !HasErasureOnlyEnumParameterMatch(
+            candidate,
+            symbolicArgTypes,
+            argumentNames,
+            symbolicReceiverType));
+
+        static bool HasErasureOnlyEnumParameterMatch(
+            MethodInfo candidate,
+            ImmutableArray<TypeSymbol> symbolicArgTypes,
+            IReadOnlyList<string> argumentNames,
+            TypeSymbol symbolicReceiverType)
+        {
+            if (candidate == null)
+            {
+                return false;
+            }
+
+            MethodInfo openCandidate = candidate.IsGenericMethod && !candidate.IsGenericMethodDefinition
+                ? candidate.GetGenericMethodDefinition()
+                : candidate;
+            Type declaringType = openCandidate.DeclaringType;
+            if (declaringType?.IsConstructedGenericType == true
+                && symbolicReceiverType is ImportedTypeSymbol symbolicReceiver
+                && symbolicReceiver.OpenDefinition != null)
+            {
+                var declaringDefinition = declaringType.GetGenericTypeDefinition();
+                var receiverCarriesSymbolicType = ClrTypeUtilities.AreSame(
+                        symbolicReceiver.OpenDefinition,
+                        declaringDefinition)
+                    && TypeSymbol.ContainsSameCompilationUserType(symbolicReceiverType);
+                if (!receiverCarriesSymbolicType
+                    && TryMapThroughImplemented(
+                        symbolicReceiver,
+                        declaringDefinition,
+                        out var liftedReceiverArguments))
+                {
+                    receiverCarriesSymbolicType = liftedReceiverArguments.Any(
+                        TypeSymbol.ContainsSameCompilationUserType);
+                }
+
+                if (receiverCarriesSymbolicType)
+                {
+                    MethodInfo reopened = TryGetOpenMethodOnDeclaringType(
+                        declaringDefinition,
+                        openCandidate);
+                    if (reopened != null)
+                    {
+                        openCandidate = reopened;
+                    }
+                }
+            }
+
+            ParameterInfo[] parameters;
+            try
+            {
+                parameters = openCandidate.GetParameters();
+            }
+            catch
+            {
+                return false;
+            }
+
+            var hasParams = parameters.Length > 0
+                && OverloadResolution.IsParamsArrayParameter(parameters[parameters.Length - 1]);
+            var nextPositionalParameter = 0;
+            for (var i = 0; i < symbolicArgTypes.Length; i++)
+            {
+                var argumentName = argumentNames != null && i < argumentNames.Count
+                    ? argumentNames[i]
+                    : null;
+                var parameterIndex = -1;
+                if (!string.IsNullOrEmpty(argumentName))
+                {
+                    for (var p = 0; p < parameters.Length; p++)
+                    {
+                        if (string.Equals(parameters[p].Name, argumentName, StringComparison.Ordinal))
+                        {
+                            parameterIndex = p;
+                            break;
+                        }
+                    }
+                }
+                else if (nextPositionalParameter < parameters.Length)
+                {
+                    parameterIndex = nextPositionalParameter++;
+                }
+                else if (hasParams)
+                {
+                    parameterIndex = parameters.Length - 1;
+                }
+
+                if (parameterIndex < 0 || parameterIndex >= parameters.Length)
+                {
+                    continue;
+                }
+
+                var parameterType = parameters[parameterIndex].ParameterType;
+                if (hasParams
+                    && parameterIndex == parameters.Length - 1
+                    && string.IsNullOrEmpty(argumentName)
+                    && parameterType.IsArray
+                    && symbolicArgTypes[i] is not SliceTypeSymbol
+                    && symbolicArgTypes[i] is not ArrayTypeSymbol)
+                {
+                    parameterType = parameterType.GetElementType();
+                    nextPositionalParameter = parameterIndex;
+                }
+
+                if (IsErasureOnlyEnumMatch(parameterType, symbolicArgTypes[i]))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        static bool IsErasureOnlyEnumMatch(Type openParameterType, TypeSymbol symbolicArgumentType)
+        {
+            if (openParameterType == null || symbolicArgumentType == null)
+            {
+                return false;
+            }
+
+            if (openParameterType.IsByRef)
+            {
+                openParameterType = openParameterType.GetElementType();
+            }
+
+            if (symbolicArgumentType is ByRefTypeSymbol byRefArgument)
+            {
+                symbolicArgumentType = byRefArgument.PointeeType;
+            }
+
+            // A generic slot captures the symbolic enum and is repaired downstream
+            // by BuildSymbolicMethodTypeArgs/ResolveCallReturnTypeFromSymbolicTypeArgs.
+            if (openParameterType == null || openParameterType.IsGenericParameter)
+            {
+                return false;
+            }
+
+            if (symbolicArgumentType is EnumSymbol)
+            {
+                return string.Equals(openParameterType.FullName, typeof(int).FullName, StringComparison.Ordinal);
+            }
+
+            if (symbolicArgumentType is NullableTypeSymbol nullable)
+            {
+                if (TryGetNullableTypeArgument(openParameterType, out var nullableParameter))
+                {
+                    return IsErasureOnlyEnumMatch(nullableParameter, nullable.UnderlyingType);
+                }
+
+                // Reference-type nullability is an annotation, not a distinct
+                // CLR generic wrapper. Continue matching the underlying symbolic
+                // shape against the same formal parameter.
+                return IsErasureOnlyEnumMatch(openParameterType, nullable.UnderlyingType);
+            }
+
+            if (symbolicArgumentType is FunctionTypeSymbol functionType)
+            {
+                MethodInfo invoke;
+                try
+                {
+                    invoke = openParameterType.GetMethod("Invoke");
+                }
+                catch
+                {
+                    return false;
+                }
+
+                if (invoke == null)
+                {
+                    return false;
+                }
+
+                var invokeParameters = invoke.GetParameters();
+                var parameterCount = Math.Min(invokeParameters.Length, functionType.ParameterTypes.Length);
+                for (var i = 0; i < parameterCount; i++)
+                {
+                    if (IsErasureOnlyEnumMatch(invokeParameters[i].ParameterType, functionType.ParameterTypes[i]))
+                    {
+                        return true;
+                    }
+                }
+
+                return !FunctionTypeSymbol.IsVoidReturn(functionType.ReturnType)
+                    && IsErasureOnlyEnumMatch(invoke.ReturnType, functionType.ReturnType);
+            }
+
+            if (symbolicArgumentType is TupleTypeSymbol tuple
+                && openParameterType.IsGenericType)
+            {
+                var tupleDefinition = openParameterType.GetGenericTypeDefinition();
+                var tupleArguments = openParameterType.GetGenericArguments();
+                if (tupleDefinition.FullName?.StartsWith("System.ValueTuple`", StringComparison.Ordinal) == true
+                    && tupleArguments.Length == tuple.ElementTypes.Length)
+                {
+                    for (var i = 0; i < tupleArguments.Length; i++)
+                    {
+                        if (IsErasureOnlyEnumMatch(tupleArguments[i], tuple.ElementTypes[i]))
+                        {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+            }
+
+            if (openParameterType.IsArray && openParameterType.GetArrayRank() == 1)
+            {
+                TypeSymbol symbolicElement = TryGetElementType(symbolicArgumentType);
+                return symbolicElement != null
+                    && IsErasureOnlyEnumMatch(openParameterType.GetElementType(), symbolicElement);
+            }
+
+            if (openParameterType.IsGenericType)
+            {
+                var openArguments = openParameterType.GetGenericArguments();
+                if (symbolicArgumentType is ImportedTypeSymbol implemented
+                    && TryMapThroughImplemented(
+                        implemented,
+                        openParameterType.GetGenericTypeDefinition(),
+                        out var liftedArguments)
+                    && liftedArguments.Length == openArguments.Length)
+                {
+                    for (var i = 0; i < openArguments.Length; i++)
+                    {
+                        if (IsErasureOnlyEnumMatch(openArguments[i], liftedArguments[i]))
+                        {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                if (openArguments.Length == 1)
+                {
+                    TypeSymbol symbolicElement = TryGetElementType(symbolicArgumentType);
+                    if (symbolicElement != null)
+                    {
+                        return IsErasureOnlyEnumMatch(openArguments[0], symbolicElement);
+                    }
+                }
+
+                if (symbolicArgumentType is ImportedTypeSymbol imported
+                    && !imported.TypeArguments.IsDefaultOrEmpty
+                    && imported.TypeArguments.Length == openArguments.Length)
+                {
+                    for (var i = 0; i < openArguments.Length; i++)
+                    {
+                        if (IsErasureOnlyEnumMatch(openArguments[i], imported.TypeArguments[i]))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        static bool TryGetNullableTypeArgument(Type type, out Type argument)
+        {
+            argument = null;
+            if (type == null || !type.IsGenericType)
+            {
+                return false;
+            }
+
+            Type definition;
+            try
+            {
+                definition = type.GetGenericTypeDefinition();
+            }
+            catch
+            {
+                return false;
+            }
+
+            if (!string.Equals(definition.FullName, typeof(Nullable<>).FullName, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            argument = type.GetGenericArguments()[0];
+            return true;
+        }
     }
 
     /// <summary>
@@ -1284,7 +1595,31 @@ internal sealed class MemberLookup
 
                 return false;
             case NullableTypeSymbol nullable when nullable.UnderlyingType != null:
-                return TryProjectErasedClrType(nullable.UnderlyingType, out erased);
+                if (!TryProjectErasedClrType(nullable.UnderlyingType, out var erasedUnderlying))
+                {
+                    return false;
+                }
+
+                if (!erasedUnderlying.IsValueType || Nullable.GetUnderlyingType(erasedUnderlying) != null)
+                {
+                    erased = erasedUnderlying;
+                    return true;
+                }
+
+                try
+                {
+                    var nullableDefinition = erasedUnderlying.Assembly == typeof(object).Assembly
+                        ? typeof(Nullable<>)
+                        : erasedUnderlying.Assembly.GetType(typeof(Nullable<>).FullName, throwOnError: false);
+                    erased = nullableDefinition?.MakeGenericType(erasedUnderlying) ?? erasedUnderlying;
+                    return true;
+                }
+                catch
+                {
+                    erased = erasedUnderlying;
+                    return true;
+                }
+
             case FunctionTypeSymbol fn:
                 // Issue #932: a func/arrow literal whose natural delegate type
                 // closes over a same-compilation user class (whose ClrType is
@@ -2270,8 +2605,16 @@ internal sealed class MemberLookup
         indexer = null;
         resolvedArguments = default;
 
-        var properties = ClrTypeUtilities.SafeGetProperties(clrTarget, BindingFlags.Public | BindingFlags.Instance)
+        var declaringTypes = clrTarget.IsInterface
+            ? EnumerateSelfAndInterfaces(clrTarget)
+            : new[] { clrTarget };
+        var properties = declaringTypes
+            .SelectMany(type => ClrTypeUtilities.SafeGetProperties(
+                type,
+                BindingFlags.Public | BindingFlags.Instance))
             .Where(static property => property.GetMethod != null && property.GetIndexParameters().Length > 0)
+            .GroupBy(static property => (property.Module, property.MetadataToken))
+            .Select(static group => group.First())
             .ToArray();
         var hasSymbolicArgument = boundArguments.Any(static argument =>
             argument.Type?.ClrType == null
@@ -2622,11 +2965,29 @@ internal sealed class MemberLookup
         int parameterIndex)
     {
         var closedParameter = closedIndexer.GetIndexParameters()[parameterIndex];
-        if (targetType is ImportedTypeSymbol imported
-            && imported.OpenDefinition is Type openDefinition
-            && !imported.TypeArguments.IsDefaultOrEmpty)
+        if (GetImportedTypeSymbol(targetType) is ImportedTypeSymbol importedInterface
+            && importedInterface.ClrType?.IsInterface == true
+            && TryGetSymbolicDeclaringContext(
+                importedInterface,
+                closedIndexer.DeclaringType,
+                out var openDefinition,
+                out var declaringTypeArguments))
         {
             var openIndexer = FindOpenIndexerDefinition(openDefinition, closedIndexer);
+            var openParameters = openIndexer?.GetIndexParameters();
+            if (openParameters != null && parameterIndex < openParameters.Length)
+            {
+                return MapOpenClrTypeToSymbolic(
+                    openParameters[parameterIndex].ParameterType,
+                    openDefinition,
+                    declaringTypeArguments);
+            }
+        }
+        else if (targetType is ImportedTypeSymbol imported
+            && imported.OpenDefinition is Type importedOpenDefinition
+            && !imported.TypeArguments.IsDefaultOrEmpty)
+        {
+            var openIndexer = FindOpenIndexerDefinition(importedOpenDefinition, closedIndexer);
             var openParameters = openIndexer?.GetIndexParameters();
             if (openParameters != null && parameterIndex < openParameters.Length)
             {
@@ -2650,6 +3011,195 @@ internal sealed class MemberLookup
 
         return ClrNullability.GetParameterTypeSymbol(closedParameter);
     }
+
+    /// <summary>
+    /// Resolves a CLR property's type through a symbolic imported receiver,
+    /// including properties declared on inherited generic interfaces.
+    /// </summary>
+    /// <param name="targetType">The symbolic imported receiver type.</param>
+    /// <param name="closedProperty">The reflected property selected from the erased receiver.</param>
+    /// <returns>The property type after symbolic receiver substitution.</returns>
+    internal static TypeSymbol GetClrPropertyTypeSymbol(TypeSymbol targetType, PropertyInfo closedProperty)
+    {
+        if (GetImportedTypeSymbol(targetType) is ImportedTypeSymbol imported
+            && TryGetSymbolicDeclaringContext(
+                imported,
+                closedProperty.DeclaringType,
+                out var openDefinition,
+                out var declaringTypeArguments))
+        {
+            var openProperty = FindOpenIndexerDefinition(openDefinition, closedProperty);
+            if (openProperty != null)
+            {
+                return MapOpenClrTypeToSymbolic(
+                    openProperty.PropertyType,
+                    openDefinition,
+                    declaringTypeArguments);
+            }
+        }
+
+        return ClrNullability.GetPropertyTypeSymbol(closedProperty);
+    }
+
+    /// <summary>Resolves an imported event handler type through a symbolic receiver/interface hierarchy.</summary>
+    /// <param name="targetType">The symbolic imported receiver type.</param>
+    /// <param name="closedEvent">The reflected event selected from the erased receiver.</param>
+    /// <returns>The event handler type after symbolic receiver substitution.</returns>
+    internal static TypeSymbol GetClrEventHandlerTypeSymbol(TypeSymbol targetType, EventInfo closedEvent)
+    {
+        if (GetImportedTypeSymbol(targetType) is ImportedTypeSymbol imported
+            && TryGetSymbolicDeclaringContext(
+                imported,
+                closedEvent.DeclaringType,
+                out var openDefinition,
+                out var declaringTypeArguments))
+        {
+            var openEvent = ClrTypeUtilities.SafeGetEvents(
+                    openDefinition,
+                    BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(candidate => candidate.Name == closedEvent.Name);
+            if (openEvent?.EventHandlerType != null)
+            {
+                var mapped = MapOpenClrTypeToSymbolic(
+                    openEvent.EventHandlerType,
+                    openDefinition,
+                    declaringTypeArguments);
+                if (mapped.ClrType?.ContainsGenericParameters != true)
+                {
+                    return mapped;
+                }
+            }
+        }
+
+        return TypeSymbol.FromClrType(closedEvent.EventHandlerType);
+    }
+
+    /// <summary>
+    /// Reconstructs the symbolic imported interface that actually declares a
+    /// reflected member reached through a possibly derived constraint.
+    /// </summary>
+    /// <param name="targetType">The symbolic imported receiver type.</param>
+    /// <param name="member">The reflected member reached through the receiver.</param>
+    /// <returns>The symbolic declaring interface used to parent the emitted member reference.</returns>
+    internal static TypeSymbol GetClrMemberDeclaringTypeSymbol(
+        TypeSymbol targetType,
+        MemberInfo member)
+    {
+        if (GetImportedTypeSymbol(targetType) is ImportedTypeSymbol imported
+            && TryGetSymbolicDeclaringContext(
+                imported,
+                member?.DeclaringType,
+                out var openDefinition,
+                out var declaringTypeArguments))
+        {
+            return openDefinition.IsGenericTypeDefinition
+                ? ImportedTypeSymbol.GetConstructed(
+                    member.DeclaringType,
+                    openDefinition,
+                    declaringTypeArguments)
+                : ImportedTypeSymbol.Get(openDefinition);
+        }
+
+        return targetType;
+    }
+
+    /// <summary>Resolves an imported method return through a symbolic receiver/interface hierarchy.</summary>
+    /// <param name="targetType">The symbolic imported receiver type.</param>
+    /// <param name="closedMethod">The reflected method selected from the erased receiver.</param>
+    /// <returns>The method return type after symbolic receiver substitution.</returns>
+    internal static TypeSymbol GetClrMethodReturnTypeSymbol(
+        TypeSymbol targetType,
+        MethodInfo closedMethod)
+    {
+        if (GetImportedTypeSymbol(targetType) is ImportedTypeSymbol imported
+            && TryGetSymbolicDeclaringContext(
+                imported,
+                closedMethod?.DeclaringType,
+                out var openDefinition,
+                out var declaringTypeArguments))
+        {
+            var openMethod = TryGetOpenMethodOnDeclaringType(openDefinition, closedMethod);
+            if (openMethod != null)
+            {
+                return MapOpenClrTypeToSymbolic(
+                    openMethod.ReturnType,
+                    openDefinition,
+                    declaringTypeArguments);
+            }
+        }
+
+        return TypeSymbol.FromClrType(closedMethod.ReturnType);
+    }
+
+    /// <summary>Finds the symbolic generic context for a reflected declaring type.</summary>
+    /// <param name="imported">The symbolic imported receiver.</param>
+    /// <param name="declaringType">The reflected member's declaring type.</param>
+    /// <param name="openDefinition">The open declaring type definition.</param>
+    /// <param name="typeArguments">The receiver-projected declaring type arguments.</param>
+    /// <returns><see langword="true"/> when a symbolic declaring context was found.</returns>
+    internal static bool TryGetSymbolicDeclaringContext(
+        ImportedTypeSymbol imported,
+        Type declaringType,
+        out Type openDefinition,
+        out ImmutableArray<TypeSymbol> typeArguments)
+    {
+        openDefinition = null;
+        typeArguments = default;
+        if (imported?.ClrType == null || declaringType == null)
+        {
+            return false;
+        }
+
+        var receiverOpenDefinition = imported.OpenDefinition
+            ?? (imported.ClrType.IsGenericType
+                ? imported.ClrType.GetGenericTypeDefinition()
+                : imported.ClrType);
+        var receiverTypeArguments = !imported.TypeArguments.IsDefaultOrEmpty
+            ? imported.TypeArguments
+            : (imported.ClrType.IsGenericType
+                ? imported.ClrType.GetGenericArguments()
+                    .Select(TypeSymbol.FromClrType)
+                    .ToImmutableArray()
+                : ImmutableArray<TypeSymbol>.Empty);
+
+        openDefinition = declaringType.IsGenericType
+            ? declaringType.GetGenericTypeDefinition()
+            : declaringType;
+        if (ClrTypeUtilities.AreSame(receiverOpenDefinition, openDefinition))
+        {
+            typeArguments = receiverTypeArguments;
+            return true;
+        }
+
+        if (imported.OpenDefinition != null
+            && !imported.TypeArguments.IsDefaultOrEmpty
+            && TryMapThroughImplemented(imported, openDefinition, out typeArguments))
+        {
+            return true;
+        }
+
+        if (declaringType.IsGenericType)
+        {
+            typeArguments = declaringType.GetGenericArguments()
+                .Select(TypeSymbol.FromClrType)
+                .ToImmutableArray();
+            return true;
+        }
+
+        typeArguments = ImmutableArray<TypeSymbol>.Empty;
+        return true;
+    }
+
+    /// <summary>Unwraps an imported type from an optional CLR nullability annotation.</summary>
+    /// <param name="type">The type symbol to unwrap.</param>
+    /// <returns>The imported type symbol, or <c>null</c> for another symbol kind.</returns>
+    internal static ImportedTypeSymbol GetImportedTypeSymbol(TypeSymbol type)
+        => type switch
+        {
+            ImportedTypeSymbol imported => imported,
+            NullabilityAnnotatedTypeSymbol { BaseType: ImportedTypeSymbol imported } => imported,
+            _ => null,
+        };
 
     internal static PropertyInfo FindOpenIndexerDefinition(Type openDefinition, PropertyInfo closedIndexer)
     {
@@ -2746,6 +3296,9 @@ internal sealed class MemberLookup
 
         return TypeSymbol.FromClrType(closedType);
     }
+
+    internal static TypeSymbol MergeInferredTypeArgument(TypeSymbol existing, TypeSymbol incoming)
+        => MergeRecoveredTypeArgument(existing, incoming);
 
     private static bool IsBetterSymbolicIndexerCandidate(
         ImmutableArray<TypeSymbol> candidate,
@@ -3513,20 +4066,34 @@ internal sealed class MemberLookup
             return;
         }
 
-        // Open MVar(i) → record the actual symbolic shape (first wins).
+        // A direct MVar match must observe the complete symbolic actual before
+        // nullable-reference wrappers are removed for outer structural
+        // matching. Multiple inference sources join compatible nullable
+        // evidence instead of depending on argument order.
         if (openClr.IsGenericParameter && openClr.DeclaringMethod != null)
         {
             if (ReferenceEquals(openClr.DeclaringMethod, openMethod)
                 || openClr.DeclaringMethod.MetadataToken == openMethod.MetadataToken)
             {
                 var pos = openClr.GenericParameterPosition;
-                if ((uint)pos < (uint)result.Length && result[pos] == null)
+                if ((uint)pos < (uint)result.Length)
                 {
-                    result[pos] = NormalizeRecoveredNullability(actual);
+                    var recovered = NormalizeRecoveredNullability(actual);
+                    result[pos] = MergeInferredTypeArgument(result[pos], recovered);
                 }
             }
 
             return;
+        }
+
+        // Reference-type nullability is a source annotation and does not add a
+        // CLR wrapper. Unify through it so a nullable reference receiver such as
+        // IEnumerable<Choice>? still recovers TSource = Choice. Preserve real
+        // Nullable<T> value shapes (including same-compilation enums/structs).
+        if (actual is NullableTypeSymbol nullableActual
+            && !NullableLifting.IsAnyValueTypeNullable(nullableActual))
+        {
+            actual = nullableActual.UnderlyingType;
         }
 
         // T[] / []T (open array element).
@@ -3561,6 +4128,18 @@ internal sealed class MemberLookup
         {
             var openDef = openClr.GetGenericTypeDefinition();
             var openArgs = openClr.GetGenericArguments();
+
+            if (actual is TupleTypeSymbol tuple
+                && openDef.FullName?.StartsWith("System.ValueTuple`", StringComparison.Ordinal) == true
+                && openArgs.Length == tuple.ElementTypes.Length)
+            {
+                for (var i = 0; i < openArgs.Length; i++)
+                {
+                    UnifyForMethodTypeArgs(openArgs[i], tuple.ElementTypes[i], openMethod, result);
+                }
+
+                return;
+            }
 
             // Pattern A: actual is an ImportedTypeSymbol whose OpenDefinition matches exactly.
             if (actual is ImportedTypeSymbol imp
@@ -3683,6 +4262,112 @@ internal sealed class MemberLookup
         }
 
         return t;
+    }
+
+    private static TypeSymbol MergeRecoveredTypeArgument(TypeSymbol existing, TypeSymbol incoming)
+    {
+        if (existing == null)
+        {
+            return incoming;
+        }
+
+        if (incoming == null || ReferenceEquals(existing, incoming))
+        {
+            return existing;
+        }
+
+        var existingNullable = existing is NullableTypeSymbol en
+            && !NullableLifting.IsAnyValueTypeNullable(en);
+        var incomingNullable = incoming is NullableTypeSymbol inn
+            && !NullableLifting.IsAnyValueTypeNullable(inn);
+        if (existingNullable || incomingNullable)
+        {
+            var existingUnderlying = existingNullable ? ((NullableTypeSymbol)existing).UnderlyingType : existing;
+            var incomingUnderlying = incomingNullable ? ((NullableTypeSymbol)incoming).UnderlyingType : incoming;
+            if (DeclarationBinder.TypeSignaturesEquivalent(existingUnderlying, incomingUnderlying))
+            {
+                return NullableTypeSymbol.Get(
+                    MergeRecoveredTypeArgument(existingUnderlying, incomingUnderlying));
+            }
+        }
+
+        if (existing is ImportedTypeSymbol existingImported
+            && incoming is ImportedTypeSymbol incomingImported
+            && existingImported.OpenDefinition != null
+            && incomingImported.OpenDefinition != null
+            && ClrTypeUtilities.AreSame(existingImported.OpenDefinition, incomingImported.OpenDefinition)
+            && existingImported.TypeArguments.Length == incomingImported.TypeArguments.Length)
+        {
+            var merged = ImmutableArray.CreateBuilder<TypeSymbol>(existingImported.TypeArguments.Length);
+            var changed = false;
+            for (var i = 0; i < existingImported.TypeArguments.Length; i++)
+            {
+                var left = existingImported.TypeArguments[i];
+                var right = incomingImported.TypeArguments[i];
+                if (!DeclarationBinder.TypeSignaturesEquivalent(left, right))
+                {
+                    return existing;
+                }
+
+                var item = MergeRecoveredTypeArgument(left, right);
+                changed |= !ReferenceEquals(item, left);
+                merged.Add(item);
+            }
+
+            if (changed)
+            {
+                return ImportedTypeSymbol.GetConstructed(
+                    existingImported.ClrType,
+                    existingImported.OpenDefinition,
+                    merged.MoveToImmutable());
+            }
+        }
+
+        if (existing is SliceTypeSymbol existingSlice
+            && incoming is SliceTypeSymbol incomingSlice
+            && DeclarationBinder.TypeSignaturesEquivalent(existingSlice.ElementType, incomingSlice.ElementType))
+        {
+            return SliceTypeSymbol.Get(
+                MergeRecoveredTypeArgument(existingSlice.ElementType, incomingSlice.ElementType));
+        }
+
+        if (existing is ArrayTypeSymbol existingArray
+            && incoming is ArrayTypeSymbol incomingArray
+            && existingArray.Length == incomingArray.Length
+            && DeclarationBinder.TypeSignaturesEquivalent(existingArray.ElementType, incomingArray.ElementType))
+        {
+            return ArrayTypeSymbol.Get(
+                MergeRecoveredTypeArgument(existingArray.ElementType, incomingArray.ElementType),
+                existingArray.Length);
+        }
+
+        if (existing is TupleTypeSymbol existingTuple
+            && incoming is TupleTypeSymbol incomingTuple
+            && existingTuple.ElementTypes.Length == incomingTuple.ElementTypes.Length)
+        {
+            var merged = ImmutableArray.CreateBuilder<TypeSymbol>(existingTuple.ElementTypes.Length);
+            for (var i = 0; i < existingTuple.ElementTypes.Length; i++)
+            {
+                if (!DeclarationBinder.TypeSignaturesEquivalent(
+                    existingTuple.ElementTypes[i],
+                    incomingTuple.ElementTypes[i]))
+                {
+                    return existing;
+                }
+
+                merged.Add(MergeRecoveredTypeArgument(
+                    existingTuple.ElementTypes[i],
+                    incomingTuple.ElementTypes[i]));
+            }
+
+            return TupleTypeSymbol.Get(merged.MoveToImmutable());
+        }
+
+        return !TypeSymbol.ContainsReferenceNullableAnnotation(existing)
+            && TypeSymbol.ContainsReferenceNullableAnnotation(incoming)
+            && DeclarationBinder.TypeSignaturesEquivalent(existing, incoming)
+                ? incoming
+                : existing;
     }
 
     private static TypeSymbol TryGetElementType(TypeSymbol t)

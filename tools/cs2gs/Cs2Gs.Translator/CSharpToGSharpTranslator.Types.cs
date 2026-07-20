@@ -181,7 +181,17 @@ public sealed partial class CSharpToGSharpTranslator
                 GExpression expressionBody;
                 try
                 {
-                    expressionBody = this.TranslateExpression((ExpressionSyntax)lambda.Body);
+                    // Issue #2496: callable-value nullability is distinct from
+                    // callable-return nullability. Apply forgiveness only at a
+                    // runtime lambda's semantically resolved non-null result
+                    // contract; expression trees and nullable delegate results
+                    // stay assertion-free.
+                    ExpressionSyntax bodyExpression = (ExpressionSyntax)lambda.Body;
+                    expressionBody = this.TranslateExpression(bodyExpression);
+                    if (this.IsUnguardedForwardOfTaintedValueAsRuntimeLambdaResult(bodyExpression))
+                    {
+                        expressionBody = new NonNullAssertionExpression(expressionBody);
+                    }
                 }
                 finally
                 {
@@ -236,9 +246,21 @@ public sealed partial class CSharpToGSharpTranslator
             // Issue #914 (oblivious sink): local-function/lambda return
             // promotion uses the same shared symbol-position decision as a
             // top-level method return.
-            return this.PromoteReturnIfTainted(
-                this.typeMapper.Map(returnType, this.context, location),
-                symbol);
+            GTypeReference mapped = this.typeMapper.Map(returnType, this.context, location);
+            mapped = this.PromoteTupleDeclarationIfTainted(mapped, returnType, symbol);
+
+            if (returnType is INamedTypeSymbol { IsGenericType: true } taskLike
+                && taskLike.TypeArguments.Length == 1
+                && taskLike.ContainingNamespace?.ToDisplayString() == "System.Threading.Tasks"
+                && taskLike.Name is "Task" or "ValueTask")
+            {
+                return this.PromoteTaskEnvelopeReturnIfTainted(
+                    mapped,
+                    taskLike.TypeArguments[0],
+                    symbol);
+            }
+
+            return this.PromoteReturnIfTainted(mapped, symbol);
         }
 
         private Parameter MapLambdaParameter(ParameterSyntax parameter)

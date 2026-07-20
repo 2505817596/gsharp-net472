@@ -527,21 +527,32 @@ internal sealed partial class ExpressionBinder
         if (scope.TryLookupTypeAlias(receiverName, out var typeAlias) && typeAlias is StructSymbol userStruct)
         {
             var fieldName = syntax.FieldIdentifier.Text;
-            if (TypeMemberModel.TryGetStaticField(userStruct, fieldName, out var staticField))
+            if (TypeMemberModel.TryGetStaticFieldIncludingInherited(userStruct, fieldName, out var staticField, out var fieldOwner))
             {
+                if (!AccessibilityChecker.IsAccessible(staticField.Accessibility, fieldOwner, function))
+                {
+                    Diagnostics.ReportMemberInaccessible(syntax.FieldIdentifier.Location, staticField.Name, fieldOwner.Name, staticField.Accessibility);
+                }
+
                 if (staticField.IsReadOnly)
                 {
                     Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, fieldName);
                 }
 
-                var staticValue = BindAssignmentRhs(syntax.Value, staticField.Type);
-                var staticConverted = conversions.BindConversion(syntax.Value.Location, staticValue, staticField.Type);
-                return new BoundFieldAssignmentExpression(null, null, userStruct, staticField, staticConverted);
+                var fieldType = fieldOwner.SubstituteMemberType(staticField.Type);
+                var staticValue = BindAssignmentRhs(syntax.Value, fieldType);
+                var staticConverted = conversions.BindConversion(syntax.Value.Location, staticValue, fieldType);
+                return new BoundFieldAssignmentExpression(null, null, fieldOwner, staticField, staticConverted, fieldType);
             }
 
             // Issue #263: static property assignment.
-            if (TypeMemberModel.TryGetStaticProperty(userStruct, fieldName, out var prop))
+            if (TypeMemberModel.TryGetStaticPropertyIncludingInherited(userStruct, fieldName, out var prop, out var propertyOwner))
             {
+                if (!AccessibilityChecker.IsAccessible(prop.Accessibility, propertyOwner, function))
+                {
+                    Diagnostics.ReportMemberInaccessible(syntax.FieldIdentifier.Location, prop.Name, propertyOwner.Name, prop.Accessibility);
+                }
+
                 if (!prop.HasSetter)
                 {
                     Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, fieldName);
@@ -550,7 +561,19 @@ internal sealed partial class ExpressionBinder
 
                 var staticValue = BindAssignmentRhs(syntax.Value, prop.Type);
                 var propConverted = conversions.BindConversion(syntax.Value.Location, staticValue, prop.Type);
-                return new BoundPropertyAssignmentExpression(null, receiver: null, userStruct, prop, propConverted);
+                return new BoundPropertyAssignmentExpression(null, receiver: null, propertyOwner, prop, propConverted);
+            }
+
+            if (TypeMemberModel.GetNearestImportedBase(userStruct)?.ClrType is Type importedBaseClr)
+            {
+                var importedBase = new ImportedClassSymbol(importedBaseClr, syntax, references: scope.References);
+                if (importedBase.TryLookupMember(fieldName, ne: null, out var inheritedStaticMember)
+                    && TryGetWritableClrMember(inheritedStaticMember, out _, out var inheritedTarget, out _))
+                {
+                    var inheritedValue = BindAssignmentRhs(syntax.Value, inheritedTarget);
+                    var inheritedConverted = conversions.BindConversion(syntax.Value.Location, inheritedValue, inheritedTarget);
+                    return new BoundClrPropertyAssignmentExpression(null, receiver: null, inheritedStaticMember, inheritedConverted, inheritedTarget);
+                }
             }
 
             Diagnostics.ReportUnableToFindMember(syntax.FieldIdentifier.Location, fieldName);
@@ -658,10 +681,19 @@ internal sealed partial class ExpressionBinder
                 implicitPropReceiver.Property);
         }
 
+        // Issue #2488: classify and bind the write through the same narrowed
+        // receiver view used by reads. The symbol retains its declared nullable
+        // storage type, while the bound receiver carries the effective type
+        // proven by the active if-let/null-guard frame.
+        var assignmentReceiver = implicitFieldReceiverExpr ?? BuildNarrowedVariableRead(variable);
+        var assignmentReceiverType = assignmentReceiver.Type;
+
         // Stream B: instance-CLR receiver → property/field write via reflection.
-        if (variable.Type is not StructSymbol && variable.Type is not NullableTypeSymbol && variable.Type?.ClrType != null)
+        if (assignmentReceiverType is not StructSymbol
+            && assignmentReceiverType is not NullableTypeSymbol
+            && assignmentReceiverType?.ClrType != null)
         {
-            var clrReceiverType = variable.Type.ClrType;
+            var clrReceiverType = assignmentReceiverType.ClrType;
             var fieldName = syntax.FieldIdentifier.Text;
             MemberInfo instanceMember = ClrTypeUtilities.SafeGetPropertyIncludingInterfaces(clrReceiverType, fieldName, BindingFlags.Public | BindingFlags.Instance);
             if (instanceMember is PropertyInfo prop && prop.GetIndexParameters().Length != 0)
@@ -684,16 +716,15 @@ internal sealed partial class ExpressionBinder
 
             _ = instWritable;
             _ = instTargetType;
-            var instReceiver = implicitFieldReceiverExpr ?? new BoundVariableExpression(null, variable);
             var instConverted = conversions.BindConversion(syntax.Value.Location, BindValue(instTargetSymbol), instTargetSymbol);
-            return new BoundClrPropertyAssignmentExpression(null, instReceiver, instanceMember, instConverted, instTargetSymbol);
+            return new BoundClrPropertyAssignmentExpression(null, assignmentReceiver, instanceMember, instConverted, instTargetSymbol);
         }
 
         // Issue #1068: an interface-typed variable receiver (`d.W = v` where
         // d : IDerived) writes the interface property setter (walking base
         // interfaces). Mirrors the read path and the expression-receiver write
         // path; the emitter dispatches via `callvirt set_W`.
-        if (variable.Type is InterfaceSymbol ifaceVarType)
+        if (assignmentReceiverType is InterfaceSymbol ifaceVarType)
         {
             if (TypeMemberModel.TryGetProperty(ifaceVarType, syntax.FieldIdentifier.Text, out var ifaceProp, out _))
             {
@@ -704,9 +735,8 @@ internal sealed partial class ExpressionBinder
                 }
 
                 var ifaceConverted = conversions.BindConversion(syntax.Value.Location, BindValue(ifaceProp.Type), ifaceProp.Type);
-                var ifaceReceiver = implicitFieldReceiverExpr ?? new BoundVariableExpression(null, variable);
-                EnforceInitOnlyAssignment(ifaceProp, ifaceReceiver, syntax.EqualsToken.Location);
-                return new BoundPropertyAssignmentExpression(null, ifaceReceiver, null, ifaceProp, ifaceConverted);
+                EnforceInitOnlyAssignment(ifaceProp, assignmentReceiver, syntax.EqualsToken.Location);
+                return new BoundPropertyAssignmentExpression(null, assignmentReceiver, null, ifaceProp, ifaceConverted);
             }
 
             Diagnostics.ReportUnableToFindMember(syntax.FieldIdentifier.Location, syntax.FieldIdentifier.Text);
@@ -722,7 +752,7 @@ internal sealed partial class ExpressionBinder
         // emitter dispatches via `box !!T; stfld` (fields) or
         // `box !!T; callvirt set_X` (properties) — mirroring the read path's
         // `box !!T; ldfld`/`callvirt get_X`.
-        if (variable.Type is TypeParameterSymbol tpVarType)
+        if (assignmentReceiverType is TypeParameterSymbol tpVarType)
         {
             if (tpVarType.ClassConstraint is StructSymbol tpClassConstraint)
             {
@@ -741,9 +771,8 @@ internal sealed partial class ExpressionBinder
                     }
 
                     var tpPropConverted = conversions.BindConversion(syntax.Value.Location, BindValue(tpProp.Type), tpProp.Type);
-                    var tpPropReceiver = implicitFieldReceiverExpr ?? new BoundVariableExpression(null, variable);
-                    EnforceInitOnlyAssignment(tpProp, tpPropReceiver, syntax.EqualsToken.Location);
-                    return new BoundPropertyAssignmentExpression(null, tpPropReceiver, tpPropDeclaringType, tpProp, tpPropConverted);
+                    EnforceInitOnlyAssignment(tpProp, assignmentReceiver, syntax.EqualsToken.Location);
+                    return new BoundPropertyAssignmentExpression(null, assignmentReceiver, tpPropDeclaringType, tpProp, tpPropConverted);
                 }
             }
 
@@ -759,16 +788,50 @@ internal sealed partial class ExpressionBinder
                 }
 
                 var tpIfaceConverted = conversions.BindConversion(syntax.Value.Location, BindValue(tpIfaceProp.Type), tpIfaceProp.Type);
-                var tpIfaceReceiver = implicitFieldReceiverExpr ?? new BoundVariableExpression(null, variable);
-                EnforceInitOnlyAssignment(tpIfaceProp, tpIfaceReceiver, syntax.EqualsToken.Location);
-                return new BoundPropertyAssignmentExpression(null, tpIfaceReceiver, null, tpIfaceProp, tpIfaceConverted);
+                EnforceInitOnlyAssignment(tpIfaceProp, assignmentReceiver, syntax.EqualsToken.Location);
+                return new BoundPropertyAssignmentExpression(null, assignmentReceiver, null, tpIfaceProp, tpIfaceConverted);
+            }
+
+            if (tpVarType.ClrInterfaceConstraint is TypeSymbol clrInterfaceConstraint
+                && clrInterfaceConstraint.ClrType is Type clrInterface
+                && clrInterface.IsInterface)
+            {
+                var clrProperty = ClrTypeUtilities.SafeGetPropertyIncludingInterfaces(
+                    clrInterface,
+                    syntax.FieldIdentifier.Text,
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (clrProperty != null && clrProperty.GetIndexParameters().Length == 0)
+                {
+                    if (clrProperty.GetSetMethod(nonPublic: false) == null)
+                    {
+                        Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, syntax.FieldIdentifier.Text);
+                        return new BoundErrorExpression(null);
+                    }
+
+                    var propertyType = MemberLookup.GetClrPropertyTypeSymbol(clrInterfaceConstraint, clrProperty);
+                    var declaringInterface = MemberLookup.GetClrMemberDeclaringTypeSymbol(
+                        clrInterfaceConstraint,
+                        clrProperty);
+                    var constrainedConverted = conversions.BindConversion(
+                        syntax.Value.Location,
+                        BindValue(propertyType),
+                        propertyType);
+                    return new BoundClrPropertyAssignmentExpression(
+                        null,
+                        assignmentReceiver,
+                        clrProperty,
+                        constrainedConverted,
+                        propertyType,
+                        tpVarType,
+                        declaringInterface);
+                }
             }
 
             Diagnostics.ReportUnableToFindMember(syntax.FieldIdentifier.Location, syntax.FieldIdentifier.Text);
             return new BoundErrorExpression(null);
         }
 
-        if (!(variable.Type is StructSymbol structSymbol))
+        if (!(assignmentReceiverType is StructSymbol structSymbol))
         {
             Diagnostics.ReportUnableToFindMember(syntax.FieldIdentifier.Location, syntax.FieldIdentifier.Text);
             return new BoundErrorExpression(null);
@@ -797,15 +860,14 @@ internal sealed partial class ExpressionBinder
                 // (a reference-type receiver mutates the heap object and the
                 // enclosing `this` are both exempt via ReceiverVariableIsThis /
                 // ReceiverTypeIsReference).
-                if (variable.IsReadOnly && !ReceiverVariableIsThis(variable) && !ReceiverTypeIsReference(variable.Type))
+                if (variable.IsReadOnly && !ReceiverVariableIsThis(variable) && !ReceiverTypeIsReference(assignmentReceiverType))
                 {
                     Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, receiverName);
                 }
 
                 var propConverted = conversions.BindConversion(syntax.Value.Location, BindValue(prop.Type), prop.Type);
-                var propReceiver = implicitFieldReceiverExpr ?? new BoundVariableExpression(null, variable);
-                EnforceInitOnlyAssignment(prop, propReceiver, syntax.EqualsToken.Location);
-                return new BoundPropertyAssignmentExpression(null, propReceiver, structSymbol, prop, propConverted);
+                EnforceInitOnlyAssignment(prop, assignmentReceiver, syntax.EqualsToken.Location);
+                return new BoundPropertyAssignmentExpression(null, assignmentReceiver, structSymbol, prop, propConverted);
             }
 
             // Issue #319 / #1582: a GSharp class inheriting an imported CLR base
@@ -828,9 +890,8 @@ internal sealed partial class ExpressionBinder
 
                     _ = inhWritable;
                     _ = inhTargetType;
-                    var inhReceiver = implicitFieldReceiverExpr ?? new BoundVariableExpression(null, variable);
                     var inhConverted = conversions.BindConversion(syntax.Value.Location, BindValue(inhTargetSymbol), inhTargetSymbol);
-                    return new BoundClrPropertyAssignmentExpression(null, inhReceiver, clrMember, inhConverted, inhTargetSymbol);
+                    return new BoundClrPropertyAssignmentExpression(null, assignmentReceiver, clrMember, inhConverted, inhTargetSymbol);
                 }
             }
 
@@ -856,7 +917,7 @@ internal sealed partial class ExpressionBinder
         // receiver, `b.Field = v` mutates the heap object, not the binding, so
         // it must be allowed; only value-type receivers (where the field write
         // would mutate the value stored in the read-only slot) stay rejected.
-        if (variable.IsReadOnly && !receiverIsThisField && !ReceiverTypeIsReference(variable.Type))
+        if (variable.IsReadOnly && !receiverIsThisField && !ReceiverTypeIsReference(assignmentReceiverType))
         {
             Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, receiverName);
         }
@@ -875,9 +936,11 @@ internal sealed partial class ExpressionBinder
             $"{structSymbol.Name}.{field.Name}");
 
         var converted = conversions.BindConversion(syntax.Value.Location, BindValue(field.Type), field.Type);
-        if (implicitFieldReceiverExpr != null)
+        if (implicitFieldReceiverExpr != null
+            || (assignmentReceiver is BoundVariableExpression narrowedVariable && narrowedVariable.NarrowedType != null)
+            || assignmentReceiver is BoundUnaryExpression)
         {
-            return BoundFieldAssignmentExpression.WithExpressionReceiver(null, implicitFieldReceiverExpr, structSymbol, field, converted);
+            return BoundFieldAssignmentExpression.WithExpressionReceiver(null, assignmentReceiver, structSymbol, field, converted);
         }
 
         return new BoundFieldAssignmentExpression(null, variable, structSymbol, field, converted);
@@ -1110,9 +1173,15 @@ internal sealed partial class ExpressionBinder
         var memberName = memberNameSyntax.IdentifierToken.Text;
         var boundRhs = BindExpression(syntax.Value);
 
-        if (TypeMemberModel.TryGetStaticField(staticStruct, memberName, out var staticField))
+        if (TypeMemberModel.TryGetStaticFieldIncludingInherited(staticStruct, memberName, out var staticField, out var fieldOwner))
         {
-            var leftRead = new BoundFieldAccessExpression(null, receiver: null, staticStruct, staticField);
+            if (!AccessibilityChecker.IsAccessible(staticField.Accessibility, fieldOwner, function))
+            {
+                Diagnostics.ReportMemberInaccessible(memberNameSyntax.Location, staticField.Name, fieldOwner.Name, staticField.Accessibility);
+            }
+
+            var fieldType = fieldOwner.SubstituteMemberType(staticField.Type);
+            var leftRead = new BoundFieldAccessExpression(null, receiver: null, fieldOwner, staticField, fieldType);
             var binary = TryBindCompoundBinaryOperation(baseOpSyntaxKind, leftRead, boundRhs, syntax.Value.Location);
             if (binary == null)
             {
@@ -1126,13 +1195,18 @@ internal sealed partial class ExpressionBinder
                 Diagnostics.ReportCannotAssign(syntax.OperatorToken.Location, memberName);
             }
 
-            var converted = conversions.BindConversion(syntax.Value.Location, binary, staticField.Type);
-            result = new BoundFieldAssignmentExpression(null, null, staticStruct, staticField, converted);
+            var converted = conversions.BindConversion(syntax.Value.Location, binary, fieldType);
+            result = new BoundFieldAssignmentExpression(null, null, fieldOwner, staticField, converted, fieldType);
             return true;
         }
 
-        if (TypeMemberModel.TryGetStaticProperty(staticStruct, memberName, out var prop))
+        if (TypeMemberModel.TryGetStaticPropertyIncludingInherited(staticStruct, memberName, out var prop, out var propertyOwner))
         {
+            if (!AccessibilityChecker.IsAccessible(prop.Accessibility, propertyOwner, function))
+            {
+                Diagnostics.ReportMemberInaccessible(memberNameSyntax.Location, prop.Name, propertyOwner.Name, prop.Accessibility);
+            }
+
             if (!prop.HasGetter || !prop.HasSetter)
             {
                 Diagnostics.ReportCannotAssign(syntax.OperatorToken.Location, memberName);
@@ -1140,7 +1214,7 @@ internal sealed partial class ExpressionBinder
                 return true;
             }
 
-            var leftRead = new BoundPropertyAccessExpression(null, receiver: null, staticStruct, prop);
+            var leftRead = new BoundPropertyAccessExpression(null, receiver: null, propertyOwner, prop);
             var binary = TryBindCompoundBinaryOperation(baseOpSyntaxKind, leftRead, boundRhs, syntax.Value.Location);
             if (binary == null)
             {
@@ -1150,7 +1224,7 @@ internal sealed partial class ExpressionBinder
             }
 
             var converted = conversions.BindConversion(syntax.Value.Location, binary, prop.Type);
-            result = new BoundPropertyAssignmentExpression(null, receiver: null, staticStruct, prop, converted);
+            result = new BoundPropertyAssignmentExpression(null, receiver: null, propertyOwner, prop, converted);
             return true;
         }
 
@@ -1955,6 +2029,45 @@ internal sealed partial class ExpressionBinder
             return new BoundErrorExpression(null);
         }
 
+        if (receiverType is TypeParameterSymbol tpReceiver
+            && tpReceiver.ClrInterfaceConstraint is TypeSymbol clrInterfaceConstraint
+            && clrInterfaceConstraint.ClrType is Type constraintClrType
+            && constraintClrType.IsInterface)
+        {
+            var clrProperty = ClrTypeUtilities.SafeGetPropertyIncludingInterfaces(
+                constraintClrType,
+                fieldName,
+                BindingFlags.Public | BindingFlags.Instance);
+            if (clrProperty != null && clrProperty.GetIndexParameters().Length == 0)
+            {
+                if (clrProperty.GetSetMethod(nonPublic: false) == null)
+                {
+                    Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, fieldName);
+                    return new BoundErrorExpression(null);
+                }
+
+                var propertyType = MemberLookup.GetClrPropertyTypeSymbol(clrInterfaceConstraint, clrProperty);
+                var declaringInterface = MemberLookup.GetClrMemberDeclaringTypeSymbol(
+                    clrInterfaceConstraint,
+                    clrProperty);
+                var constrainedConverted = conversions.BindConversion(
+                    syntax.Value.Location,
+                    BindValue(propertyType),
+                    propertyType);
+                return new BoundClrPropertyAssignmentExpression(
+                    null,
+                    receiver,
+                    clrProperty,
+                    constrainedConverted,
+                    propertyType,
+                    tpReceiver,
+                    declaringInterface);
+            }
+
+            Diagnostics.ReportUnableToFindMember(syntax.FieldIdentifier.Location, fieldName);
+            return new BoundErrorExpression(null);
+        }
+
         // CLR receiver → property/field write via reflection.
         if (receiverType is not NullableTypeSymbol && receiverType?.ClrType != null)
         {
@@ -2014,19 +2127,30 @@ internal sealed partial class ExpressionBinder
         // User class/struct → static field or static property write.
         if (constructedStruct != null)
         {
-            if (TypeMemberModel.TryGetStaticField(constructedStruct, fieldName, out var staticField))
+            if (TypeMemberModel.TryGetStaticFieldIncludingInherited(constructedStruct, fieldName, out var staticField, out var fieldOwner))
             {
+                if (!AccessibilityChecker.IsAccessible(staticField.Accessibility, fieldOwner, function))
+                {
+                    Diagnostics.ReportMemberInaccessible(syntax.FieldIdentifier.Location, staticField.Name, fieldOwner.Name, staticField.Accessibility);
+                }
+
                 if (staticField.IsReadOnly)
                 {
                     Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, fieldName);
                 }
 
-                var staticConverted = conversions.BindConversion(syntax.Value.Location, BindValue(staticField.Type), staticField.Type);
-                return new BoundFieldAssignmentExpression(null, null, constructedStruct, staticField, staticConverted);
+                var fieldType = fieldOwner.SubstituteMemberType(staticField.Type);
+                var staticConverted = conversions.BindConversion(syntax.Value.Location, BindValue(fieldType), fieldType);
+                return new BoundFieldAssignmentExpression(null, null, fieldOwner, staticField, staticConverted, fieldType);
             }
 
-            if (TypeMemberModel.TryGetStaticProperty(constructedStruct, fieldName, out var prop))
+            if (TypeMemberModel.TryGetStaticPropertyIncludingInherited(constructedStruct, fieldName, out var prop, out var propertyOwner))
             {
+                if (!AccessibilityChecker.IsAccessible(prop.Accessibility, propertyOwner, function))
+                {
+                    Diagnostics.ReportMemberInaccessible(syntax.FieldIdentifier.Location, prop.Name, propertyOwner.Name, prop.Accessibility);
+                }
+
                 if (!prop.HasSetter)
                 {
                     Diagnostics.ReportCannotAssign(syntax.EqualsToken.Location, fieldName);
@@ -2034,7 +2158,7 @@ internal sealed partial class ExpressionBinder
                 }
 
                 var propConverted = conversions.BindConversion(syntax.Value.Location, BindValue(prop.Type), prop.Type);
-                return new BoundPropertyAssignmentExpression(null, receiver: null, constructedStruct, prop, propConverted);
+                return new BoundPropertyAssignmentExpression(null, receiver: null, propertyOwner, prop, propConverted);
             }
 
             Diagnostics.ReportUnableToFindMember(syntax.FieldIdentifier.Location, fieldName);

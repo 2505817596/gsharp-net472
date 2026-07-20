@@ -432,6 +432,13 @@ internal sealed partial class MethodBodyEmitter
         // function token (ilverify `DelegateCtor`). Re-resolve through the
         // receiver's type.
         EntityHandle ftnToken = staticHandle;
+        if (methodGroup.Receiver == null
+            && methodGroup.StaticOwnerType != null
+            && ReflectionMetadataEmitter.IsUserGenericTypeReference(methodGroup.StaticOwnerType))
+        {
+            ftnToken = this.outer.userTokens.ResolveUserStaticMethodToken(methodGroup.StaticOwnerType, methodGroup.Function);
+        }
+
         if (methodGroup.Receiver?.Type is StructSymbol receiverStruct
             && ReflectionMetadataEmitter.IsUserGenericTypeReference(receiverStruct)
             && this.outer.cache.MethodHandles.ContainsKey(methodGroup.Function))
@@ -483,7 +490,11 @@ internal sealed partial class MethodBodyEmitter
         var isStatic = subscription.Receiver == null;
         var receiverIsValueType = !isStatic && ReflectionMetadataEmitter.IsValueTypeSymbol(subscription.Receiver.Type);
 
-        if (!isStatic)
+        if (subscription.IsConstrainedTypeParameterAccess)
+        {
+            this.EmitConstrainedTypeParameterReceiver(subscription.Receiver);
+        }
+        else if (!isStatic)
         {
             this.EmitInstanceReceiver(subscription.Receiver);
         }
@@ -511,8 +522,20 @@ internal sealed partial class MethodBodyEmitter
                 $"Event '{subscription.Event.DeclaringType?.FullName}.{subscription.Event.Name}' has no public {(subscription.IsAdd ? "add" : "remove")} accessor.");
         }
 
-        this.il.OpCode(isStatic || receiverIsValueType ? ILOpCode.Call : ILOpCode.Callvirt);
-        this.il.Token(this.outer.memberRefs.GetMethodReference(accessor));
+        if (subscription.IsConstrainedTypeParameterAccess)
+        {
+            this.il.OpCode(ILOpCode.Constrained);
+            this.il.Token(this.outer.memberRefs.GetElementTypeToken(subscription.ConstrainedReceiverTypeParameter));
+            this.il.OpCode(ILOpCode.Callvirt);
+            this.il.Token(this.outer.memberRefs.GetMethodEntityHandle(
+                accessor,
+                subscription.ConstrainedInterfaceType));
+        }
+        else
+        {
+            this.il.OpCode(isStatic || receiverIsValueType ? ILOpCode.Call : ILOpCode.Callvirt);
+            this.il.Token(this.outer.memberRefs.GetMethodReference(accessor));
+        }
     }
 
     private void EmitUserEventSubscription(BoundEventSubscriptionExpression node)
@@ -520,7 +543,20 @@ internal sealed partial class MethodBodyEmitter
         // ADR-0052: user-defined event subscription — call add_X or remove_X accessor.
         if (node.Receiver != null)
         {
-            this.EmitInstanceReceiver(node.Receiver);
+            if (node.Receiver.Type is TypeParameterSymbol typeParameterReceiver)
+            {
+                // Issue #2519: mirror constrained field/property access. Boxing
+                // a reference-shaped T is a runtime no-op and provides the
+                // verifier with the class-constraint receiver shape expected by
+                // the event accessor.
+                this.EmitExpression(node.Receiver);
+                this.il.OpCode(ILOpCode.Box);
+                this.il.Token(this.outer.memberRefs.GetElementTypeToken(typeParameterReceiver));
+            }
+            else
+            {
+                this.EmitInstanceReceiver(node.Receiver);
+            }
         }
 
         // Issue #503: function-literal handlers default to Action/Func
@@ -534,9 +570,9 @@ internal sealed partial class MethodBodyEmitter
         // and non-capturing lambdas both flow through the closure builder
         // with the correct target delegate ctor (object, IntPtr).
         if (node.Handler is BoundFunctionLiteralExpression literalHandler
-            && node.Event.Type?.ClrType != null)
+            && node.EventType?.ClrType != null)
         {
-            var mappedDelegateType = this.outer.signatures.MapToReferenceClrType(node.Event.Type.ClrType);
+            var mappedDelegateType = this.outer.signatures.MapToReferenceClrType(node.EventType.ClrType);
             this.EmitFunctionLiteral(literalHandler, mappedDelegateType);
         }
         else
@@ -547,6 +583,18 @@ internal sealed partial class MethodBodyEmitter
         if (this.outer.cache.EventAccessorHandles.TryGetValue(node.Event, out var accessorHandles))
         {
             var accessorMethodSymbol = node.IsAdd ? node.Event.AddMethodSymbol : node.Event.RemoveMethodSymbol;
+            var accessorHandle = node.IsAdd ? accessorHandles.Add : accessorHandles.Remove;
+
+            if (node.Receiver == null
+                && node.StructType is StructSymbol staticOwner
+                && ReflectionMetadataEmitter.IsUserGenericTypeReference(staticOwner)
+                && accessorMethodSymbol != null)
+            {
+                var accessorToken = this.outer.userTokens.ResolveUserStaticMethodToken(staticOwner, accessorMethodSymbol, accessorHandle);
+                this.il.OpCode(ILOpCode.Call);
+                this.il.Token(accessorToken);
+                return;
+            }
 
             // ADR-0149 follow-up (issue #2370): a generic-interface-typed
             // receiver (`b: IWatchable[int32]; b.Changed += h`) must reach
@@ -564,7 +612,6 @@ internal sealed partial class MethodBodyEmitter
                 return;
             }
 
-            var accessorHandle = node.IsAdd ? accessorHandles.Add : accessorHandles.Remove;
             bool isStatic = node.Receiver == null;
             bool isVirtual = !isStatic && (node.StructType is InterfaceSymbol || node.Event.IsVirtual || node.Event.IsOverride);
             this.il.OpCode(isVirtual ? ILOpCode.Callvirt : ILOpCode.Call);

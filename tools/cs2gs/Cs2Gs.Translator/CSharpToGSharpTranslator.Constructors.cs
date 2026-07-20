@@ -619,21 +619,16 @@ public sealed partial class CSharpToGSharpTranslator
             {
                 ITypeSymbol primary = tp.ConstraintTypes[0];
 
-                // Issue #943: a constructed generic-interface constraint
-                // (`where T : IComparable<T>`) now has a canonical G# form —
-                // `[T IComparable[T]]` — which parses, binds, emits verifiable
-                // IL, and is enforced. Render the constraint type (including its
-                // type arguments, e.g. the self-referential `T`) into the legacy
-                // constraint slot via the type mapper + printer.
-                if (primary is INamedTypeSymbol { IsGenericType: true })
-                {
-                    GTypeReference constraintRef = this.typeMapper.Map(primary, this.context, tp.Locations.FirstOrDefault());
-                    legacy = GSharpPrinter.RenderTypeReference(constraintRef);
-                }
-                else
-                {
-                    legacy = primary.Name;
-                }
+                // Issues #943 and #2509: every selected class/interface
+                // constraint uses the canonical semantic type mapper. The old
+                // non-generic branch emitted only `primary.Name`, discarding
+                // namespace/nesting identity and allowing a synthesized import
+                // containing a homonym to rebind the constraint.
+                GTypeReference constraintRef = this.typeMapper.MapConstraintType(
+                    primary,
+                    this.context,
+                    tp.Locations.FirstOrDefault());
+                legacy = GSharpPrinter.RenderTypeReference(constraintRef);
 
                 if (tp.ConstraintTypes.Length > 1)
                 {
@@ -900,7 +895,7 @@ public sealed partial class CSharpToGSharpTranslator
                     ITypeSymbol awaitedType = task.TypeArguments[0];
                     GTypeReference awaitedMapped = this.typeMapper.Map(
                         awaitedType, this.context, node.ReturnType.GetLocation());
-                    awaitedMapped = this.PromoteTupleReturnIfTainted(awaitedMapped, awaitedType, symbol);
+                    awaitedMapped = this.PromoteTupleDeclarationIfTainted(awaitedMapped, awaitedType, symbol);
                     return this.PromoteAwaitedReturnIfTainted(awaitedMapped, awaitedType, symbol);
                 }
 
@@ -914,7 +909,7 @@ public sealed partial class CSharpToGSharpTranslator
                 // Issue #2469: promote tuple return leaves independently from
                 // the analyzer's element-path evidence graph. Applied before
                 // scalar promotion, which is a no-op for tuple value types.
-                mapped = this.PromoteTupleReturnIfTainted(mapped, returnType, symbol);
+                mapped = this.PromoteTupleDeclarationIfTainted(mapped, returnType, symbol);
 
                 // Issue #2423: a NON-async declaration (a C# interface member —
                 // interfaces cannot declare `async` members — or a synchronous

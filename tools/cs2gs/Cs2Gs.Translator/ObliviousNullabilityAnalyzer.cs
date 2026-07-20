@@ -59,6 +59,7 @@ internal static class ObliviousNullabilityAnalyzer
     // a fresh entry and stale ones are collectible — same pattern as the
     // subclassed-base-types / partial-type-parts caches in the translator.
     private static readonly ConditionalWeakTable<Compilation, TaintResult> Cache = new();
+    private static readonly ConditionalWeakTable<Compilation, SourceAssemblySet> SourceAssemblies = new();
 
     // Which source expressions a transitive return/forwarding edge follows.
     private enum SourceScope
@@ -102,6 +103,7 @@ internal static class ObliviousNullabilityAnalyzer
             return false;
         }
 
+        RegisterSourceAssemblies(compilation, null);
         return Cache.GetValue(compilation, Compute).Tainted.Contains(Canonical(symbol));
     }
 
@@ -130,8 +132,10 @@ internal static class ObliviousNullabilityAnalyzer
     /// <para>
     /// Deliberately scoped to <paramref name="symbol"/> ITSELF (plus its
     /// remapped counterpart in each sibling) — never a same-compilation
-    /// backward walk through <paramref name="compilation"/>'s own assignment
-    /// edges to some OTHER, indirectly-connected declaration. Issue #2412's
+    /// backward walk through ordinary assignment edges to some OTHER,
+    /// indirectly-connected declaration. The sole exception is issue #2504's
+    /// explicitly tracked named-delegate return-contract edge, whose source
+    /// callable may be declared in a referenced sibling. Issue #2412's
     /// own worked example is explicit that the fix must insert `!!`
     /// forgiveness AT THE CONSUMPTION SITE while leaving the consuming
     /// project's OWN declarations (e.g. an object-initializer target
@@ -160,48 +164,20 @@ internal static class ObliviousNullabilityAnalyzer
         ISymbol symbol,
         IReadOnlyList<CSharpCompilation> siblingCompilations)
     {
-        if (IsTainted(compilation, symbol))
-        {
-            return true;
-        }
-
-        if (symbol == null || siblingCompilations == null)
+        if (symbol == null
+            || compilation == null
+            || compilation.Options.NullableContextOptions != NullableContextOptions.Disable)
         {
             return false;
         }
 
-        foreach (CSharpCompilation sibling in siblingCompilations)
-        {
-            if (sibling == null || ReferenceEquals(sibling, compilation))
-            {
-                continue;
-            }
-
-            // A symbol resolved through one compilation's semantic model and
-            // the "same" declaration resolved directly in the compilation that
-            // actually owns it are NOT `SymbolEqualityComparer.Default`-equal
-            // across two independently-bound `CSharpCompilation`s linked only
-            // by a `CompilationReference` (confirmed empirically: two separate
-            // `CSharpCompilation.Create` calls each mint their own distinct
-            // `IAssemblySymbol` wrapper for the "same" referenced assembly, so
-            // even `ContainingAssembly` differs) — this is true of the exact
-            // `LoadProjectWithReferencesAsync` shape too (a separate
-            // `BuildLoadedProjectAsync`/`GetCompilationAsync` call per project).
-            // So `IsTainted(sibling, symbol)` alone would only ever match a
-            // symbol whose OWN declaring compilation happens to be `sibling`
-            // itself — remap `symbol` to ITS OWN symbol in `sibling`'s symbol
-            // table (by stable metadata identity: containing type's fully
-            // qualified metadata name + member name/arity, not object/CLR
-            // symbol identity) and test that remapped symbol against
-            // `sibling`'s own cached result instead.
-            ISymbol remapped = RemapToCompilation(sibling, symbol);
-            if (remapped != null && IsTainted(sibling, remapped))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        RegisterSourceAssemblies(compilation, siblingCompilations);
+        return IsTaintedCore(
+            compilation,
+            Canonical(symbol),
+            siblingCompilations,
+            new HashSet<ScalarQuery>(ScalarQueryComparer.Instance),
+            new HashSet<TupleElementQuery>(TupleElementQueryComparer.Instance));
     }
 
     /// <summary>
@@ -229,12 +205,125 @@ internal static class ObliviousNullabilityAnalyzer
             return false;
         }
 
+        RegisterSourceAssemblies(compilation, siblingCompilations);
         return IsTupleElementTaintedCore(
             compilation,
             Canonical(symbol),
             EncodeTuplePath(elementPath),
             siblingCompilations,
+            new HashSet<ScalarQuery>(ScalarQueryComparer.Instance),
             new HashSet<TupleElementQuery>(TupleElementQueryComparer.Instance));
+    }
+
+    /// <summary>
+    /// Whether <paramref name="expression"/> reads a null-tainted tuple leaf.
+    /// </summary>
+    /// <param name="compilation">The compilation containing the expression.</param>
+    /// <param name="expression">A named or positional tuple-member expression.</param>
+    /// <param name="model">The semantic model for the expression.</param>
+    /// <param name="siblingCompilations">Other compilations loaded in the same translation run.</param>
+    /// <returns><see langword="true"/> when the selected tuple leaf is null-tainted.</returns>
+    public static bool IsTupleElementTainted(
+        CSharpCompilation compilation,
+        ExpressionSyntax expression,
+        SemanticModel model,
+        IReadOnlyList<CSharpCompilation> siblingCompilations)
+    {
+        if (compilation == null
+            || expression == null
+            || model == null
+            || compilation.Options.NullableContextOptions != NullableContextOptions.Disable
+            || !TryResolveTupleElementSource(expression, model, out TupleElementKey source))
+        {
+            return false;
+        }
+
+        RegisterSourceAssemblies(compilation, siblingCompilations);
+        return IsTupleElementTaintedCore(
+            compilation,
+            source.Symbol,
+            source.Path,
+            siblingCompilations,
+            new HashSet<ScalarQuery>(ScalarQueryComparer.Instance),
+            new HashSet<TupleElementQuery>(TupleElementQueryComparer.Instance));
+    }
+
+    private static bool IsTaintedCore(
+        CSharpCompilation compilation,
+        ISymbol symbol,
+        IReadOnlyList<CSharpCompilation> siblingCompilations,
+        HashSet<ScalarQuery> scalarVisited,
+        HashSet<TupleElementQuery> tupleVisited)
+    {
+        var query = new ScalarQuery(compilation, Canonical(symbol));
+        if (!scalarVisited.Add(query))
+        {
+            return false;
+        }
+
+        TaintResult result = Cache.GetValue(compilation, Compute);
+        if (result.Tainted.Contains(query.Symbol))
+        {
+            return true;
+        }
+
+        foreach ((ISymbol target, TupleElementKey source) in result.ScalarTupleEdges)
+        {
+            if (SymbolEqualityComparer.Default.Equals(target, query.Symbol)
+                && IsTupleElementTaintedCore(
+                    compilation,
+                    source.Symbol,
+                    source.Path,
+                    siblingCompilations,
+                    scalarVisited,
+                    tupleVisited))
+            {
+                return true;
+            }
+        }
+
+        foreach ((ISymbol target, ISymbol source) in result.DelegateReturnEdges)
+        {
+            if (SymbolEqualityComparer.Default.Equals(target, query.Symbol)
+                && IsTaintedCore(
+                    compilation,
+                    source,
+                    siblingCompilations,
+                    scalarVisited,
+                    tupleVisited))
+            {
+                return true;
+            }
+        }
+
+        if (siblingCompilations != null)
+        {
+            foreach (CSharpCompilation sibling in siblingCompilations)
+            {
+                if (sibling == null
+                    || ReferenceEquals(sibling, compilation)
+                    || sibling.Options.NullableContextOptions != NullableContextOptions.Disable)
+                {
+                    continue;
+                }
+
+                // Remap independently-bound symbols by stable metadata identity
+                // before testing the sibling compilation's own cached graph.
+                ISymbol remapped = RemapToCompilation(sibling, query.Symbol);
+                if (remapped != null
+                    && IsTaintedCore(
+                        sibling,
+                        Canonical(remapped),
+                        siblingCompilations,
+                        scalarVisited,
+                        tupleVisited))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private static bool IsTupleElementTaintedCore(
@@ -242,10 +331,11 @@ internal static class ObliviousNullabilityAnalyzer
         ISymbol symbol,
         string path,
         IReadOnlyList<CSharpCompilation> siblingCompilations,
-        HashSet<TupleElementQuery> visited)
+        HashSet<ScalarQuery> scalarVisited,
+        HashSet<TupleElementQuery> tupleVisited)
     {
         var key = new TupleElementKey(symbol, path);
-        if (!visited.Add(new TupleElementQuery(compilation, key)))
+        if (!tupleVisited.Add(new TupleElementQuery(compilation, key)))
         {
             return false;
         }
@@ -259,7 +349,12 @@ internal static class ObliviousNullabilityAnalyzer
         foreach ((TupleElementKey target, ISymbol source) in result.TupleScalarEdges)
         {
             if (TupleElementKeyComparer.Instance.Equals(target, key)
-                && IsTainted(compilation, source, siblingCompilations))
+                && IsTaintedCore(
+                    compilation,
+                    source,
+                    siblingCompilations,
+                    scalarVisited,
+                    tupleVisited))
             {
                 return true;
             }
@@ -273,7 +368,8 @@ internal static class ObliviousNullabilityAnalyzer
                     source.Symbol,
                     source.Path,
                     siblingCompilations,
-                    visited))
+                    scalarVisited,
+                    tupleVisited))
             {
                 return true;
             }
@@ -297,7 +393,8 @@ internal static class ObliviousNullabilityAnalyzer
                         Canonical(remapped),
                         path,
                         siblingCompilations,
-                        visited))
+                        scalarVisited,
+                        tupleVisited))
                 {
                     return true;
                 }
@@ -411,6 +508,7 @@ internal static class ObliviousNullabilityAnalyzer
         var tupleEdges = new List<(TupleElementKey Target, TupleElementKey Source)>();
         var tupleScalarEdges = new List<(TupleElementKey Target, ISymbol Source)>();
         var scalarTupleEdges = new List<(ISymbol Target, TupleElementKey Source)>();
+        var delegateReturnEdges = new List<(ISymbol Target, ISymbol Source)>();
 
         foreach (SyntaxTree tree in compilation.SyntaxTrees)
         {
@@ -420,7 +518,7 @@ internal static class ObliviousNullabilityAnalyzer
             foreach (SyntaxNode node in root.DescendantNodes())
             {
                 SeedDirectTaint(node, model, tainted);
-                CollectEdges(node, model, tainted, edges);
+                CollectEdges(node, model, tainted, edges, scalarTupleEdges);
             }
 
             // Method / accessor / local-function RETURN taint: a `return null`,
@@ -428,7 +526,7 @@ internal static class ObliviousNullabilityAnalyzer
             // enclosing member's return symbol; a non-directly-null `return`
             // records a transitive edge from the return symbol to the returned
             // value's source.
-            SeedReturnTaint(root, model, tainted, edges);
+            SeedReturnTaint(root, model, tainted, edges, scalarTupleEdges);
             CollectTupleFlows(
                 root,
                 model,
@@ -438,6 +536,15 @@ internal static class ObliviousNullabilityAnalyzer
                 tupleEdges,
                 tupleScalarEdges,
                 scalarTupleEdges);
+            CollectDelegateReturnContractEdges(
+                compilation,
+                root,
+                model,
+                tainted,
+                edges,
+                delegateReturnEdges,
+                tupleTainted,
+                tupleEdges);
         }
 
         // Issue #2285: an interface member and every member that implements it
@@ -446,6 +553,7 @@ internal static class ObliviousNullabilityAnalyzer
         // parameter) to `T?` while leaving the other (the interface property it
         // satisfies) non-null `T` — see <see cref="CollectInterfaceImplementationEdges"/>.
         CollectInterfaceImplementationEdges(compilation, edges);
+        CollectOverrideContractEdges(compilation, edges);
         CollectTupleContractEdges(compilation, tupleTainted, tupleEdges);
 
         // Fixpoint: propagate taint along the edge set until it stabilizes.
@@ -494,7 +602,9 @@ internal static class ObliviousNullabilityAnalyzer
             tainted,
             tupleTainted,
             tupleEdges,
-            tupleScalarEdges);
+            tupleScalarEdges,
+            scalarTupleEdges,
+            delegateReturnEdges);
     }
 
     // Seeds direct null evidence for a value declaration symbol (field /
@@ -587,7 +697,8 @@ internal static class ObliviousNullabilityAnalyzer
         SyntaxNode node,
         SemanticModel model,
         HashSet<ISymbol> tainted,
-        List<(ISymbol Target, ISymbol Source)> edges)
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges)
     {
         // Interprocedural parameter taint: an argument that is directly null or
         // reads a (possibly tainted) declaration flows to the bound parameter, so
@@ -607,9 +718,11 @@ internal static class ObliviousNullabilityAnalyzer
         // through the same argument→parameter edge collection.
         if (node is InvocationExpressionSyntax
             or ObjectCreationExpressionSyntax
-            or ConstructorInitializerSyntax)
+            or ConstructorInitializerSyntax
+            or ElementAccessExpressionSyntax
+            or ElementBindingExpressionSyntax)
         {
-            CollectArgumentEdges(node, model, tainted, edges);
+            CollectArgumentEdges(node, model, tainted, edges, scalarTupleEdges);
         }
 
         switch (node)
@@ -627,14 +740,13 @@ internal static class ObliviousNullabilityAnalyzer
                     // non-null (issue #2167, the `var` local-join case). A
                     // directly-nullable RHS taints immediately; any other RHS
                     // records a transitive edge so a nullable source propagates.
-                    if (IsDirectlyNullable(assign.Right, model))
-                    {
-                        tainted.Add(assignTarget);
-                    }
-                    else
-                    {
-                        AddEdges(assignTarget, assign.Right, model, edges);
-                    }
+                    CollectScalarValueFlow(
+                        assignTarget,
+                        assign.Right,
+                        model,
+                        tainted,
+                        edges,
+                        scalarTupleEdges);
                 }
 
                 break;
@@ -642,20 +754,30 @@ internal static class ObliviousNullabilityAnalyzer
             case VariableDeclaratorSyntax declarator
                 when declarator.Initializer != null:
                 if (model.GetDeclaredSymbol(declarator) is ISymbol declared
-                    && IsValueDeclarationSymbol(declared)
-                    && !IsDirectlyNullable(declarator.Initializer.Value, model))
+                    && IsValueDeclarationSymbol(declared))
                 {
-                    AddEdges(Canonical(declared), declarator.Initializer.Value, model, edges);
+                    CollectScalarValueFlow(
+                        Canonical(declared),
+                        declarator.Initializer.Value,
+                        model,
+                        tainted,
+                        edges,
+                        scalarTupleEdges);
                 }
 
                 break;
 
             case PropertyDeclarationSyntax property
                 when property.Initializer != null:
-                if (model.GetDeclaredSymbol(property) is IPropertySymbol propertySymbol
-                    && !IsDirectlyNullable(property.Initializer.Value, model))
+                if (model.GetDeclaredSymbol(property) is IPropertySymbol propertySymbol)
                 {
-                    AddEdges(Canonical(propertySymbol), property.Initializer.Value, model, edges);
+                    CollectScalarValueFlow(
+                        Canonical(propertySymbol),
+                        property.Initializer.Value,
+                        model,
+                        tainted,
+                        edges,
+                        scalarTupleEdges);
                 }
 
                 break;
@@ -669,14 +791,10 @@ internal static class ObliviousNullabilityAnalyzer
         SyntaxNode call,
         SemanticModel model,
         HashSet<ISymbol> tainted,
-        List<(ISymbol Target, ISymbol Source)> edges)
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges)
     {
-        ImmutableArray<IArgumentOperation> arguments = model.GetOperation(call) switch
-        {
-            IInvocationOperation invocation => invocation.Arguments,
-            IObjectCreationOperation creation => creation.Arguments,
-            _ => default,
-        };
+        ImmutableArray<IArgumentOperation> arguments = GetCallArguments(call, model);
 
         if (arguments.IsDefaultOrEmpty)
         {
@@ -692,16 +810,26 @@ internal static class ObliviousNullabilityAnalyzer
             }
 
             ISymbol parameterSymbol = Canonical(parameter);
-            if (IsDirectlyNullable(value, model))
-            {
-                tainted.Add(parameterSymbol);
-            }
-            else
-            {
-                AddEdges(parameterSymbol, value, model, edges);
-            }
+            CollectScalarValueFlow(
+                parameterSymbol,
+                value,
+                model,
+                tainted,
+                edges,
+                scalarTupleEdges);
         }
     }
+
+    private static ImmutableArray<IArgumentOperation> GetCallArguments(
+        SyntaxNode call,
+        SemanticModel model) =>
+        model.GetOperation(call) switch
+        {
+            IInvocationOperation invocation => invocation.Arguments,
+            IObjectCreationOperation creation => creation.Arguments,
+            IPropertyReferenceOperation property => property.Arguments,
+            _ => default,
+        };
 
     // Issue #2469: tuple-valued declarations need the same direct/transitive
     // evidence graph as scalar declarations, but keyed by an element path.
@@ -737,6 +865,17 @@ internal static class ObliviousNullabilityAnalyzer
                         model.GetDeclaredSymbol(localFunction),
                         localFunction.ExpressionBody?.Expression,
                         localFunction.Body,
+                        model,
+                        tupleTainted,
+                        tupleEdges,
+                        tupleScalarEdges);
+                    break;
+
+                case AnonymousFunctionExpressionSyntax lambda:
+                    CollectTupleReturnFlows(
+                        model.GetSymbolInfo(lambda).Symbol as IMethodSymbol,
+                        lambda.Body as ExpressionSyntax,
+                        lambda.Body as BlockSyntax,
                         model,
                         tupleTainted,
                         tupleEdges,
@@ -838,7 +977,9 @@ internal static class ObliviousNullabilityAnalyzer
 
                 case InvocationExpressionSyntax
                     or ObjectCreationExpressionSyntax
-                    or ConstructorInitializerSyntax:
+                    or ConstructorInitializerSyntax
+                    or ElementAccessExpressionSyntax
+                    or ElementBindingExpressionSyntax:
                     CollectTupleArgumentFlows(
                         node,
                         model,
@@ -958,12 +1099,7 @@ internal static class ObliviousNullabilityAnalyzer
         List<(TupleElementKey Target, TupleElementKey Source)> tupleEdges,
         List<(TupleElementKey Target, ISymbol Source)> tupleScalarEdges)
     {
-        ImmutableArray<IArgumentOperation> arguments = model.GetOperation(call) switch
-        {
-            IInvocationOperation invocation => invocation.Arguments,
-            IObjectCreationOperation creation => creation.Arguments,
-            _ => default,
-        };
+        ImmutableArray<IArgumentOperation> arguments = GetCallArguments(call, model);
 
         if (arguments.IsDefaultOrEmpty)
         {
@@ -1194,7 +1330,7 @@ internal static class ObliviousNullabilityAnalyzer
 
         if (value is TupleExpressionSyntax declarationTupleValue
             && targetPattern is DeclarationExpressionSyntax
-                { Designation: ParenthesizedVariableDesignationSyntax declarationPattern }
+            { Designation: ParenthesizedVariableDesignationSyntax declarationPattern }
             && declarationPattern.Variables.Count == declarationTupleValue.Arguments.Count)
         {
             for (int i = 0; i < declarationPattern.Variables.Count; i++)
@@ -1440,15 +1576,15 @@ internal static class ObliviousNullabilityAnalyzer
             int index = TupleElementIndex(receiverTuple, field);
             if (index >= 0)
             {
-                if (TryResolveTupleSource(member.Expression, model, out ISymbol symbol, out _))
-                {
-                    source = new TupleElementKey(symbol, index.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                    return true;
-                }
-
                 if (TryResolveTupleElementSource(member.Expression, model, out TupleElementKey parent))
                 {
                     source = new TupleElementKey(parent.Symbol, AppendTuplePath(parent.Path, index));
+                    return true;
+                }
+
+                if (TryResolveTupleSource(member.Expression, model, out ISymbol symbol, out _))
+                {
+                    source = new TupleElementKey(symbol, index.ToString(System.Globalization.CultureInfo.InvariantCulture));
                     return true;
                 }
             }
@@ -1495,6 +1631,22 @@ internal static class ObliviousNullabilityAnalyzer
         type is { IsReferenceType: true }
             && type.NullableAnnotation != NullableAnnotation.Annotated;
 
+    private static bool IsEligibleScalarTarget(ISymbol symbol)
+    {
+        ITypeSymbol type = symbol switch
+        {
+            IMethodSymbol method => UnwrapAwaitedType(method.ReturnType),
+            IPropertySymbol property => property.Type,
+            IFieldSymbol field => field.Type,
+            ILocalSymbol local => local.Type,
+            IParameterSymbol parameter => parameter.Type,
+            _ => null,
+        };
+
+        return type is { IsReferenceType: true }
+            && type.NullableAnnotation != NullableAnnotation.Annotated;
+    }
+
     private static bool IsDefaultTupleValue(ExpressionSyntax expression, SemanticModel model) =>
         expression is DefaultExpressionSyntax
             || (expression is LiteralExpressionSyntax literal
@@ -1538,7 +1690,8 @@ internal static class ObliviousNullabilityAnalyzer
         SyntaxNode root,
         SemanticModel model,
         HashSet<ISymbol> tainted,
-        List<(ISymbol Target, ISymbol Source)> edges)
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges)
     {
         foreach (SyntaxNode node in root.DescendantNodes())
         {
@@ -1551,7 +1704,8 @@ internal static class ObliviousNullabilityAnalyzer
                         method.Body,
                         model,
                         tainted,
-                        edges);
+                        edges,
+                        scalarTupleEdges);
                     break;
 
                 case LocalFunctionStatementSyntax localFunction:
@@ -1561,7 +1715,19 @@ internal static class ObliviousNullabilityAnalyzer
                         localFunction.Body,
                         model,
                         tainted,
-                        edges);
+                        edges,
+                        scalarTupleEdges);
+                    break;
+
+                case AnonymousFunctionExpressionSyntax lambda:
+                    SeedMethodLikeReturnTaint(
+                        model.GetSymbolInfo(lambda).Symbol,
+                        lambda.Body as ExpressionSyntax,
+                        lambda.Body as BlockSyntax,
+                        model,
+                        tainted,
+                        edges,
+                        scalarTupleEdges);
                     break;
 
                 // Property / indexer getters: the "return type" is the
@@ -1576,7 +1742,8 @@ internal static class ObliviousNullabilityAnalyzer
                         property.AccessorList,
                         model,
                         tainted,
-                        edges);
+                        edges,
+                        scalarTupleEdges);
                     break;
 
                 case IndexerDeclarationSyntax indexer:
@@ -1586,7 +1753,8 @@ internal static class ObliviousNullabilityAnalyzer
                         indexer.AccessorList,
                         model,
                         tainted,
-                        edges);
+                        edges,
+                        scalarTupleEdges);
                     break;
             }
         }
@@ -1598,7 +1766,8 @@ internal static class ObliviousNullabilityAnalyzer
         BlockSyntax body,
         SemanticModel model,
         HashSet<ISymbol> tainted,
-        List<(ISymbol Target, ISymbol Source)> edges)
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges)
     {
         if (returnSymbol is not IMethodSymbol { ReturnsVoid: false })
         {
@@ -1609,14 +1778,28 @@ internal static class ObliviousNullabilityAnalyzer
 
         if (arrowBody != null)
         {
-            ApplyReturnValue(canonicalReturn, arrowBody, model, tainted, edges, transitive: true);
+            ApplyReturnValue(
+                canonicalReturn,
+                arrowBody,
+                model,
+                tainted,
+                edges,
+                scalarTupleEdges,
+                transitive: true);
         }
 
         foreach (ReturnStatementSyntax statement in EnumerateOwnReturns(body))
         {
             if (statement.Expression != null)
             {
-                ApplyReturnValue(canonicalReturn, statement.Expression, model, tainted, edges, transitive: true);
+                ApplyReturnValue(
+                    canonicalReturn,
+                    statement.Expression,
+                    model,
+                    tainted,
+                    edges,
+                    scalarTupleEdges,
+                    transitive: true);
             }
         }
     }
@@ -1627,7 +1810,8 @@ internal static class ObliviousNullabilityAnalyzer
         AccessorListSyntax accessorList,
         SemanticModel model,
         HashSet<ISymbol> tainted,
-        List<(ISymbol Target, ISymbol Source)> edges)
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges)
     {
         // Only reference-typed, not-already-nullable property/indexer types are
         // governed by this analysis; value types and `T?` declarations are left
@@ -1674,7 +1858,15 @@ internal static class ObliviousNullabilityAnalyzer
         // `Prop => expr;`
         if (propertyArrowBody != null)
         {
-            ApplyReturnValue(canonicalReturn, propertyArrowBody, model, tainted, edges, transitive, SourceScope.CallsAndNonPropertyDeclarations);
+            ApplyReturnValue(
+                canonicalReturn,
+                propertyArrowBody,
+                model,
+                tainted,
+                edges,
+                scalarTupleEdges,
+                transitive,
+                SourceScope.CallsAndNonPropertyDeclarations);
         }
 
         // Only the `get` accessor produces the property value; `set`/`init`
@@ -1689,7 +1881,15 @@ internal static class ObliviousNullabilityAnalyzer
         // `get => expr;`
         if (getter.ExpressionBody?.Expression is ExpressionSyntax getterArrow)
         {
-            ApplyReturnValue(canonicalReturn, getterArrow, model, tainted, edges, transitive, SourceScope.CallsAndNonPropertyDeclarations);
+            ApplyReturnValue(
+                canonicalReturn,
+                getterArrow,
+                model,
+                tainted,
+                edges,
+                scalarTupleEdges,
+                transitive,
+                SourceScope.CallsAndNonPropertyDeclarations);
         }
 
         // `get { ... return x; }`
@@ -1697,7 +1897,15 @@ internal static class ObliviousNullabilityAnalyzer
         {
             if (statement.Expression != null)
             {
-                ApplyReturnValue(canonicalReturn, statement.Expression, model, tainted, edges, transitive, SourceScope.CallsAndNonPropertyDeclarations);
+                ApplyReturnValue(
+                    canonicalReturn,
+                    statement.Expression,
+                    model,
+                    tainted,
+                    edges,
+                    scalarTupleEdges,
+                    transitive,
+                    SourceScope.CallsAndNonPropertyDeclarations);
             }
         }
     }
@@ -1803,29 +2011,28 @@ internal static class ObliviousNullabilityAnalyzer
         IPropertySymbol interfaceProperty,
         List<(ISymbol Target, ISymbol Source)> edges)
     {
-        if (interfaceProperty.Type is not { IsReferenceType: true }
-            || interfaceProperty.Type.NullableAnnotation == NullableAnnotation.Annotated)
-        {
-            return;
-        }
-
         if (type.FindImplementationForInterfaceMember(interfaceProperty) is not IPropertySymbol implementingProperty)
         {
             return;
         }
 
-        ISymbol interfaceCanonical = Canonical(interfaceProperty);
-        ISymbol implCanonical = Canonical(implementingProperty);
-        edges.Add((interfaceCanonical, implCanonical));
-        edges.Add((implCanonical, interfaceCanonical));
-
-        IParameterSymbol positionalParameter = FindPositionalRecordParameter(compilation, implementingProperty);
-        if (positionalParameter != null)
+        if (IsEligibleScalarTarget(interfaceProperty))
         {
-            ISymbol paramCanonical = Canonical(positionalParameter);
-            edges.Add((interfaceCanonical, paramCanonical));
-            edges.Add((paramCanonical, interfaceCanonical));
+            ISymbol interfaceCanonical = Canonical(interfaceProperty);
+            ISymbol implCanonical = Canonical(implementingProperty);
+            edges.Add((interfaceCanonical, implCanonical));
+            edges.Add((implCanonical, interfaceCanonical));
+
+            IParameterSymbol positionalParameter = FindPositionalRecordParameter(compilation, implementingProperty);
+            if (positionalParameter != null)
+            {
+                ISymbol paramCanonical = Canonical(positionalParameter);
+                edges.Add((interfaceCanonical, paramCanonical));
+                edges.Add((paramCanonical, interfaceCanonical));
+            }
         }
+
+        AddParameterContractEdges(interfaceProperty.Parameters, implementingProperty.Parameters, edges);
     }
 
     // Issue #2423: the method-return analog of
@@ -1859,27 +2066,81 @@ internal static class ObliviousNullabilityAnalyzer
         IMethodSymbol interfaceMethod,
         List<(ISymbol Target, ISymbol Source)> edges)
     {
-        if (interfaceMethod.MethodKind != MethodKind.Ordinary || interfaceMethod.ReturnsVoid)
+        if (interfaceMethod.MethodKind != MethodKind.Ordinary
+            || type.FindImplementationForInterfaceMember(interfaceMethod) is not IMethodSymbol implementingMethod)
         {
             return;
         }
 
-        ITypeSymbol effectiveReturnType = UnwrapAwaitedType(interfaceMethod.ReturnType);
-        if (effectiveReturnType is not { IsReferenceType: true }
+        AddReturnContractEdges(interfaceMethod, implementingMethod, edges);
+
+        AddParameterContractEdges(interfaceMethod.Parameters, implementingMethod.Parameters, edges);
+    }
+
+    private static void CollectOverrideContractEdges(
+        Compilation compilation,
+        List<(ISymbol Target, ISymbol Source)> edges)
+    {
+        foreach (INamedTypeSymbol type in EnumerateSourceNamedTypes(compilation))
+        {
+            foreach (IMethodSymbol method in type.GetMembers().OfType<IMethodSymbol>())
+            {
+                if (method.MethodKind == MethodKind.Ordinary
+                    && method.OverriddenMethod is IMethodSymbol overridden)
+                {
+                    AddReturnContractEdges(method, overridden, edges);
+                    AddParameterContractEdges(method.Parameters, overridden.Parameters, edges);
+                }
+            }
+
+            foreach (IPropertySymbol property in type.GetMembers().OfType<IPropertySymbol>())
+            {
+                if (property.OverriddenProperty is IPropertySymbol overridden)
+                {
+                    AddParameterContractEdges(property.Parameters, overridden.Parameters, edges);
+                }
+            }
+        }
+    }
+
+    private static void AddReturnContractEdges(
+        IMethodSymbol first,
+        IMethodSymbol second,
+        List<(ISymbol Target, ISymbol Source)> edges)
+    {
+        ITypeSymbol effectiveReturnType = UnwrapAwaitedType(first.ReturnType);
+        if (first.ReturnsVoid
+            || second.ReturnsVoid
+            || effectiveReturnType is not { IsReferenceType: true }
             || effectiveReturnType.NullableAnnotation == NullableAnnotation.Annotated)
         {
             return;
         }
 
-        if (type.FindImplementationForInterfaceMember(interfaceMethod) is not IMethodSymbol implementingMethod)
-        {
-            return;
-        }
+        ISymbol firstCanonical = Canonical(first);
+        ISymbol secondCanonical = Canonical(second);
+        edges.Add((firstCanonical, secondCanonical));
+        edges.Add((secondCanonical, firstCanonical));
+    }
 
-        ISymbol interfaceCanonical = Canonical(interfaceMethod);
-        ISymbol implCanonical = Canonical(implementingMethod);
-        edges.Add((interfaceCanonical, implCanonical));
-        edges.Add((implCanonical, interfaceCanonical));
+    private static void AddParameterContractEdges(
+        ImmutableArray<IParameterSymbol> first,
+        ImmutableArray<IParameterSymbol> second,
+        List<(ISymbol Target, ISymbol Source)> edges)
+    {
+        int count = System.Math.Min(first.Length, second.Length);
+        for (int i = 0; i < count; i++)
+        {
+            if (!IsEligibleScalarTarget(first[i]) || !IsEligibleScalarTarget(second[i]))
+            {
+                continue;
+            }
+
+            ISymbol firstCanonical = Canonical(first[i]);
+            ISymbol secondCanonical = Canonical(second[i]);
+            edges.Add((firstCanonical, secondCanonical));
+            edges.Add((secondCanonical, firstCanonical));
+        }
     }
 
     private static void CollectTupleContractEdges(
@@ -1962,6 +2223,123 @@ internal static class ObliviousNullabilityAnalyzer
             string.Empty,
             tupleTainted,
             tupleEdges);
+    }
+
+    // Issue #2504: a source named delegate's Invoke return is a declaration
+    // contract just like an interface/base method return. Roslyn exposes the
+    // selected method group or synthesized lambda method and the converted
+    // delegate type at every conversion seam, independent of whether that seam
+    // is an initializer, assignment, argument, return, or multicast update.
+    private static void CollectDelegateReturnContractEdges(
+        Compilation compilation,
+        SyntaxNode root,
+        SemanticModel model,
+        HashSet<ISymbol> tainted,
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, ISymbol Source)> delegateReturnEdges,
+        HashSet<TupleElementKey> tupleTainted,
+        List<(TupleElementKey Target, TupleElementKey Source)> tupleEdges)
+    {
+        foreach (ExpressionSyntax expression in root.DescendantNodes().OfType<ExpressionSyntax>())
+        {
+            bool isLambda = expression is AnonymousFunctionExpressionSyntax;
+            if (!isLambda && model.GetMemberGroup(expression).IsDefaultOrEmpty)
+            {
+                continue;
+            }
+
+            if (model.GetTypeInfo(expression).ConvertedType is not INamedTypeSymbol delegateType
+                || delegateType.TypeKind != TypeKind.Delegate
+                || !IsSourceDelegateType(compilation, delegateType)
+                || delegateType.DelegateInvokeMethod is not IMethodSymbol invoke
+                || invoke.ReturnsVoid)
+            {
+                continue;
+            }
+
+            IMethodSymbol source = model.GetSymbolInfo(expression).Symbol as IMethodSymbol;
+            if (source == null || source.ReturnsVoid)
+            {
+                continue;
+            }
+
+            if (TryGetTupleType(invoke, out INamedTypeSymbol invokeTuple)
+                && TryGetTupleType(source, out INamedTypeSymbol sourceTuple))
+            {
+                AddTupleContractPair(
+                    invoke,
+                    invokeTuple,
+                    source,
+                    sourceTuple,
+                    tupleTainted,
+                    tupleEdges);
+                continue;
+            }
+
+            if (!IsEligibleScalarTarget(invoke))
+            {
+                continue;
+            }
+
+            ISymbol invokeCanonical = Canonical(invoke);
+            ISymbol sourceCanonical = Canonical(source);
+            edges.Add((invokeCanonical, sourceCanonical));
+            edges.Add((sourceCanonical, invokeCanonical));
+            delegateReturnEdges.Add((invokeCanonical, sourceCanonical));
+            delegateReturnEdges.Add((sourceCanonical, invokeCanonical));
+
+            if (UnwrapAwaitedType(source.ReturnType).NullableAnnotation == NullableAnnotation.Annotated)
+            {
+                tainted.Add(invokeCanonical);
+            }
+        }
+    }
+
+    private static bool IsSourceDelegateType(Compilation compilation, INamedTypeSymbol delegateType)
+    {
+        SourceAssemblySet assemblies = SourceAssemblies.GetValue(
+            compilation,
+            static current => new SourceAssemblySet(current.Assembly.Identity.GetDisplayName()));
+        lock (assemblies.Names)
+        {
+            return assemblies.Names.Contains(delegateType.ContainingAssembly.Identity.GetDisplayName());
+        }
+    }
+
+    private static void RegisterSourceAssemblies(
+        CSharpCompilation compilation,
+        IReadOnlyList<CSharpCompilation> siblingCompilations)
+    {
+        var compilations = new List<CSharpCompilation> { compilation };
+        if (siblingCompilations != null)
+        {
+            compilations.AddRange(siblingCompilations.Where(candidate => candidate != null));
+        }
+
+        string[] names = compilations
+            .Select(candidate => candidate.Assembly.Identity.GetDisplayName())
+            .Distinct(System.StringComparer.Ordinal)
+            .ToArray();
+
+        foreach (CSharpCompilation candidate in compilations)
+        {
+            SourceAssemblySet assemblies = SourceAssemblies.GetValue(
+                candidate,
+                static current => new SourceAssemblySet(current.Assembly.Identity.GetDisplayName()));
+            bool changed = false;
+            lock (assemblies.Names)
+            {
+                foreach (string name in names)
+                {
+                    changed |= assemblies.Names.Add(name);
+                }
+            }
+
+            if (changed)
+            {
+                Cache.Remove(candidate);
+            }
+        }
     }
 
     // Unwraps a (non-generic-parameter) `System.Threading.Tasks.Task<T>` or
@@ -2057,6 +2435,7 @@ internal static class ObliviousNullabilityAnalyzer
         SemanticModel model,
         HashSet<ISymbol> tainted,
         List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges,
         bool transitive,
         SourceScope scope = SourceScope.AllSources)
     {
@@ -2066,7 +2445,14 @@ internal static class ObliviousNullabilityAnalyzer
         }
         else if (transitive)
         {
-            AddEdges(returnSymbol, value, model, edges, scope);
+            CollectScalarValueFlow(
+                returnSymbol,
+                value,
+                model,
+                tainted,
+                edges,
+                scalarTupleEdges,
+                scope);
         }
     }
 
@@ -2112,6 +2498,98 @@ internal static class ObliviousNullabilityAnalyzer
         {
             edges.Add((target, source));
         }
+    }
+
+    // Issue #2490: a scalar declaration/return/parameter can receive one
+    // independently-tainted leaf from the tuple graph introduced for #2469.
+    // Preserve the scalar expression-shape rules used by ResolveSources while
+    // recording tuple-member reads as element-path edges instead of collapsing
+    // them to the synthesized ValueTuple field symbol.
+    private static void CollectScalarValueFlow(
+        ISymbol target,
+        ExpressionSyntax value,
+        SemanticModel model,
+        HashSet<ISymbol> tainted,
+        List<(ISymbol Target, ISymbol Source)> edges,
+        List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges,
+        SourceScope scope = SourceScope.AllSources)
+    {
+        if (!IsEligibleScalarTarget(target))
+        {
+            return;
+        }
+
+        // Issue #2504/#2496: assigning or returning a lambda/method group moves
+        // the callable object, not the value produced by invoking it. Its result
+        // taint is wired separately to the converted named delegate's Invoke
+        // contract; it must never make the delegate envelope itself nullable.
+        if (IsCallableValueExpression(value, model))
+        {
+            return;
+        }
+
+        if (IsDirectlyNullable(value, model))
+        {
+            tainted.Add(target);
+            return;
+        }
+
+        switch (value)
+        {
+            case ParenthesizedExpressionSyntax parenthesized:
+                CollectScalarValueFlow(target, parenthesized.Expression, model, tainted, edges, scalarTupleEdges, scope);
+                return;
+
+            case AwaitExpressionSyntax awaitExpression:
+                CollectScalarValueFlow(target, awaitExpression.Expression, model, tainted, edges, scalarTupleEdges, scope);
+                return;
+
+            case PostfixUnaryExpressionSyntax suppress
+                when suppress.IsKind(SyntaxKind.SuppressNullableWarningExpression):
+                return;
+
+            case BinaryExpressionSyntax coalesce
+                when coalesce.IsKind(SyntaxKind.CoalesceExpression):
+                CollectScalarValueFlow(target, coalesce.Right, model, tainted, edges, scalarTupleEdges, scope);
+                return;
+
+            case ConditionalExpressionSyntax conditional:
+                CollectScalarValueFlow(target, conditional.WhenTrue, model, tainted, edges, scalarTupleEdges, scope);
+                CollectScalarValueFlow(target, conditional.WhenFalse, model, tainted, edges, scalarTupleEdges, scope);
+                return;
+
+            case SwitchExpressionSyntax switchExpression:
+                foreach (SwitchExpressionArmSyntax arm in switchExpression.Arms)
+                {
+                    CollectScalarValueFlow(target, arm.Expression, model, tainted, edges, scalarTupleEdges, scope);
+                }
+
+                return;
+
+            case CastExpressionSyntax cast:
+                CollectScalarValueFlow(target, cast.Expression, model, tainted, edges, scalarTupleEdges, scope);
+                return;
+        }
+
+        if (scope != SourceScope.CallsOnly
+            && TryResolveTupleElementSource(value, model, out TupleElementKey tupleSource))
+        {
+            scalarTupleEdges.Add((target, tupleSource));
+            return;
+        }
+
+        AddEdges(target, value, model, edges, scope);
+    }
+
+    private static bool IsCallableValueExpression(ExpressionSyntax expression, SemanticModel model)
+    {
+        while (expression is ParenthesizedExpressionSyntax parenthesized)
+        {
+            expression = parenthesized.Expression;
+        }
+
+        return expression is AnonymousFunctionExpressionSyntax
+            || !model.GetMemberGroup(expression).IsDefaultOrEmpty;
     }
 
     private static IEnumerable<ISymbol> ResolveSources(
@@ -2417,6 +2895,19 @@ internal static class ObliviousNullabilityAnalyzer
         public string Path { get; }
     }
 
+    private readonly struct ScalarQuery
+    {
+        public ScalarQuery(CSharpCompilation compilation, ISymbol symbol)
+        {
+            this.Compilation = compilation;
+            this.Symbol = Canonical(symbol);
+        }
+
+        public CSharpCompilation Compilation { get; }
+
+        public ISymbol Symbol { get; }
+    }
+
     private readonly struct TupleElementQuery
     {
         public TupleElementQuery(CSharpCompilation compilation, TupleElementKey key)
@@ -2447,6 +2938,25 @@ internal static class ObliviousNullabilityAnalyzer
         }
     }
 
+    private sealed class ScalarQueryComparer : IEqualityComparer<ScalarQuery>
+    {
+        public static ScalarQueryComparer Instance { get; } = new();
+
+        public bool Equals(ScalarQuery x, ScalarQuery y) =>
+            ReferenceEquals(x.Compilation, y.Compilation)
+                && SymbolEqualityComparer.Default.Equals(x.Symbol, y.Symbol);
+
+        public int GetHashCode(ScalarQuery obj)
+        {
+            int symbolHash = obj.Symbol == null
+                ? 0
+                : SymbolEqualityComparer.Default.GetHashCode(obj.Symbol);
+            return System.HashCode.Combine(
+                System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj.Compilation),
+                symbolHash);
+        }
+    }
+
     private sealed class TupleElementQueryComparer : IEqualityComparer<TupleElementQuery>
     {
         public static TupleElementQueryComparer Instance { get; } = new();
@@ -2467,12 +2977,16 @@ internal static class ObliviousNullabilityAnalyzer
             HashSet<ISymbol> tainted,
             HashSet<TupleElementKey> tupleTainted,
             List<(TupleElementKey Target, TupleElementKey Source)> tupleEdges,
-            List<(TupleElementKey Target, ISymbol Source)> tupleScalarEdges)
+            List<(TupleElementKey Target, ISymbol Source)> tupleScalarEdges,
+            List<(ISymbol Target, TupleElementKey Source)> scalarTupleEdges,
+            List<(ISymbol Target, ISymbol Source)> delegateReturnEdges)
         {
             this.Tainted = tainted;
             this.TupleTainted = tupleTainted;
             this.TupleEdges = tupleEdges;
             this.TupleScalarEdges = tupleScalarEdges;
+            this.ScalarTupleEdges = scalarTupleEdges;
+            this.DelegateReturnEdges = delegateReturnEdges;
         }
 
         public HashSet<ISymbol> Tainted { get; }
@@ -2482,5 +2996,19 @@ internal static class ObliviousNullabilityAnalyzer
         public List<(TupleElementKey Target, TupleElementKey Source)> TupleEdges { get; }
 
         public List<(TupleElementKey Target, ISymbol Source)> TupleScalarEdges { get; }
+
+        public List<(ISymbol Target, TupleElementKey Source)> ScalarTupleEdges { get; }
+
+        public List<(ISymbol Target, ISymbol Source)> DelegateReturnEdges { get; }
+    }
+
+    private sealed class SourceAssemblySet
+    {
+        public SourceAssemblySet(string currentAssembly)
+        {
+            this.Names = new HashSet<string>(System.StringComparer.Ordinal) { currentAssembly };
+        }
+
+        public HashSet<string> Names { get; }
     }
 }
