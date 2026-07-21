@@ -55,6 +55,63 @@ public class Issue1239CoalesceCommonTypeEmitTests
     }
 
     [Fact]
+    public void RightSubtypeAndDelegateFactory_ConvertToNullableLeftTypes()
+    {
+        var source = """
+            package P
+
+            import System
+
+            interface ILogger { func Name() string; }
+            class RealLogger : ILogger { func Name() string { return "real" } }
+            class NullLogger : ILogger { func Name() string { return "null" } }
+
+            func PickLogger(logger ILogger?) ILogger {
+                return logger ?? NullLogger()
+            }
+
+            func PickFactory(factory (() -> ILogger)?) () -> ILogger {
+                return factory ?? (() -> NullLogger())
+            }
+
+            var realFactory (() -> ILogger) = () -> RealLogger()
+            Console.WriteLine(PickLogger(RealLogger()).Name())
+            Console.WriteLine(PickLogger(nil).Name())
+            Console.WriteLine(PickFactory(realFactory)().Name())
+            Console.WriteLine(PickFactory(nil)().Name())
+            """;
+
+        var output = CompileAndRun(source);
+
+        Assert.Equal("real\nnull\nreal\nnull\n", output);
+    }
+
+    [Fact]
+    public void NullableRightSubtype_ConvertsToNullableLeftInterface()
+    {
+        var source = """
+            package P
+
+            import System
+
+            interface ILogger { func Name() string; }
+            class NullLogger : ILogger { func Name() string -> "null" }
+
+            func Pick(logger ILogger?, fallback NullLogger?) ILogger? {
+                var selected = logger ?? fallback
+                return selected
+            }
+
+            Console.WriteLine(Pick(nil, NullLogger())!!.Name())
+            Console.WriteLine(Pick(nil, nil) == nil)
+            """;
+
+        var output = CompileAndRun(source);
+
+        Assert.Equal("null\nTrue\n", output);
+    }
+
+    [Fact]
     public void RightIsBaseClass_ResultIsBaseClass()
     {
         var source = """

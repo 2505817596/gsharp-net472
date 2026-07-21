@@ -95,6 +95,17 @@ public sealed partial class CSharpToGSharpTranslator
                     }
                 }
 
+                if (initializer != null
+                    && declarator.Initializer?.Value is { } initializerSyntax
+                    && this.context.GetDeclaredSymbol(declarator) is ILocalSymbol localTarget)
+                {
+                    initializer = this.ForgiveNullableReferenceValue(
+                        initializerSyntax,
+                        initializer,
+                        localTarget.Type,
+                        localTarget);
+                }
+
                 // Issue #1954: `var g2 = grid;` — a simple `var` local initialized
                 // directly from another local/parameter/field that is ITSELF a
                 // tracked flat-lowered multi-dim array (see `multiDimArrays`)
@@ -211,32 +222,6 @@ public sealed partial class CSharpToGSharpTranslator
                             // shape so `var x = e;` and `T x = e;` (declared type ==
                             // natural type) promote identically.
                             emitType = true;
-                        }
-                        else if (this.IsObliviousCompilation()
-                            && IsObliviousExternalNullableMember(
-                                this.context.GetSymbolInfo(declarator.Initializer.Value).Symbol))
-                        {
-                            // Issue #2425: the explicit-type-equals-initializer-type
-                            // shape above elides the type clause and relies on
-                            // inference (issue #1737 above doesn't fire — the
-                            // whole-program taint fixpoint only tracks
-                            // same/sibling-SOURCE symbols, and an EXTERNAL member
-                            // never seeds one of its edges). But the initializer
-                            // itself is a value-position read of an oblivious
-                            // (metadata, no nullable context) external member —
-                            // exactly the shape #2202's TranslateValueWithNullForgiveness
-                            // already forgives for a `return ext.Combine(...)` direct
-                            // return. gsc maps that read to `T?`, so with no type
-                            // clause emitted here gsc would infer the LOCAL itself as
-                            // `T?` (e.g. `let codeVerifier = tokenBytes.ToUrlBase64String()`
-                            // → `codeVerifier : string?`), and a later `return
-                            // codeVerifier;` has no external symbol left at the read
-                            // site to trigger forgiveness (GS0156). Assert `!!` at the
-                            // INITIALIZER instead — mirroring the direct-return fix —
-                            // so the local infers the declared non-null type from the
-                            // start and every later use (return/argument/assignment)
-                            // needs no further special-casing.
-                            initializer = new NonNullAssertionExpression(initializer);
                         }
                     }
 
@@ -604,7 +589,7 @@ public sealed partial class CSharpToGSharpTranslator
         // is consumed. Neither of those fixes reaches a subsequent bare assignment
         // STATEMENT: `TranslateExpressionStatement`'s assignment case translates
         // the RHS via plain `TranslateExpression` with no external-oblivious
-        // forgiveness of its own. This reuses the SAME `IsObliviousExternalNullableMember`
+        // forgiveness of its own. This reuses the SAME `IsImportedObliviousNullableMember`
         // detection those two fixes already use, applied at the assignment RHS use
         // site instead. Gated to a target whose OWN type is a non-annotated,
         // non-promoted reference type — i.e., one that genuinely expects
@@ -620,7 +605,7 @@ public sealed partial class CSharpToGSharpTranslator
             if (!this.IsObliviousCompilation()
                 || !assignment.IsKind(SyntaxKind.SimpleAssignmentExpression)
                 || translatedRhs is NonNullAssertionExpression
-                || !IsObliviousExternalNullableMember(this.context.GetSymbolInfo(assignment.Right).Symbol))
+                || !this.IsImportedObliviousNullableMember(this.context.GetSymbolInfo(assignment.Right).Symbol))
             {
                 return translatedRhs;
             }
@@ -1785,6 +1770,24 @@ public sealed partial class CSharpToGSharpTranslator
                     assignRhs = this.ForgiveEventSubscriptionRhs(assignment, assignRhs);
                     assignRhs = this.ForgiveElementAccessAssignmentRhs(assignment, assignRhs);
                     assignRhs = this.ForgiveObliviousExternalAssignmentRhs(assignment, assignRhs);
+                    if (assignment.IsKind(SyntaxKind.SimpleAssignmentExpression))
+                    {
+                        ISymbol assignmentTarget = this.context.GetSymbolInfo(assignment.Left).Symbol;
+                        ITypeSymbol assignmentTargetType = assignmentTarget switch
+                        {
+                            ILocalSymbol local => local.Type,
+                            IParameterSymbol parameter => parameter.Type,
+                            IFieldSymbol field => field.Type,
+                            IPropertySymbol property => property.Type,
+                            _ => this.context.GetTypeInfo(assignment.Left).Type,
+                        };
+                        assignRhs = this.ForgiveNullableReferenceValue(
+                            assignment.Right,
+                            assignRhs,
+                            assignmentTargetType,
+                            assignmentTarget);
+                    }
+
                     return new AssignmentStatement(
                         this.TranslateAssignmentTarget(assignment.Left),
                         assignRhs,

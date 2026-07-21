@@ -111,6 +111,19 @@ public sealed class Conversion
     /// <returns>The classified conversion.</returns>
     internal static Conversion ClassifyCore(TypeSymbol from, TypeSymbol to, bool allowStructuralProjection)
     {
+        // Inner generic nullability metadata does not change the outer CLR type's
+        // conversion rules. Expose the symbolic generic/interface shape beneath
+        // it before applying identity, hierarchy, and variance classification.
+        while (from is NullabilityAnnotatedTypeSymbol fromAnnotated)
+        {
+            from = fromAnnotated.BaseType;
+        }
+
+        while (to is NullabilityAnnotatedTypeSymbol toAnnotated)
+        {
+            to = toAnnotated.BaseType;
+        }
+
         if (from == to)
         {
             return Conversion.Identity;
@@ -903,7 +916,11 @@ public sealed class Conversion
                 {
                     foreach (var i in c.Interfaces)
                     {
-                        if (i == toInterface)
+                        // Issue #2535: lift declaration-site variance through a
+                        // class's implemented interface (e.g. C : IOut<object>
+                        // converts to IOut<object?>). Direct interface values
+                        // already use this same safe, reference-only check below.
+                        if (i == toInterface || IsVarianceCompatibleInterfaceConversion(i, toInterface))
                         {
                             return Conversion.Implicit;
                         }
@@ -2103,6 +2120,12 @@ public sealed class Conversion
 
         for (var i = 0; i < invokeParamTypes.Length; i++)
         {
+            if (fn.ParameterTypes[i] is FunctionTypeSymbol nestedFunction
+                && IsFunctionToDelegateConvertible(nestedFunction, invokeParamTypes[i]))
+            {
+                continue;
+            }
+
             var fnParamClr = fn.ParameterTypes[i]?.ClrType;
             if (fnParamClr == null || !ClrTypeUtilities.IsAssignableByName(invokeParamTypes[i], fnParamClr))
             {
@@ -2458,7 +2481,19 @@ public sealed class Conversion
             return true;
         }
 
-        return false;
+        // Issue #2542: same-compilation classes and interfaces have no CLR
+        // backing while binding, so the CLR-only delegate checks cannot see a
+        // safe concrete-to-interface (or derived-to-base) return covariance.
+        // Reuse the scalar conversion rules, but require both ends to be
+        // reference-like and exclude structural projection. Function
+        // parameters remain exact in IsFunctionShapeAssignable.
+        if (!IsReferenceLikeTarget(fromReturn) || !IsReferenceLikeTarget(toReturn))
+        {
+            return false;
+        }
+
+        var conversion = ClassifyNonStructural(fromReturn, toReturn);
+        return conversion.Exists && conversion.IsImplicit;
     }
 
     private static bool IsEnumLikeType(TypeSymbol type)

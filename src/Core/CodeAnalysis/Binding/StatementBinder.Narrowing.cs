@@ -1236,6 +1236,11 @@ internal sealed partial class StatementBinder
             for (var i = 0; i < syntax.Identifiers.Count; i++)
             {
                 var idTok = syntax.Identifiers[i];
+                if (IsDiscard(idTok))
+                {
+                    continue;
+                }
+
                 var elemType = tupleType.ElementTypes[i];
                 var elemVar = bindLocalVariable(idTok, isReadOnly: true, elemType);
                 var access = new BoundTupleElementAccessExpression(null, new BoundVariableExpression(null, tempVar), tupleType, i);
@@ -1263,6 +1268,11 @@ internal sealed partial class StatementBinder
             for (var i = 0; i < syntax.Identifiers.Count; i++)
             {
                 var idTok = syntax.Identifiers[i];
+                if (IsDiscard(idTok))
+                {
+                    continue;
+                }
+
                 var field = fields[i];
                 var elemVar = bindLocalVariable(idTok, isReadOnly: true, field.Type);
                 var access = new BoundFieldAccessExpression(null, new BoundVariableExpression(null, tempVar), structType, field);
@@ -1270,6 +1280,15 @@ internal sealed partial class StatementBinder
             }
 
             return new BoundBlockStatement(syntax, statements.ToImmutable());
+        }
+
+        if (TryBindImportedDeconstruct(
+            initializer,
+            syntax.Identifiers,
+            syntax.OpenParenToken.Location,
+            out var deconstructStatements))
+        {
+            return new BoundBlockStatement(syntax, deconstructStatements);
         }
 
         Diagnostics.ReportDeconstructionRequiresTupleOrDataStruct(syntax.OpenParenToken.Location, initializer.Type);
@@ -1312,6 +1331,11 @@ internal sealed partial class StatementBinder
             var statements = ImmutableArray.CreateBuilder<BoundStatement>();
             for (var i = 0; i < identifiers.Count; i++)
             {
+                if (IsDiscard(identifiers[i]))
+                {
+                    continue;
+                }
+
                 var elemType = tupleType.ElementTypes[i];
                 var elemVar = bindLocalVariable(identifiers[i], isReadOnly: true, elemType);
                 var access = new BoundTupleElementAccessExpression(null, elementAccessBase, tupleType, i);
@@ -1334,6 +1358,11 @@ internal sealed partial class StatementBinder
             var statements = ImmutableArray.CreateBuilder<BoundStatement>();
             for (var i = 0; i < identifiers.Count; i++)
             {
+                if (IsDiscard(identifiers[i]))
+                {
+                    continue;
+                }
+
                 var field = fields[i];
                 var elemVar = bindLocalVariable(identifiers[i], isReadOnly: true, field.Type);
                 var access = new BoundFieldAccessExpression(null, elementAccessBase, structType, field);
@@ -1341,6 +1370,15 @@ internal sealed partial class StatementBinder
             }
 
             return statements.ToImmutable();
+        }
+
+        if (TryBindImportedDeconstruct(
+            elementAccessBase,
+            identifiers,
+            openParenLocation,
+            out var deconstructStatements))
+        {
+            return deconstructStatements;
         }
 
         if (elementType != TypeSymbol.Error)
@@ -1352,12 +1390,199 @@ internal sealed partial class StatementBinder
         return ImmutableArray<BoundStatement>.Empty;
     }
 
+    private bool TryBindImportedDeconstruct(
+        BoundExpression receiver,
+        SeparatedSyntaxList<SyntaxToken> identifiers,
+        TextLocation location,
+        out ImmutableArray<BoundStatement> statements)
+    {
+        statements = default;
+        var receiverClrType = receiver.Type?.ClrType;
+        if (receiverClrType == null
+            && !MemberLookup.TryProjectErasedClrType(receiver.Type, out receiverClrType))
+        {
+            return false;
+        }
+
+        if (receiver.Type is ImportedTypeSymbol symbolicReceiver
+            && symbolicReceiver.OpenDefinition != null
+            && !symbolicReceiver.TypeArguments.IsDefaultOrEmpty)
+        {
+            receiverClrType = symbolicReceiver.ReifyClosedClrType() ?? receiverClrType;
+        }
+
+        var probes = new MemberLookup(binderCtx)
+            .CollectImportedMethodProbes(
+                staticClassType: null,
+                receiverClrType,
+                "Deconstruct",
+                includeExtensions: true);
+        foreach (var probe in probes)
+        {
+            var receiverOffset = probe.ReceiverParameterOffset;
+            var candidates = probe.Methods
+                .Where(method =>
+                {
+                    var parameters = method.GetParameters();
+                    return method.ReturnType.FullName == typeof(void).FullName
+                        && parameters.Length == identifiers.Count + receiverOffset
+                        && parameters.Skip(receiverOffset).All(parameter =>
+                            parameter.IsOut && parameter.ParameterType.IsByRef);
+                })
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                continue;
+            }
+
+            var inferenceTypes = new Type[identifiers.Count + receiverOffset];
+            if (receiverOffset == 1)
+            {
+                inferenceTypes[0] = receiverClrType;
+            }
+
+            candidates = candidates
+                .Select(method =>
+                {
+                    if (!method.IsGenericMethodDefinition)
+                    {
+                        return method;
+                    }
+
+                    if (!OverloadResolution.TryInferTypeArguments(method, inferenceTypes, out var typeArguments))
+                    {
+                        return null;
+                    }
+
+                    try
+                    {
+                        for (var i = 0; i < typeArguments.Length; i++)
+                        {
+                            typeArguments[i] = scope.References.MapClrTypeToReferences(typeArguments[i])
+                                ?? typeArguments[i];
+                        }
+
+                        return method.MakeGenericMethod(typeArguments);
+                    }
+                    catch (ArgumentException)
+                    {
+                        return null;
+                    }
+                })
+                .Where(method => method != null)
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                continue;
+            }
+
+            var argumentTypes = new Type[identifiers.Count + receiverOffset];
+            if (receiverOffset == 1)
+            {
+                argumentTypes[0] = receiverClrType;
+            }
+
+            Array.Fill(
+                argumentTypes,
+                OverloadResolution.InlineOutVarArgumentType,
+                startIndex: receiverOffset,
+                count: identifiers.Count);
+
+            var resolution = OverloadResolution.Resolve(
+                candidates,
+                argumentTypes,
+                projectTypeArgument: scope.References.MapClrTypeToReferences);
+            if (resolution.Outcome == OverloadResolution.ResolutionOutcome.Ambiguous)
+            {
+                Diagnostics.ReportAmbiguousOverload(
+                    location,
+                    "Deconstruct",
+                    resolution.Ambiguous.Length,
+                    resolution.Ambiguous.Select(OverloadResolution.FormatMethodSignature));
+                DeclareErrorTypedLocals(identifiers);
+                statements = ImmutableArray<BoundStatement>.Empty;
+                return true;
+            }
+
+            if (resolution.Outcome != OverloadResolution.ResolutionOutcome.Resolved)
+            {
+                continue;
+            }
+
+            var method = resolution.Best;
+            var parameters = method.GetParameters();
+            var arguments = ImmutableArray.CreateBuilder<BoundExpression>(parameters.Length);
+            var refKinds = ImmutableArray.CreateBuilder<RefKind>(parameters.Length);
+            var declarations = ImmutableArray.CreateBuilder<BoundStatement>(identifiers.Count);
+            if (receiverOffset == 1)
+            {
+                arguments.Add(conversions.BindConversion(
+                    location,
+                    receiver,
+                    TypeSymbol.FromClrType(parameters[0].ParameterType)));
+                refKinds.Add(RefKind.None);
+            }
+
+            for (var i = 0; i < identifiers.Count; i++)
+            {
+                var parameterType = receiverOffset == 0
+                    ? MemberLookup.GetClrMethodParameterTypeSymbol(receiver.Type, method, i)
+                    : TypeSymbol.FromClrType(parameters[i + receiverOffset].ParameterType);
+                var elementType = parameterType is ByRefTypeSymbol byRef
+                    ? byRef.PointeeType
+                    : TypeSymbol.FromClrType(parameters[i + receiverOffset].ParameterType.GetElementType());
+                var temp = new LocalVariableSymbol(
+                    $"<deconstruct{System.Threading.Interlocked.Increment(ref binderCtx.SyntheticLocalCounter)}>",
+                    isReadOnly: false,
+                    elementType);
+                scope.TryDeclareVariable(temp);
+                arguments.Add(new BoundAddressOfExpression(
+                    null,
+                    new BoundVariableExpression(null, temp)));
+                refKinds.Add(RefKind.Out);
+                if (!IsDiscard(identifiers[i]))
+                {
+                    var variable = bindLocalVariable(identifiers[i], isReadOnly: true, elementType);
+                    declarations.Add(new BoundVariableDeclaration(
+                        null,
+                        variable,
+                        new BoundVariableExpression(null, temp)));
+                }
+            }
+
+            BoundExpression call = receiverOffset == 1
+                ? new BoundClrStaticCallExpression(
+                    null,
+                    method,
+                    TypeSymbol.Void,
+                    arguments.MoveToImmutable(),
+                    refKinds.MoveToImmutable())
+                : new BoundImportedInstanceCallExpression(
+                    null,
+                    receiver,
+                    MemberLookup.GetImportedMethodForEmission(method),
+                    TypeSymbol.Void,
+                    arguments.MoveToImmutable(),
+                    refKinds.MoveToImmutable());
+            var result = ImmutableArray.CreateBuilder<BoundStatement>(identifiers.Count + 1);
+            result.Add(new BoundExpressionStatement(null, call));
+            result.AddRange(declarations);
+            statements = result.ToImmutable();
+            return true;
+        }
+
+        return false;
+    }
+
     /// <summary>Declares each identifier as an error-typed local so a deconstruction failure doesn't cascade "variable doesn't exist" diagnostics through the loop body.</summary>
     private void DeclareErrorTypedLocals(SeparatedSyntaxList<SyntaxToken> identifiers)
     {
         for (var i = 0; i < identifiers.Count; i++)
         {
-            bindLocalVariable(identifiers[i], isReadOnly: true, TypeSymbol.Error);
+            if (!IsDiscard(identifiers[i]))
+            {
+                bindLocalVariable(identifiers[i], isReadOnly: true, TypeSymbol.Error);
+            }
         }
     }
 
@@ -1394,6 +1619,11 @@ internal sealed partial class StatementBinder
             if (!TypeMemberModel.TryGetFieldIncludingInherited(structType, fieldName, MemberQuery.Instance(MemberKinds.Field), out var field, out var declaringType))
             {
                 Diagnostics.ReportUnableToFindMember(fieldSyntax.FieldIdentifier.Location, fieldName);
+                continue;
+            }
+
+            if (IsDiscard(fieldSyntax.LocalIdentifier))
+            {
                 continue;
             }
 

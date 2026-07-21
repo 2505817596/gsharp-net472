@@ -91,6 +91,16 @@ public sealed partial class CSharpToGSharpTranslator
                     SanitizeIdentifier(identifier.Identifier.Text));
             }
 
+            // A bare type used as an expression receiver (Path.Combine,
+            // Task.FromResult, Console.WriteLine, ...) does not pass through
+            // type-syntax translation. Map it here so SDK implicit/global
+            // usings still contribute the namespace import required by G#.
+            if (this.context.SemanticModel.GetAliasInfo(identifier) is null &&
+                this.context.GetSymbolInfo(identifier).Symbol is INamedTypeSymbol type)
+            {
+                return new TypeExpression(this.typeMapper.Map(type, this.context, identifier.GetLocation()));
+            }
+
             return new IdentifierExpression(SanitizeIdentifier(identifier.Identifier.Text));
         }
 
@@ -266,8 +276,8 @@ public sealed partial class CSharpToGSharpTranslator
 
         /// <summary>
         /// Translates a C# anonymous object creation (<c>new { A = 1, B = 2 }</c>)
-        /// to a G# composite literal constructing a synthesized <c>data
-        /// class</c> (<c>AnonymousType0{A: 1, B: 2}</c>, issue #2282). See
+        /// to a positional construction of a synthesized G# <c>data class</c>
+        /// (<c>AnonymousType0(1, 2)</c>, issues #2282 and #2538). See
         /// <see cref="CSharpTypeMapper.GetOrCreateAnonymousDataClass"/> for why
         /// a synthesized, shape-deduplicated data class supersedes both the
         /// original positional-tuple lowering (issue #1934, which dropped
@@ -275,61 +285,57 @@ public sealed partial class CSharpToGSharpTranslator
         /// literal (issue #2224, which cannot be spelled as an explicit TYPE —
         /// e.g. a lambda parameter's type inferred from another lambda's
         /// anonymous-typed return value, issue #2282's actual repro shape). A
-        /// user-declared struct/class composite literal — unlike a tuple
-        /// literal — is explicitly legal inside an expression-tree lambda, so
-        /// this remains safe even when the anonymous type is constructed
-        /// inside one. Each member's type annotation is the C# compiler's own
-        /// inferred anonymous-type property type, written out explicitly — G#
-        /// (unlike C#) has no type inference at this syntax position.
+        /// positional class construction — unlike a tuple literal — is legal
+        /// inside an expression-tree lambda. It also remains a direct
+        /// expression when used as a constructor-delegation argument; a class
+        /// composite literal lowers to setup statements before the delegation
+        /// and violates G#'s delegation-first rule (issue #2538).
         /// </summary>
         private GExpression TranslateAnonymousObjectCreation(AnonymousObjectCreationExpressionSyntax anonymous)
         {
             this.context.Report(new TranslationDiagnostic(
                 nameof(SyntaxKind.AnonymousObjectCreationExpression),
-                "anonymous object creation 'new { ... }' maps to a G# composite literal constructing a synthesized 'data class' (issue #2282); gsc reuses the same synthesized type for every structurally-identical anonymous-type shape, preserving named-member access at both the construction site and any type-position use.",
+                "anonymous object creation 'new { ... }' maps to positional construction of a synthesized G# 'data class' (issues #2282 and #2538); gsc reuses the same synthesized type for every structurally-identical anonymous-type shape, preserving named-member access at both the construction site and any type-position use.",
                 anonymous.GetLocation(),
                 TranslationSeverity.Info));
 
-            GTypeReference syntheticType = this.context.GetTypeInfo(anonymous).Type is INamedTypeSymbol anonymousType
-                ? this.typeMapper.GetOrCreateAnonymousDataClass(anonymousType, this.context, anonymous.GetLocation())
-                : new NamedTypeReference(CSharpTypeMapper.UnsupportedPlaceholderType);
+            (GTypeReference Type, IReadOnlyList<IPropertySymbol> Properties) shape =
+                this.context.GetTypeInfo(anonymous).Type is INamedTypeSymbol anonymousType
+                    ? this.typeMapper.GetOrCreateAnonymousDataClassShape(
+                        anonymousType,
+                        this.context,
+                        anonymous.GetLocation())
+                    : (new NamedTypeReference(CSharpTypeMapper.UnsupportedPlaceholderType), Array.Empty<IPropertySymbol>());
 
-            var fieldInitializers = anonymous.Initializers
-                .Select(i => new FieldInitializer(AnonymousMemberName(i), this.TranslateExpression(i.Expression)))
-                .ToList();
+            // Roslyn exposes anonymous properties in constructor order. Drive
+            // construction from that same registered order rather than an
+            // independent member enumeration so declaration and call arity/order
+            // cannot diverge across files or projects.
+            var arguments = shape.Properties.Count == anonymous.Initializers.Count
+                ? shape.Properties
+                    .Select((_, index) => this.TranslateExpression(anonymous.Initializers[index].Expression))
+                    .ToList()
+                : anonymous.Initializers
+                    .Select(initializer => this.TranslateExpression(initializer.Expression))
+                    .ToList();
 
-            return new CompositeLiteralExpression(syntheticType, fieldInitializers);
-        }
-
-        /// <summary>
-        /// Resolves an anonymous-object member's projected name: the explicit
-        /// <c>Name = expr</c> form carries it directly; otherwise (C# member-name
-        /// inference, e.g. <c>new { x.Id }</c> or <c>new { id }</c>) it is the
-        /// simple identifier of the initializer expression (a bare identifier or
-        /// the last segment of a member access) — the same rule the C# compiler
-        /// uses to name the synthesized anonymous-type property.
-        /// </summary>
-        /// <param name="declarator">The anonymous-object member declarator.</param>
-        /// <returns>The projected member name.</returns>
-        private static string AnonymousMemberName(AnonymousObjectMemberDeclaratorSyntax declarator)
-        {
-            if (declarator.NameEquals != null)
-            {
-                return declarator.NameEquals.Name.Identifier.Text;
-            }
-
-            return declarator.Expression switch
-            {
-                IdentifierNameSyntax id => id.Identifier.Text,
-                MemberAccessExpressionSyntax member => member.Name.Identifier.Text,
-                MemberBindingExpressionSyntax memberBinding => memberBinding.Name.Identifier.Text,
-                _ => throw new InvalidOperationException(
-                    $"anonymous-object member at {declarator.GetLocation()} has no explicit name and no inferable name (expression kind {declarator.Expression.Kind()})."),
-            };
+            return BuildConstruction(shape.Type, arguments);
         }
 
         private GExpression TranslateMemberAccess(MemberAccessExpressionSyntax member)
         {
+            // C# permits namespace-qualified type expressions without importing
+            // their namespace, including relative qualification from the current
+            // namespace. G# resolves expression receivers as values/types, not as
+            // C# namespace paths. Collapse the whole bound type expression through
+            // the type mapper so it emits the canonical type name and records the
+            // namespace import needed by the generated file.
+            if (this.context.GetSymbolInfo(member).Symbol is INamedTypeSymbol qualifiedType)
+            {
+                return new TypeExpression(
+                    this.typeMapper.Map(qualifiedType, this.context, member.GetLocation()));
+            }
+
             // Issue #2351: a bare (non-invoked) reference to an extension
             // method's method group (e.g. assigned to a delegate) never goes
             // through TranslateInvocation, so track its declaring namespace
@@ -457,9 +463,22 @@ public sealed partial class CSharpToGSharpTranslator
             bool receiverIsAnonymousType =
                 this.context.GetTypeInfo(member.Expression).Type is { IsAnonymousType: true };
 
-            GExpression target = this.MemberBindsToNullableThisExtension(member) || receiverIsAnonymousType
-                ? this.TranslateExpression(member.Expression)
-                : this.TranslateReceiverWithNullForgiveness(member.Expression);
+            GExpression target;
+            if (this.context.GetSymbolInfo(member.Expression).Symbol is INamedTypeSymbol
+                { IsGenericType: true } receiverNamedType)
+            {
+                // A qualified generic type is a MemberAccessExpressionSyntax;
+                // translate its bound type so its type arguments are retained.
+                target = new TypeExpression(
+                    this.typeMapper.Map(receiverNamedType, this.context, member.Expression.GetLocation()));
+            }
+            else
+            {
+                target = this.MemberBindsToNullableThisExtension(member) || receiverIsAnonymousType
+                    ? this.TranslateExpression(member.Expression)
+                    : this.TranslateReceiverWithNullForgiveness(member.Expression);
+            }
+
             string memberName = member.Name.Identifier.Text;
 
             // Issue #1905: C# pointer member access (`p->X`) and plain member
@@ -528,7 +547,8 @@ public sealed partial class CSharpToGSharpTranslator
             GExpression translated = this.TranslateExpression(recv);
 
             if (this.ReceiverNeedsNullForgiveness(recv, isDereferenceReceiver: true)
-                || this.ReceiverIsNullableReferenceFieldOrProperty(recv))
+                || this.ReceiverIsNullableReferenceFieldOrProperty(recv)
+                || this.NullableReferenceValueMayBeNull(recv))
             {
                 translated = new NonNullAssertionExpression(translated);
             }
@@ -603,20 +623,18 @@ public sealed partial class CSharpToGSharpTranslator
                 return true;
             }
 
-            // Issue #2113 follow-up: a value produced by an EXTERNAL (metadata)
-            // member compiled WITHOUT a nullable context is oblivious — Roslyn
+            // A value produced by a member imported from a project or metadata
+            // assembly compiled WITHOUT a nullable context is oblivious — Roslyn
             // reports its reference-type return/type as `NullableAnnotation.None`
-            // — and gsc maps every such oblivious external reference type to `T?`.
+            // — and gsc maps every such imported reference type to `T?`.
             // A method-call/property/field receiver like `searcher.Get()` (from an
             // unannotated package, e.g. System.Management) is therefore rejected on
             // `recv.Member` / `recv[i]` / `for … in recv` (GS0158/GS0116) even
             // though C# accepts it (it would `NullReferenceException` on null just
             // the same). Assert `recv!!` to compile and preserve that throw-on-null
-            // behavior. Gated to oblivious so nullable-enabled projects — whose
-            // external refs carry real annotations — are untouched.
-            if (this.IsObliviousCompilation()
-                && (IsObliviousExternalNullableMember(symbol)
-                    || this.LocalInitializedFromObliviousExternalNullable(symbol)))
+            // behavior.
+            if (this.IsImportedObliviousNullableMember(symbol)
+                || this.LocalInitializedFromImportedObliviousNullable(symbol))
             {
                 return true;
             }
@@ -645,19 +663,14 @@ public sealed partial class CSharpToGSharpTranslator
         private bool IsObliviousCompilation() =>
             this.context.Compilation.Options.NullableContextOptions == NullableContextOptions.Disable;
 
-        // Issue #2113 follow-up: true when <paramref name="symbol"/> is an EXTERNAL
-        // (metadata) method/property/field whose reference-type return/type is
-        // oblivious (<c>NullableAnnotation.None</c>, i.e. the declaring assembly was
-        // compiled without a nullable context, e.g. System.Management). gsc maps
-        // every such oblivious external reference type to <c>T?</c>, so a value
-        // read from one is nullable from gsc's point of view. Restricted to
-        // external symbols because a SOURCE symbol in an oblivious compilation is
-        // also <c>None</c> but its nullability is decided by the whole-program
-        // taint analysis instead, not treated as unconditionally nullable.
-        private static bool IsObliviousExternalNullableMember(ISymbol symbol)
+        // True when <paramref name="symbol"/> is a method/property/field imported
+        // from another project or metadata assembly and its concrete reference
+        // return/type is oblivious. Same-compilation source symbols stay on the
+        // whole-program taint path; imported source and metadata contracts are
+        // already fixed and gsc maps their oblivious references to <c>T?</c>.
+        private bool IsImportedObliviousNullableMember(ISymbol symbol)
         {
-            if (symbol is not (IMethodSymbol or IPropertySymbol or IFieldSymbol)
-                || !symbol.DeclaringSyntaxReferences.IsDefaultOrEmpty)
+            if (symbol is not (IMethodSymbol or IPropertySymbol or IFieldSymbol))
             {
                 return false;
             }
@@ -680,19 +693,22 @@ public sealed partial class CSharpToGSharpTranslator
                 _ => null,
             };
 
-            return type is { IsReferenceType: true }
+            return !SymbolEqualityComparer.Default.Equals(
+                    original.ContainingAssembly,
+                    this.context.Compilation.Assembly)
+                && type is { IsReferenceType: true }
                 and not ITypeParameterSymbol
                 && type.NullableAnnotation == NullableAnnotation.None;
         }
 
         // Issue #2113 follow-up: true when <paramref name="symbol"/> is a `let`
-        // local whose type is inferred from an initializer that reads an oblivious
-        // external nullable member (e.g. `let coll = searcher.Get()`). gsc infers
+        // local whose type is inferred from an initializer that reads an imported
+        // oblivious member (e.g. `let coll = searcher.Get()`). gsc infers
         // such a local as `T?`, so a `coll.Member` / `for … in coll` use needs a
         // `!!` — but promoting the local's DECLARATION to `T?` cascades
         // nullable-conversion errors at its other (non-null) uses, so the
         // assertion is applied only here at the receiver/foreach-source use site.
-        private bool LocalInitializedFromObliviousExternalNullable(ISymbol symbol)
+        private bool LocalInitializedFromImportedObliviousNullable(ISymbol symbol)
         {
             if (symbol is not ILocalSymbol local)
             {
@@ -702,7 +718,7 @@ public sealed partial class CSharpToGSharpTranslator
             foreach (SyntaxReference reference in local.DeclaringSyntaxReferences)
             {
                 if (reference.GetSyntax() is VariableDeclaratorSyntax { Initializer.Value: { } initializer }
-                    && IsObliviousExternalNullableMember(
+                    && this.IsImportedObliviousNullableMember(
                         this.context.GetSymbolInfo(initializer).Symbol))
                 {
                     return true;
@@ -755,7 +771,90 @@ public sealed partial class CSharpToGSharpTranslator
                 return new NonNullAssertionExpression(translated);
             }
 
-            return translated;
+            (ITypeSymbol targetType, ISymbol targetSymbol) = this.FindContextualValueTarget(value);
+            return this.ForgiveNullableReferenceValue(value, translated, targetType, targetSymbol);
+        }
+
+        private GExpression ForgiveNullableReferenceValue(
+            ExpressionSyntax value,
+            GExpression translated,
+            ITypeSymbol targetType,
+            ISymbol targetSymbol)
+        {
+            if (translated is NonNullAssertionExpression
+                || value is PostfixUnaryExpressionSyntax
+                    { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression }
+                || this.IsWithinExpressionTreeLambda(value)
+                || !this.TargetWillRemainNonNullableReference(targetType, targetSymbol)
+                || !this.NullableReferenceValueMayBeNull(value))
+            {
+                return translated;
+            }
+
+            GExpression operand = value is ConditionalExpressionSyntax
+                or SwitchExpressionSyntax
+                or ConditionalAccessExpressionSyntax
+                    ? new ParenthesizedExpression(translated)
+                    : translated;
+            return new NonNullAssertionExpression(operand);
+        }
+
+        private bool NullableReferenceValueMayBeNull(ExpressionSyntax value)
+        {
+            if (value is PostfixUnaryExpressionSyntax
+                    { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression }
+                || this.IsWithinExpressionTreeLambda(value)
+                || this.IsCallableValueExpression(value))
+            {
+                return false;
+            }
+
+            TypeInfo typeInfo = this.context.GetTypeInfo(value);
+            ITypeSymbol type = typeInfo.Type ?? typeInfo.ConvertedType;
+            if (type is not { IsReferenceType: true })
+            {
+                return false;
+            }
+
+            // An oblivious producer's unannotated reference return is imported by
+            // gsc as T? regardless of the consumer's nullable context. Roslyn
+            // reports that metadata as Annotation.None, so its flow state cannot
+            // drive the target-aware receiver/value bridges below.
+            ISymbol valueSymbol = this.context.GetSymbolInfo(value).Symbol;
+            if (this.IsImportedObliviousNullableMember(valueSymbol))
+            {
+                return true;
+            }
+
+            return typeInfo.Nullability.FlowState == NullableFlowState.MaybeNull
+                && (type.NullableAnnotation == NullableAnnotation.Annotated
+                    || typeInfo.Nullability.Annotation == NullableAnnotation.Annotated);
+        }
+
+        private (ITypeSymbol Type, ISymbol Symbol) FindContextualValueTarget(ExpressionSyntax value)
+        {
+            SyntaxNode current = value;
+            while (current.Parent is ParenthesizedExpressionSyntax
+                or ConditionalExpressionSyntax
+                or SwitchExpressionArmSyntax)
+            {
+                current = current.Parent;
+            }
+
+            ISymbol target = current.Parent switch
+            {
+                ReturnStatementSyntax => this.context.SemanticModel.GetEnclosingSymbol(value.SpanStart),
+                ArrowExpressionClauseSyntax arrow => this.context.GetDeclaredSymbol(arrow.Parent),
+                _ => null,
+            };
+
+            ITypeSymbol targetType = target switch
+            {
+                IMethodSymbol method => method.ReturnType,
+                IPropertySymbol property => property.Type,
+                _ => this.context.GetTypeInfo(value).ConvertedType,
+            };
+            return (targetType, target);
         }
 
         // Issue #2511: element-access arguments are call-like value sinks too.
@@ -763,14 +862,14 @@ public sealed partial class CSharpToGSharpTranslator
         // argument to a non-null reference parameter that cs2gs will keep
         // non-null. Arrays and numeric/string/span indices therefore stay on
         // their existing paths, explicitly nullable indexer contracts remain
-        // untouched, and nullable-enabled projects receive no new assertions.
+        // untouched, and nullable-enabled projects receive new assertions only
+        // for values imported from nullable-oblivious assemblies.
         // A genuinely null oblivious key follows the existing `!!` bridge
         // policy and fails at runtime before the index operation.
         private GExpression TranslateIndexArgumentWithNullForgiveness(ArgumentSyntax argument)
         {
             GExpression translated = this.TranslateExpression(argument.Expression);
-            if (!this.IsObliviousCompilation()
-                || !this.IndexArgumentTargetsNonNullableReference(argument)
+            if (!this.IndexArgumentTargetsNonNullableReference(argument)
                 || !this.IndexArgumentValueNeedsNullForgiveness(argument.Expression))
             {
                 return translated;
@@ -793,7 +892,18 @@ public sealed partial class CSharpToGSharpTranslator
                 return false;
             }
 
+            ISymbol valueSymbol = this.context.GetSymbolInfo(value).Symbol;
+            if (valueSymbol != null && this.IsDominatedByNullCheckGuard(value, valueSymbol))
+            {
+                return false;
+            }
+
             if (this.ReceiverNeedsNullForgiveness(value))
+            {
+                return true;
+            }
+
+            if (this.NullableReferenceValueMayBeNull(value))
             {
                 return true;
             }
@@ -815,8 +925,9 @@ public sealed partial class CSharpToGSharpTranslator
                     return true;
             }
 
-            ISymbol symbol = this.context.GetSymbolInfo(value).Symbol;
-            return symbol is IFieldSymbol or IPropertySymbol or ILocalSymbol or IParameterSymbol or IMethodSymbol
+            ISymbol symbol = valueSymbol;
+            return this.IsObliviousCompilation()
+                && symbol is IFieldSymbol or IPropertySymbol or ILocalSymbol or IParameterSymbol or IMethodSymbol
                 && this.IsNullablePromotedValue(value)
                 && !this.IsDominatedByNullCheckGuard(value, symbol);
         }
@@ -1001,7 +1112,7 @@ public sealed partial class CSharpToGSharpTranslator
             }
 
             // Issue #2202: a call (or property/field read) whose result comes from
-            // an EXTERNAL (metadata) member compiled without a nullable context is
+            // an imported member compiled without a nullable context is
             // oblivious — Roslyn reports its reference-type return/type as
             // `NullableAnnotation.None` — and gsc maps every such oblivious
             // external reference type to `T?` (see ClrNullability.cs). When such a
@@ -1010,10 +1121,9 @@ public sealed partial class CSharpToGSharpTranslator
             // nullability (oblivious); assert `!!` to bridge the gap. This mirrors
             // the RECEIVER-position handling in ReceiverIsNullableReferenceFieldOrProperty
             // (issue #2113) but for VALUE positions (return statements, expression
-            // bodies). Restricted to oblivious compilations so nullable-enabled
-            // projects — whose external refs carry real annotations — are untouched.
-            if (this.IsObliviousCompilation()
-                && IsObliviousExternalNullableMember(this.context.GetSymbolInfo(recv).Symbol))
+            // bodies). The declaring contract, not the consumer's nullable mode,
+            // determines how gsc imports the value.
+            if (this.IsImportedObliviousNullableMember(this.context.GetSymbolInfo(recv).Symbol))
             {
                 return true;
             }
@@ -1685,7 +1795,7 @@ public sealed partial class CSharpToGSharpTranslator
             }
 
             return this.IsNullablePromotedValue(use)
-                || IsObliviousExternalNullableMember(this.context.GetSymbolInfo(use).Symbol);
+                || this.IsImportedObliviousNullableMember(this.context.GetSymbolInfo(use).Symbol);
         }
 
         private AnonymousFunctionExpressionSyntax FindResultLambda(ExpressionSyntax use)

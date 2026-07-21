@@ -155,10 +155,11 @@ internal sealed partial class ExpressionBinder
 
                     var staticType = staticMember switch
                     {
-                        PropertyInfo sp => TypeSymbol.FromClrType(sp.PropertyType),
-                        FieldInfo sf => TypeSymbol.FromClrType(sf.FieldType),
+                        PropertyInfo sp => ClrNullability.GetPropertyTypeSymbol(sp),
+                        FieldInfo sf => ClrNullability.GetFieldTypeSymbol(sf),
                         _ => TypeSymbol.Error,
                     };
+                    staticType = NormalizeImportedSemanticAggregate(staticType, staticMember);
 
                     // Issue #1330: when the receiver is a generic type
                     // constructed over an in-scope generic type parameter
@@ -478,10 +479,7 @@ internal sealed partial class ExpressionBinder
 
                     return BindExtensionMethodGroupOrError(receiver, ne);
                 }
-                else if (receiver != null
-                    && receiver.Type?.ClrType != null
-                    && (receiver.Type is not NullableTypeSymbol
-                        || receiver is BoundClrPropertyAccessExpression))
+                else if (CanBindClrInstanceMember(receiver))
                 {
                     // Phase 4 exit: read a public instance property or field on
                     // a CLR receiver (e.g. `lst.Count`, `sb.Length`,
@@ -518,13 +516,15 @@ internal sealed partial class ExpressionBinder
                             ?? (prop.PropertyType.IsByRef
                                 ? MapClrMemberType(prop.PropertyType)
                                 : ClrNullability.GetPropertyTypeSymbol(prop));
+                        propType = NormalizeImportedSemanticAggregate(propType, prop);
                         return ConversionClassifier.AutoDereferenceRefReturn(new BoundClrPropertyAccessExpression(null, receiver, prop, propType));
                     }
 
                     var fld = ClrTypeUtilities.SafeGetFieldIncludingInterfaces(clrReceiverType, memberName, BindingFlags.Public | BindingFlags.Instance);
                     if (fld != null)
                     {
-                        return new BoundClrPropertyAccessExpression(null, receiver, fld, ClrNullability.GetFieldTypeSymbol(fld));
+                        var fieldType = NormalizeImportedSemanticAggregate(ClrNullability.GetFieldTypeSymbol(fld), fld);
+                        return new BoundClrPropertyAccessExpression(null, receiver, fld, fieldType);
                     }
 
                     // Issue #337: an instance member name that resolves to a
@@ -592,6 +592,18 @@ internal sealed partial class ExpressionBinder
     }
 
     /// <summary>
+    /// Returns whether CLR instance lookup may continue through a receiver.
+    /// Imported fields and properties can carry oblivious reference metadata as
+    /// a nullable type, but remain valid intermediate receivers in a member chain.
+    /// </summary>
+    private static bool CanBindClrInstanceMember(BoundExpression receiver)
+    {
+        return receiver?.Type?.ClrType != null
+            && (receiver.Type is not NullableTypeSymbol
+                || receiver is BoundClrPropertyAccessExpression);
+    }
+
+    /// <summary>
     /// Issue #2452: binds a receiver-style extension method reference used as a
     /// value (<c>receiver.Extension</c>) after ordinary fields, properties, and
     /// instance methods have all failed lookup. Calls already resolve extensions
@@ -600,6 +612,11 @@ internal sealed partial class ExpressionBinder
     /// </summary>
     private BoundExpression BindExtensionMethodGroupOrError(BoundExpression receiver, NameExpressionSyntax name)
     {
+        if (receiver is BoundErrorExpression)
+        {
+            return receiver;
+        }
+
         if (receiver != null)
         {
             var userCandidates = scope.TryLookupExtensionFunctions(receiver.Type, name.IdentifierToken.Text);
@@ -977,6 +994,12 @@ internal sealed partial class ExpressionBinder
             var idxArgsAnnot = ImmutableArray.Create(BoundIndexArg());
             if (this.memberLookup.TryResolveClrIndexer(target.Type, clrAnnotIdx, idxArgsAnnot, out var idxPropAnnot, out var resolvedIdxArgsAnnot))
             {
+                if (idxPropAnnot.GetGetMethod(nonPublic: false) == null)
+                {
+                    Diagnostics.ReportTypeNotIndexable(targetLocation, target.Type);
+                    return new BoundErrorExpression(null);
+                }
+
                 var elemTypeAnnot = annotIdx.GetTypeArgumentSymbolForClrType(idxPropAnnot.PropertyType);
                 var convertedIdxArgsAnnot = BindClrIndexerArguments(
                     target.Type,
@@ -991,6 +1014,12 @@ internal sealed partial class ExpressionBinder
             var idxArgs = ImmutableArray.Create(BoundIndexArg());
             if (this.memberLookup.TryResolveClrIndexer(target.Type, clrTarget, idxArgs, out var idxProp, out var resolvedIdxArgs))
             {
+                if (idxProp.GetGetMethod(nonPublic: false) == null)
+                {
+                    Diagnostics.ReportTypeNotIndexable(targetLocation, target.Type);
+                    return new BoundErrorExpression(null);
+                }
+
                 var elementType = target.Type is ImportedTypeSymbol imported
                     ? MapErasedIndexerElementType(imported, idxProp)
                     : ClrNullability.GetPropertyTypeSymbol(idxProp);
@@ -1633,7 +1662,7 @@ internal sealed partial class ExpressionBinder
             var idxArgsAnnotWr = ImmutableArray.Create(BindIndexValue());
             if (this.memberLookup.TryResolveClrIndexer(targetType, clrAnnotWr, idxArgsAnnotWr, out var idxPropAnnotWr, out var resolvedIdxArgsAnnotWr))
             {
-                if (!idxPropAnnotWr.CanWrite)
+                if (idxPropAnnotWr.GetSetMethod(nonPublic: false) == null)
                 {
                     Diagnostics.ReportTypeNotIndexable(diagnosticLocation, targetType);
                     return new BoundErrorExpression(null);
@@ -1665,7 +1694,7 @@ internal sealed partial class ExpressionBinder
                 // managed pointer. Detect the ref-returning getter and store through
                 // it. A `ReadOnlySpan[T]` getter is `ref readonly T` — writing is a
                 // hard error (GS0226).
-                if (!idxProp.CanWrite)
+                if (idxProp.GetSetMethod(nonPublic: false) == null)
                 {
                     var refGetter = idxProp.GetGetMethod(nonPublic: false);
                     if (refGetter != null && refGetter.ReturnType.IsByRef)
@@ -1912,7 +1941,7 @@ internal sealed partial class ExpressionBinder
     /// </summary>
     /// <param name="method">The imported method whose return type to map.</param>
     /// <returns>The nullability-aware return type symbol.</returns>
-    private static TypeSymbol MapClrMethodReturnType(System.Reflection.MethodInfo method)
+    private TypeSymbol MapClrMethodReturnType(System.Reflection.MethodInfo method)
     {
         if (method == null)
         {
@@ -1926,7 +1955,21 @@ internal sealed partial class ExpressionBinder
             return ByRefTypeSymbol.Get(TypeSymbol.FromClrType(returnClrType.GetElementType()!));
         }
 
-        return ClrNullability.GetReturnTypeSymbol(method);
+        return ImportedTypeSymbol.NormalizeSemanticAggregate(
+            ClrNullability.GetReturnTypeSymbol(method),
+            method.ReturnType,
+            scope.References);
+    }
+
+    private TypeSymbol NormalizeImportedSemanticAggregate(TypeSymbol type, MemberInfo member)
+    {
+        var clrType = member switch
+        {
+            PropertyInfo property => property.PropertyType,
+            FieldInfo field => field.FieldType,
+            _ => null,
+        };
+        return ImportedTypeSymbol.NormalizeSemanticAggregate(type, clrType, scope.References);
     }
 
     // ADR-0118 / issue #944: locate a user-declared indexer member on a (possibly

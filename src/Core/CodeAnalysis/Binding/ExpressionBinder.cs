@@ -420,6 +420,8 @@ internal sealed partial class ExpressionBinder
                 // BoundBaseInterfaceCallExpression emits a non-virtual call
                 // into the interface's default body.
                 return BindBaseInterfaceCallExpression((BaseInterfaceCallExpressionSyntax)syntax);
+            case SyntaxKind.BaseClassCallExpression:
+                return BindBaseClassCallExpression((BaseClassCallExpressionSyntax)syntax);
             case SyntaxKind.RangeExpression:
                 // Issue #1038: a standalone range `lo..hi` (and the open forms)
                 // binds to a constructed `System.Range` value.
@@ -1269,7 +1271,9 @@ internal sealed partial class ExpressionBinder
 
         if (enclosing != null)
         {
-            var enclosingType = (enclosing.ReceiverType as StructSymbol) ?? (enclosing.StaticOwnerType as StructSymbol);
+            var enclosingType = (enclosing.ReceiverType as StructSymbol)
+                ?? (enclosing.StaticOwnerType as StructSymbol)
+                ?? (enclosing.LexicalEnclosingType as StructSymbol);
             if (enclosingType != null)
             {
                 var sharedMethods = TypeMemberModel.GetMethods(enclosingType, name, MemberQuery.Static(MemberKinds.Method));
@@ -1291,7 +1295,6 @@ internal sealed partial class ExpressionBinder
     private static bool IsMethodGroupCandidateUsable(FunctionSymbol function)
     {
         if (function.IsInstanceMethod
-            || function.IsGeneric
             || function.IsExtension
             || function.IsStatic
             || function.StaticOwnerType != null
@@ -1318,6 +1321,12 @@ internal sealed partial class ExpressionBinder
         if (!IsMethodGroupCandidateUsable(function))
         {
             return false;
+        }
+
+        if (function.IsGeneric)
+        {
+            methodGroup = new BoundMethodGroupExpression(null, ImmutableArray.Create(function));
+            return true;
         }
 
         var parameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>(function.Parameters.Length);
@@ -1484,6 +1493,234 @@ internal sealed partial class ExpressionBinder
         }
 
         return null;
+    }
+
+    internal static Func<int, IReadOnlyList<Type>, Tuple<Type[], Type>> MakeMethodGroupInference(
+        IReadOnlyList<BoundExpression> arguments,
+        Func<TypeSymbol, Type> projectType,
+        int argumentOffset = 0)
+    {
+        if (arguments == null || !arguments.Any(OverloadResolution.IsUnresolvedMethodGroupArgument))
+        {
+            return null;
+        }
+
+        return (argumentIndex, delegateParameterTypes) =>
+        {
+            var sourceIndex = argumentIndex - argumentOffset;
+            if (sourceIndex < 0 || sourceIndex >= arguments.Count)
+            {
+                return null;
+            }
+
+            return ResolveMethodGroupInferenceSignature(arguments[sourceIndex], delegateParameterTypes, projectType);
+        };
+    }
+
+    internal static Func<int, bool> MakeMethodGroupArgumentCheck(
+        IReadOnlyList<BoundExpression> arguments,
+        int argumentOffset = 0)
+    {
+        if (arguments == null || !arguments.Any(OverloadResolution.IsUnresolvedMethodGroupArgument))
+        {
+            return null;
+        }
+
+        return argumentIndex =>
+        {
+            var sourceIndex = argumentIndex - argumentOffset;
+            return sourceIndex >= 0
+                && sourceIndex < arguments.Count
+                && OverloadResolution.IsUnresolvedMethodGroupArgument(arguments[sourceIndex]);
+        };
+    }
+
+    private static Tuple<Type[], Type> ResolveMethodGroupInferenceSignature(
+        BoundExpression argument,
+        IReadOnlyList<Type> delegateParameterTypes,
+        Func<TypeSymbol, Type> projectType)
+    {
+        if (argument is BoundClrMethodGroupExpression { ResolvedMethod: null } clrGroup)
+        {
+            var closesExtensionReceiver = clrGroup.Receiver != null
+                && clrGroup.Candidates.All(candidate => candidate.IsStatic);
+            var resolutionArguments = new Type[delegateParameterTypes.Count + (closesExtensionReceiver ? 1 : 0)];
+            if (closesExtensionReceiver)
+            {
+                var receiverClr = projectType(clrGroup.Receiver.Type);
+                if (receiverClr == null)
+                {
+                    return null;
+                }
+
+                resolutionArguments[0] = receiverClr;
+            }
+
+            for (var i = 0; i < delegateParameterTypes.Count; i++)
+            {
+                resolutionArguments[i + (closesExtensionReceiver ? 1 : 0)] = delegateParameterTypes[i];
+            }
+
+            var resolution = OverloadResolution.Resolve(clrGroup.Candidates, resolutionArguments);
+            if (resolution.Outcome != OverloadResolution.ResolutionOutcome.Resolved)
+            {
+                return null;
+            }
+
+            var method = resolution.Best;
+            var parameters = method.GetParameters();
+            var parameterOffset = closesExtensionReceiver ? 1 : 0;
+            var signatureParameters = new Type[parameters.Length - parameterOffset];
+            for (var i = parameterOffset; i < parameters.Length; i++)
+            {
+                signatureParameters[i - parameterOffset] = parameters[i].ParameterType;
+            }
+
+            return Tuple.Create(signatureParameters, method.ReturnType);
+        }
+
+        if (argument is not BoundMethodGroupExpression { FunctionType: null } userGroup)
+        {
+            return null;
+        }
+
+        var matches = new List<(Tuple<Type[], Type> Signature, OverloadResolution.ImplicitConversionKind[] Conversions)>();
+        foreach (var candidate in userGroup.Candidates)
+        {
+            var candidateOwner = userGroup.StaticOwnerType != null && candidate.StaticOwnerType is StructSymbol declaredOwner
+                ? TypeMemberModel.ResolveStaticMemberOwner(userGroup.StaticOwnerType, declaredOwner)
+                : null;
+            var targetParameterTypes = delegateParameterTypes.Select(TypeSymbol.FromClrType).ToArray();
+            if (!TryCloseMethodGroupCandidate(
+                candidate,
+                userGroup.Receiver,
+                candidateOwner,
+                targetParameterTypes,
+                out var closedParameters,
+                out var closedReturn,
+                out _))
+            {
+                continue;
+            }
+
+            var parameterTypes = new Type[delegateParameterTypes.Count];
+            var conversions = new OverloadResolution.ImplicitConversionKind[delegateParameterTypes.Count];
+            var compatible = true;
+            for (var i = 0; i < parameterTypes.Length; i++)
+            {
+                parameterTypes[i] = projectType(closedParameters[i]);
+                conversions[i] = parameterTypes[i] == null
+                    ? OverloadResolution.ImplicitConversionKind.None
+                    : OverloadResolution.ClassifyImplicit(parameterTypes[i], delegateParameterTypes[i]);
+                if (conversions[i] == OverloadResolution.ImplicitConversionKind.None)
+                {
+                    compatible = false;
+                    break;
+                }
+            }
+
+            if (!compatible)
+            {
+                continue;
+            }
+
+            var returnType = projectType(closedReturn);
+            if (returnType == null)
+            {
+                continue;
+            }
+
+            matches.Add((Tuple.Create(parameterTypes, returnType), conversions));
+        }
+
+        var best = matches.Where(candidate =>
+            !matches.Any(other =>
+                !ReferenceEquals(candidate.Signature, other.Signature)
+                && IsBetterMethodGroupConversion(other.Conversions, candidate.Conversions))).ToList();
+        return best.Count == 1 ? best[0].Signature : null;
+    }
+
+    internal static bool TryCloseMethodGroupCandidate(
+        FunctionSymbol candidate,
+        BoundExpression receiver,
+        StructSymbol candidateOwner,
+        IReadOnlyList<TypeSymbol> targetParameterTypes,
+        out TypeSymbol[] closedParameters,
+        out TypeSymbol closedReturn,
+        out ImmutableArray<TypeSymbol> methodTypeArguments)
+    {
+        closedParameters = null;
+        closedReturn = null;
+        methodTypeArguments = default;
+
+        var parameterOffset = candidate.IsExtension && receiver != null ? 1 : 0;
+        if (candidate.Parameters.Length - parameterOffset != targetParameterTypes.Count)
+        {
+            return false;
+        }
+
+        Dictionary<TypeParameterSymbol, TypeSymbol> substitution = null;
+        if (candidate.IsGeneric)
+        {
+            substitution = new Dictionary<TypeParameterSymbol, TypeSymbol>();
+            if (parameterOffset == 1)
+            {
+                var receiverParameter = candidateOwner?.SubstituteMemberType(candidate.Parameters[0].Type)
+                    ?? candidate.Parameters[0].Type;
+                Binder.InferTypeArguments(receiverParameter, receiver.Type, substitution);
+            }
+
+            for (var i = 0; i < targetParameterTypes.Count; i++)
+            {
+                var parameter = candidateOwner?.SubstituteMemberType(candidate.Parameters[i + parameterOffset].Type)
+                    ?? candidate.Parameters[i + parameterOffset].Type;
+                Binder.InferTypeArguments(parameter, targetParameterTypes[i], substitution);
+            }
+
+            var typeArguments = ImmutableArray.CreateBuilder<TypeSymbol>(candidate.TypeParameters.Length);
+            foreach (var typeParameter in candidate.TypeParameters)
+            {
+                if (!substitution.TryGetValue(typeParameter, out var typeArgument)
+                    || !Binder.SatisfiesConstraint(typeArgument, typeParameter))
+                {
+                    return false;
+                }
+
+                typeArguments.Add(typeArgument);
+            }
+
+            methodTypeArguments = typeArguments.MoveToImmutable();
+        }
+
+        closedParameters = new TypeSymbol[targetParameterTypes.Count];
+        for (var i = 0; i < closedParameters.Length; i++)
+        {
+            var parameter = candidateOwner?.SubstituteMemberType(candidate.Parameters[i + parameterOffset].Type)
+                ?? candidate.Parameters[i + parameterOffset].Type;
+            closedParameters[i] = substitution == null ? parameter : Binder.SubstituteType(parameter, substitution);
+        }
+
+        var returnType = candidateOwner?.SubstituteMemberType(candidate.Type) ?? candidate.Type ?? TypeSymbol.Void;
+        closedReturn = substitution == null ? returnType : Binder.SubstituteType(returnType, substitution);
+        return true;
+    }
+
+    private static bool IsBetterMethodGroupConversion(
+        IReadOnlyList<OverloadResolution.ImplicitConversionKind> candidate,
+        IReadOnlyList<OverloadResolution.ImplicitConversionKind> other)
+    {
+        var strictlyBetter = false;
+        for (var i = 0; i < candidate.Count; i++)
+        {
+            if (candidate[i] > other[i])
+            {
+                return false;
+            }
+
+            strictlyBetter |= candidate[i] < other[i];
+        }
+
+        return strictlyBetter;
     }
 
     /// <summary>

@@ -332,7 +332,7 @@ public sealed partial class CSharpToGSharpTranslator
             List<Parameter> parameters = this.MapParameters(symbol, node.ParameterList, skipFirst: false);
 
             List<GExpression> baseArguments = null;
-            bool isConvenience = false;
+            List<GExpression> delegatingArguments = null;
             if (node.Initializer != null)
             {
                 if (node.Initializer.ThisOrBaseKeyword.IsKind(SyntaxKind.BaseKeyword))
@@ -348,23 +348,16 @@ public sealed partial class CSharpToGSharpTranslator
                 {
                     // `: this(args)` (constructor delegation) maps to a G#
                     // `convenience init(params) { init(args); ... }`: the delegated
-                    // `init(args)` call is the first body statement (ADR-0065).
-                    isConvenience = true;
+                    // arguments are retained on the constructor model so its
+                    // canonical lowering always emits `init(args)` first.
+                    delegatingArguments = this.TranslateNullSeamArguments(
+                        node.Initializer.ArgumentList.Arguments, symbol);
                 }
             }
 
             BlockStatement body = this.TranslateBody(node, $"constructor on '{node.Identifier.Text}'");
 
-            if (isConvenience)
-            {
-                var delegated = new ExpressionStatement(new InvocationExpression(
-                    new IdentifierExpression("init"),
-                    this.TranslateNullSeamArguments(node.Initializer.ArgumentList.Arguments, symbol)));
-                var statements = new List<GStatement> { delegated };
-                statements.AddRange(body.Statements);
-                body = new BlockStatement(statements);
-            }
-            else if (propertyCtorInits != null && propertyCtorInits.Count > 0)
+            if (delegatingArguments == null && propertyCtorInits != null && propertyCtorInits.Count > 0)
             {
                 // OD-T1: move get-only auto-property inline initializers into the
                 // designated constructor body (G# has no property member
@@ -385,7 +378,7 @@ public sealed partial class CSharpToGSharpTranslator
                 baseArguments: baseArguments,
                 visibility: MapVisibility(symbol, this.context, node),
                 attributes: this.MapAttributes(node.AttributeLists),
-                isConvenience: isConvenience);
+                delegatingArguments: delegatingArguments);
         }
 
         /// <summary>
@@ -782,6 +775,29 @@ public sealed partial class CSharpToGSharpTranslator
                 ? this.MapAttributes(parameterSyntax.AttributeLists)
                 : null;
 
+            // C# emits no FieldMarshal row for the default P/Invoke bool
+            // contract, but the CLR marshaler still treats bool as a four-byte
+            // Win32 BOOL. G# intentionally requires that ABI to be explicit for
+            // byref bool, so materialize C#'s effective default during migration.
+            if (symbol.RefKind != RefKind.None
+                && symbol.Type.SpecialType == SpecialType.System_Boolean
+                && symbol.ContainingSymbol is IMethodSymbol method
+                && method.GetDllImportData() != null
+                && !symbol.GetAttributes().Any(attribute =>
+                    attribute.AttributeClass?.ToDisplayString() == "System.Runtime.InteropServices.MarshalAsAttribute"))
+            {
+                attributes ??= new List<AttributeUse>();
+                attributes.Add(new AttributeUse(
+                    "System.Runtime.InteropServices.MarshalAs",
+                    new[]
+                    {
+                        new AttributeArgument(
+                            new MemberAccessExpression(
+                                new IdentifierExpression("System.Runtime.InteropServices.UnmanagedType"),
+                                "Bool")),
+                    }));
+            }
+
             return new Parameter(SanitizeIdentifier(symbol.Name), type, variadic, refKind, defaultValue, attributes);
         }
 
@@ -959,6 +975,11 @@ public sealed partial class CSharpToGSharpTranslator
                 .Any();
         }
 
+        private static bool HasYieldBreak(SyntaxNode bodyOwner)
+            => bodyOwner.DescendantNodes(n => n is not LocalFunctionStatementSyntax)
+                .OfType<YieldStatementSyntax>()
+                .Any(y => y.Expression == null);
+
         private List<AttributeUse> MapAttributes(IEnumerable<AttributeListSyntax> attributeLists)
         {
             var attributes = new List<AttributeUse>();
@@ -1113,7 +1134,17 @@ public sealed partial class CSharpToGSharpTranslator
             try
             {
                 BlockStatement body = this.TranslateBodyCore(bodyOwner, description);
-                return this.WithParameterShadows(bodyOwner, body);
+                body = this.WithParameterShadows(bodyOwner, body);
+                if (HasYieldBreak(bodyOwner))
+                {
+                    var statements = body.Statements.ToList();
+                    statements.Add(new LabeledStatement(
+                        IteratorExitLabelName(bodyOwner),
+                        new BlockStatement(new List<GStatement>())));
+                    body = new BlockStatement(statements, body.IsUnsafe);
+                }
+
+                return body;
             }
             finally
             {

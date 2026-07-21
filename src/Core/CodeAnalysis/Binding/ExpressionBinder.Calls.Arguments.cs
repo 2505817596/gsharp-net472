@@ -419,7 +419,7 @@ internal sealed partial class ExpressionBinder
         return null;
     }
 
-    private bool TryBindUserStructDelegateFieldInvocation(
+    private bool TryBindUserStructDelegateMemberInvocation(
         BoundExpression receiver,
         StructSymbol receiverStruct,
         string methodName,
@@ -443,23 +443,37 @@ internal sealed partial class ExpressionBinder
             }
         }
 
-        if (matchedField == null)
+        PropertySymbol matchedProperty = null;
+        if (matchedField == null
+            && TypeMemberModel.TryGetProperty(
+                receiverStruct,
+                methodName,
+                out var property,
+                out var propertyDeclaringType)
+            && property.HasGetter)
+        {
+            matchedProperty = property;
+            declaringType = propertyDeclaringType;
+        }
+
+        var memberType = matchedField?.Type ?? matchedProperty?.Type;
+        if (memberType == null)
         {
             return false;
         }
 
         FunctionTypeSymbol functionType;
-        if (matchedField.Type is FunctionTypeSymbol fts)
+        if (memberType is FunctionTypeSymbol fts)
         {
             functionType = fts;
         }
-        else if (matchedField.Type is DelegateTypeSymbol nds)
+        else if (memberType is DelegateTypeSymbol nds)
         {
             functionType = nds.EquivalentFunctionType;
         }
-        else if (matchedField.Type?.ClrType is System.Type fieldClrType
-            && ClrTypeUtilities.IsDelegateType(fieldClrType)
-            && MemberLookup.TryGetDelegateFunctionType(fieldClrType, out var clrFn))
+        else if (memberType.ClrType is System.Type memberClrType
+            && ClrTypeUtilities.IsDelegateType(memberClrType)
+            && MemberLookup.TryGetDelegateFunctionType(memberClrType, out var clrFn))
         {
             functionType = clrFn;
         }
@@ -524,8 +538,10 @@ internal sealed partial class ExpressionBinder
             convertedArgs.Add(conversions.BindConversion(argLoc, permutedArgs[i], functionType.ParameterTypes[i]));
         }
 
-        var fieldLoad = new BoundFieldAccessExpression(null, receiver, declaringType, matchedField);
-        result = new BoundIndirectCallExpression(null, fieldLoad, functionType, convertedArgs.MoveToImmutable());
+        BoundExpression memberLoad = matchedField != null
+            ? new BoundFieldAccessExpression(null, receiver, declaringType, matchedField)
+            : new BoundPropertyAccessExpression(null, receiver, declaringType, matchedProperty);
+        result = new BoundIndirectCallExpression(null, memberLoad, functionType, convertedArgs.MoveToImmutable());
         return true;
     }
 
@@ -834,6 +850,9 @@ internal sealed partial class ExpressionBinder
             ? (source, target) => IsUserClassAssignableToInterfaceFromArgs(arguments, argTypes, source, target)
             : null;
 
+        var inheritedSymbolicArgs = MemberLookup.BuildSymbolicArgTypeVector(
+            null,
+            ImmutableArray.CreateRange(arguments.Select(a => a?.Type)));
         var resolution = OverloadResolution.Resolve(
             candidates,
             argTypes,
@@ -841,9 +860,16 @@ internal sealed partial class ExpressionBinder
             scope.References.MapClrTypeToReferences,
             ComputeInterpolatedStringArgFlags(ce.Arguments, arguments.Length),
             argumentNames: argumentNames.IsDefault ? null : (IReadOnlyList<string>)argumentNames,
+            recoverTypeArgSymbols: (closed, isExpanded) => MemberLookup.BuildSymbolicMethodTypeArgs(
+                closed,
+                typeArgSymbols,
+                inheritedSymbolicArgs,
+                isExpanded),
             supplementaryInterfaceCheck: supplementaryInterfaceCheck,
             constantNarrowingArgumentCheck: MakeConstantNarrowingArgumentCheck(arguments),
-            structuralProjectionArgumentCheck: MakeStructuralProjectionArgumentCheck(arguments));
+            structuralProjectionArgumentCheck: MakeStructuralProjectionArgumentCheck(arguments),
+            methodGroupInference: MakeMethodGroupInference(arguments, GetEffectiveArgumentClrTypeForOverloadResolution),
+            methodGroupArgumentCheck: MakeMethodGroupArgumentCheck(arguments));
 
         switch (resolution.Outcome)
         {
@@ -882,8 +908,11 @@ internal sealed partial class ExpressionBinder
                 // parameter list, so the method-type-argument inference vector must
                 // not carry the receiver as slot 0 — otherwise lambda-only-inferable
                 // method type parameters never unify and erase to `<object>`.
-                var inheritedSymbolicArgs = MemberLookup.BuildSymbolicArgTypeVector(null, ImmutableArray.CreateRange(arguments.Select(a => a?.Type)));
-                var inheritedSymbolicTypeArgs = MemberLookup.BuildSymbolicMethodTypeArgs(resolution.Best, typeArgSymbols, inheritedSymbolicArgs);
+                var inheritedSymbolicTypeArgs = MemberLookup.BuildSymbolicMethodTypeArgs(
+                    resolution.Best,
+                    typeArgSymbols,
+                    inheritedSymbolicArgs,
+                    resolution.IsExpanded);
                 var inheritedTypeArgSymbolsForCall = !inheritedSymbolicTypeArgs.IsDefault ? inheritedSymbolicTypeArgs : typeArgSymbols;
                 var returnType = ResolveImportedGenericReturnType(resolution.Best, typeArgSymbols)
                     ?? MemberLookup.ResolveCallReturnTypeFromSymbolicTypeArgs(resolution.Best, inheritedSymbolicTypeArgs, receiver?.Type)
@@ -892,7 +921,12 @@ internal sealed partial class ExpressionBinder
                 var inheritedParameters = resolution.Best.GetParameters();
                 var inheritedMapping = resolution.ParameterMapping;
                 var inheritedExpandedArgs = resolution.IsExpanded
-                    ? overloads.ExpandParamsArguments(arguments, inheritedParameters, ce, parameterMapping: inheritedMapping)
+                    ? overloads.ExpandParamsArguments(
+                        arguments,
+                        inheritedParameters,
+                        ce,
+                        parameterMapping: inheritedMapping,
+                        symbolicMethodTypeArgs: inheritedTypeArgSymbolsForCall)
                     : arguments;
                 var inheritedDownstreamMapping = resolution.IsExpanded ? default : inheritedMapping;
 
@@ -1090,6 +1124,7 @@ internal sealed partial class ExpressionBinder
         // arguments. Every argument must carry a concrete CLR type so overload
         // resolution (including generic inference) can run.
         var argTypes = new Type[arguments.Length + 1];
+        var deferredInferenceArgs = new bool[arguments.Length + 1];
         argTypes[0] = receiverClrType;
         var hasUserClassArg = false;
         for (var i = 0; i < arguments.Length; i++)
@@ -1126,6 +1161,17 @@ internal sealed partial class ExpressionBinder
                 hasUserClassArg = true;
             }
 
+            // A same-compilation lambda parameter may erase to its imported
+            // base while its inherited-interface receiver erases to object.
+            // Keep that CLR shape for applicability, but infer from the
+            // receiver's symbolic hierarchy instead of conflicting erasures.
+            if (receiver.Type is ImportedTypeSymbol
+                && arguments[i].Type is FunctionTypeSymbol functionType
+                && functionType.ParameterTypes.Any(TypeSymbol.RequiresSymbolicProjection))
+            {
+                deferredInferenceArgs[i + 1] = true;
+            }
+
             argTypes[i + 1] = t;
         }
 
@@ -1154,6 +1200,27 @@ internal sealed partial class ExpressionBinder
         if (candidates.Count == 0)
         {
             return false;
+        }
+
+        if (deferredInferenceArgs.Any(static deferred => deferred)
+            && receiverClrType.IsGenericType)
+        {
+            var receiverDefinition = receiverClrType.GetGenericTypeDefinition();
+            if (candidates.Any(candidate =>
+            {
+                var parameters = candidate.GetParameters();
+                if (parameters.Length == 0 || !parameters[0].ParameterType.IsGenericType)
+                {
+                    return false;
+                }
+
+                return ClrTypeUtilities.AreSame(
+                    receiverDefinition,
+                    parameters[0].ParameterType.GetGenericTypeDefinition());
+            }))
+            {
+                Array.Clear(deferredInferenceArgs);
+            }
         }
 
         // Issue #2523: when a symbolic imported receiver's own reconstructed
@@ -1206,6 +1273,12 @@ internal sealed partial class ExpressionBinder
         Func<Type, Type, bool> supplementaryInterfaceCheck = hasUserClassArg
             ? (source, target) => IsUserClassAssignableToInterfaceFromArgs(arguments, argTypes, source, target)
             : null;
+        var argumentStructuralProjectionCheck = MakeStructuralProjectionArgumentCheck(arguments, argumentOffset: 1);
+        bool ExtensionStructuralProjectionCheck(int index, Type target) =>
+            index == 0
+                ? ClrTypeUtilities.IsAssignableByName(target, argTypes[0])
+                    || Conversion.ClassifyNonStructural(receiver.Type, TypeSymbol.FromClrType(target)).IsImplicit
+                : argumentStructuralProjectionCheck?.Invoke(index, target) == true;
 
         // Issue #1311: imported extension calls dispatch as
         // `Class.Method(this receiver, args…)`, so argTypes slot 0 is the
@@ -1223,9 +1296,17 @@ internal sealed partial class ExpressionBinder
             scope.References.MapClrTypeToReferences,
             ComputeInterpolatedStringArgFlags(ce.Arguments, argTypes.Length, receiverArgCount: 1),
             argumentNames: extensionArgumentNames,
+            recoverTypeArgSymbols: (closed, isExpanded) => MemberLookup.BuildSymbolicMethodTypeArgs(
+                closed,
+                typeArgSymbols,
+                extensionSymbolicArgs,
+                isExpanded),
             supplementaryInterfaceCheck: supplementaryInterfaceCheck,
             constantNarrowingArgumentCheck: MakeConstantNarrowingArgumentCheck(arguments, argumentOffset: 1),
-            structuralProjectionArgumentCheck: MakeStructuralProjectionArgumentCheck(arguments, argumentOffset: 1));
+            structuralProjectionArgumentCheck: ExtensionStructuralProjectionCheck,
+            methodGroupInference: MakeMethodGroupInference(arguments, GetEffectiveArgumentClrTypeForOverloadResolution, argumentOffset: 1),
+            methodGroupArgumentCheck: MakeMethodGroupArgumentCheck(arguments, argumentOffset: 1),
+            deferredInferenceArgs: deferredInferenceArgs);
 
         switch (resolution.Outcome)
         {
@@ -1254,7 +1335,11 @@ internal sealed partial class ExpressionBinder
         // method-type-args may then surface a symbolic return like
         // `[]T` from `[]T{}.ToArray()` instead of the erased
         // `object[]`.
-        var extensionSymbolicTypeArgs = MemberLookup.BuildSymbolicMethodTypeArgs(best, typeArgSymbols, extensionSymbolicArgs);
+        var extensionSymbolicTypeArgs = MemberLookup.BuildSymbolicMethodTypeArgs(
+            best,
+            typeArgSymbols,
+            extensionSymbolicArgs,
+            resolution.IsExpanded);
         var extensionTypeArgSymbolsForCall = !extensionSymbolicTypeArgs.IsDefault ? extensionSymbolicTypeArgs : typeArgSymbols;
         var returnOverride = ResolveImportedGenericReturnType(best, typeArgSymbols)
             ?? MemberLookup.ResolveCallReturnTypeFromSymbolicTypeArgs(best, extensionSymbolicTypeArgs, receiver?.Type);
@@ -1289,7 +1374,13 @@ internal sealed partial class ExpressionBinder
                 expandedMapping = offset.MoveToImmutable();
             }
 
-            bound = overloads.ExpandParamsArguments(bound, parameters, ce, receiverArgCount: 1, parameterMapping: expandedMapping);
+            bound = overloads.ExpandParamsArguments(
+                bound,
+                parameters,
+                ce,
+                receiverArgCount: 1,
+                parameterMapping: expandedMapping,
+                symbolicMethodTypeArgs: extensionTypeArgSymbolsForCall);
         }
 
         var downstreamMapping = resolution.IsExpanded ? default : resolution.ParameterMapping;
@@ -2017,6 +2108,28 @@ internal sealed partial class ExpressionBinder
     }
 
     /// <summary>
+    /// Issue #2534: binds the canonical <c>base.M(args)</c> syntax. A real
+    /// value named <c>base</c> retains its historical member-call meaning;
+    /// otherwise the call resolves through the base-class overload set and
+    /// emits non-virtually.
+    /// </summary>
+    private BoundExpression BindBaseClassCallExpression(BaseClassCallExpressionSyntax syntax)
+    {
+        if (scope.TryLookupSymbol(syntax.BaseKeyword.Text) is VariableSymbol)
+        {
+            var receiver = new NameExpressionSyntax(syntax.SyntaxTree, syntax.BaseKeyword);
+            var accessor = new AccessorExpressionSyntax(syntax.SyntaxTree, receiver, syntax.DotToken, syntax.Call);
+            return BindAccessorExpression(accessor);
+        }
+
+        return BindBaseClassCall(
+            syntax.Call,
+            syntax.BaseKeyword.Location,
+            explicitBaseType: null,
+            selectorLocation: syntax.BaseKeyword.Location);
+    }
+
+    /// <summary>
     /// ADR-0091: produces a human-readable display name for the enclosing
     /// receiver type used in GS0338 messages. Falls back to a placeholder
     /// when the call site is not inside an instance member.
@@ -2699,7 +2812,9 @@ internal sealed partial class ExpressionBinder
             interpolatedStringArgs,
             argumentNames.IsDefault ? null : (IReadOnlyList<string>)argumentNames,
             constantNarrowingArgumentCheck: MakeConstantNarrowingArgumentCheck(arguments),
-            structuralProjectionArgumentCheck: MakeStructuralProjectionArgumentCheck(arguments));
+            structuralProjectionArgumentCheck: MakeStructuralProjectionArgumentCheck(arguments),
+            methodGroupInference: MakeMethodGroupInference(arguments, GetEffectiveArgumentClrTypeForOverloadResolution),
+            methodGroupArgumentCheck: MakeMethodGroupArgumentCheck(arguments));
         if (resolution.Outcome != OverloadResolution.ResolutionOutcome.Resolved)
         {
             return false;

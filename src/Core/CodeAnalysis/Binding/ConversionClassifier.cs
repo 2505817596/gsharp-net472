@@ -1459,6 +1459,11 @@ internal sealed class ConversionClassifier
             targetParameterTypes = pb.MoveToImmutable();
             targetReturnType = userDelegate.ReturnType;
         }
+        else if (MemberLookup.TryGetLambdaTargetFunctionTypeFromSymbol(targetType, out var importedDelegate))
+        {
+            targetParameterTypes = importedDelegate.ParameterTypes;
+            targetReturnType = importedDelegate.ReturnType;
+        }
         else
         {
             if (targetType != null && targetType != TypeSymbol.Error)
@@ -1471,13 +1476,22 @@ internal sealed class ConversionClassifier
 
         FunctionSymbol pick = null;
         StructSymbol pickOwner = null;
+        ImmutableArray<TypeSymbol> pickMethodTypeArguments = default;
+        TypeSymbol[] pickParameterTypes = null;
+        TypeSymbol pickReturnType = null;
         foreach (var candidate in group.Candidates)
         {
             var candidateOwner = group.StaticOwnerType != null && candidate.StaticOwnerType is StructSymbol declaredOwner
                 ? TypeMemberModel.ResolveStaticMemberOwner(group.StaticOwnerType, declaredOwner)
                 : null;
-            var parameterOffset = candidate.IsExtension && group.Receiver != null ? 1 : 0;
-            if (candidate.Parameters.Length - parameterOffset != targetParameterTypes.Length)
+            if (!ExpressionBinder.TryCloseMethodGroupCandidate(
+                candidate,
+                group.Receiver,
+                candidateOwner,
+                targetParameterTypes,
+                out var candidateParameterTypes,
+                out var candidateReturn,
+                out var candidateMethodTypeArguments))
             {
                 continue;
             }
@@ -1485,9 +1499,7 @@ internal sealed class ConversionClassifier
             var paramsMatch = true;
             for (var i = 0; i < targetParameterTypes.Length; i++)
             {
-                var candidateParameterType = candidateOwner?.SubstituteMemberType(candidate.Parameters[i + parameterOffset].Type)
-                    ?? candidate.Parameters[i + parameterOffset].Type;
-                if (!ReferenceEquals(candidateParameterType, targetParameterTypes[i]))
+                if (!AreMethodGroupTypesEquivalent(candidateParameterTypes[i], targetParameterTypes[i]))
                 {
                     paramsMatch = false;
                     break;
@@ -1499,8 +1511,7 @@ internal sealed class ConversionClassifier
                 continue;
             }
 
-            var candidateReturn = candidateOwner?.SubstituteMemberType(candidate.Type) ?? candidate.Type ?? TypeSymbol.Void;
-            if (!ReferenceEquals(candidateReturn, targetReturnType))
+            if (!AreMethodGroupTypesEquivalent(candidateReturn, targetReturnType))
             {
                 continue;
             }
@@ -1526,6 +1537,9 @@ internal sealed class ConversionClassifier
 
             pick = candidate;
             pickOwner = candidateOwner;
+            pickMethodTypeArguments = candidateMethodTypeArguments;
+            pickParameterTypes = candidateParameterTypes;
+            pickReturnType = candidateReturn;
         }
 
         if (pick == null)
@@ -1534,16 +1548,14 @@ internal sealed class ConversionClassifier
             return new BoundErrorExpression(null);
         }
 
-        var pickParameterOffset = pick.IsExtension && group.Receiver != null ? 1 : 0;
-        var pickParams = ImmutableArray.CreateBuilder<TypeSymbol>(pick.Parameters.Length - pickParameterOffset);
-        for (var i = pickParameterOffset; i < pick.Parameters.Length; i++)
-        {
-            pickParams.Add(pickOwner?.SubstituteMemberType(pick.Parameters[i].Type) ?? pick.Parameters[i].Type);
-        }
-
-        var pickReturn = pickOwner?.SubstituteMemberType(pick.Type) ?? pick.Type ?? TypeSymbol.Void;
-        var pickFnType = FunctionTypeSymbol.Get(pickParams.MoveToImmutable(), pickReturn);
-        var resolvedGroup = new BoundMethodGroupExpression(group.Syntax, group.Receiver, pick, pickFnType, pickOwner);
+        var pickFnType = FunctionTypeSymbol.Get(ImmutableArray.Create(pickParameterTypes), pickReturnType);
+        var resolvedGroup = new BoundMethodGroupExpression(
+            group.Syntax,
+            group.Receiver,
+            pick,
+            pickFnType,
+            pickOwner,
+            pickMethodTypeArguments);
 
         // If the target is the native function type matching the pick exactly,
         // identity-convert; otherwise let the regular conversion machinery turn
@@ -2163,6 +2175,12 @@ internal sealed class ConversionClassifier
 
         return ClrTypeUtilities.IsAssignableByName(invokeReturn, methodReturn);
     }
+
+    private static bool AreMethodGroupTypesEquivalent(TypeSymbol left, TypeSymbol right)
+        => ReferenceEquals(left, right)
+            || (left?.ClrType != null
+                && right?.ClrType != null
+                && ClrTypeUtilities.AreSame(left.ClrType, right.ClrType));
 
     // ADR-0062: an inner ref-kind modifier on a conditional ref-argument branch
     // must agree with the outer modifier text (`ref`, `out`, `in`, or `&`).

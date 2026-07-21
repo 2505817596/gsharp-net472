@@ -76,6 +76,63 @@ namespace Demo
     }
 
     [Fact]
+    public void KeyValuePairDeconstruction_TranslatesToCompilerSupportedForTupleIn()
+    {
+        string printed = TranslateUnit(@"
+using System.Collections.Generic;
+
+namespace Demo
+{
+    public sealed class C
+    {
+        public void M(Dictionary<string, int> values)
+        {
+            foreach (var (key, value) in values)
+            {
+            }
+        }
+    }
+}");
+
+        Assert.Contains("for (key, value) in values {", printed);
+        Assert.DoesNotContain("__decon", printed);
+    }
+
+    [Fact]
+    public void ConcurrentDictionaryOfNestedUserGenericDeconstruction_TranslatesToCompilerSupportedForTupleIn()
+    {
+        string printed = TranslateUnit(@"
+using System;
+using System.Collections.Concurrent;
+using System.Threading.Channels;
+
+namespace Demo
+{
+    public sealed class JobUpdate
+    {
+        int Number { get; }
+    }
+
+    public sealed class C
+    {
+        public void M(ConcurrentDictionary<Guid, Channel<JobUpdate>> subscribers)
+        {
+            foreach (var (key, ch) in subscribers)
+            {
+                Console.WriteLine(ch.Reader.Count);
+            }
+        }
+    }
+}");
+
+        Assert.Contains("import System.Collections.Concurrent", printed);
+        Assert.Contains("import System.Threading.Channels", printed);
+        Assert.Contains("for (key, ch) in subscribers {", printed);
+        Assert.Contains("ch.Reader.Count", printed);
+        Assert.DoesNotContain("import System.Collections.Generic", printed);
+    }
+
+    [Fact]
     public void AwaitForEachTupleDeconstruction_KeepsTempPlusLetLowering()
     {
         // G# has no first-class `await for (a, b) in` header, so the async

@@ -6,7 +6,9 @@ using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using GSharp.Core.CodeAnalysis;
+using GSharp.Core.CodeAnalysis.Binding;
 using GSharp.Core.CodeAnalysis.Compilation;
+using GSharp.Core.CodeAnalysis.Symbols;
 using GSharp.Core.CodeAnalysis.Syntax;
 using GSharp.Core.CodeAnalysis.Text;
 using Xunit;
@@ -45,6 +47,171 @@ class C {
         var diagnostics = EmitDiagnostics(Source);
         Assert.DoesNotContain(diagnostics, d => d.Id == "GS0129");
         Assert.Empty(diagnostics);
+    }
+
+    [Fact]
+    public void RightSubtypeConvertsToNullableLeftInterface()
+    {
+        const string Source = @"package Issue2540.Iface
+
+interface ILogger { func Name() string; }
+class NullLogger : ILogger { func Name() string { return ""null"" } }
+class C {
+    func Pick(logger ILogger?) ILogger { return logger ?? NullLogger() }
+}
+";
+        var diagnostics = EmitDiagnostics(Source);
+        Assert.DoesNotContain(diagnostics, d => d.Id == "GS0129");
+        Assert.Empty(diagnostics);
+    }
+
+    [Fact]
+    public void NullableRightSubtypeConvertsToNullableLeftInterface()
+    {
+        const string Source = @"package Issue2540.NullableIface
+
+interface ILogger { }
+class NullLogger : ILogger { }
+class C {
+    func Pick(logger ILogger?, fallback NullLogger?) ILogger? {
+        var selected = logger ?? fallback
+        return selected
+    }
+}
+";
+        var diagnostics = EmitDiagnostics(Source);
+        Assert.DoesNotContain(diagnostics, d => d.Id == "GS0129");
+        Assert.Empty(diagnostics);
+    }
+
+    [Fact]
+    public void NullableUnrelatedTypesStillReportError()
+    {
+        const string Source = @"package Issue2540.InvalidNullable
+
+interface ILogger { }
+class Other { }
+class C {
+    func Bad(logger ILogger?, fallback Other?) ILogger? {
+        var selected = logger ?? fallback
+        return selected
+    }
+}
+";
+        var diagnostics = EmitDiagnostics(Source);
+        Assert.Contains(diagnostics, d => d.Id == "GS0129");
+    }
+
+    [Fact]
+    public void NullabilityAnnotatedNullableInterface_UsesUnderlyingConversion()
+    {
+        var contract = new InterfaceSymbol(
+            "ILogger",
+            Accessibility.Public,
+            declaration: null,
+            packageName: "Issue2540");
+        var implementation = new StructSymbol(
+            "NullLogger",
+            ImmutableArray<FieldSymbol>.Empty,
+            Accessibility.Public,
+            declaration: null,
+            packageName: "Issue2540",
+            isData: false,
+            isInline: false,
+            isClass: true);
+        implementation.SetInterfaces(ImmutableArray.Create(contract));
+        var annotatedContract = new NullabilityAnnotatedTypeSymbol(
+            contract,
+            ImmutableArray.Create<byte>(1, 1));
+
+        var op = BoundBinaryOperator.Bind(
+            SyntaxKind.QuestionQuestionToken,
+            NullableTypeSymbol.Get(annotatedContract),
+            implementation);
+
+        Assert.NotNull(op);
+        Assert.Same(annotatedContract, op.Type);
+    }
+
+    [Fact]
+    public void NullabilityAnnotatedNullableInterface_PreservesUnrelatedNegative()
+    {
+        var contract = new InterfaceSymbol(
+            "ILogger",
+            Accessibility.Public,
+            declaration: null,
+            packageName: "Issue2540");
+        var other = new StructSymbol(
+            "Other",
+            ImmutableArray<FieldSymbol>.Empty,
+            Accessibility.Public,
+            declaration: null,
+            packageName: "Issue2540",
+            isData: false,
+            isInline: false,
+            isClass: true);
+        var annotatedContract = new NullabilityAnnotatedTypeSymbol(
+            contract,
+            ImmutableArray.Create<byte>(1, 1));
+
+        var op = BoundBinaryOperator.Bind(
+            SyntaxKind.QuestionQuestionToken,
+            NullableTypeSymbol.Get(annotatedContract),
+            other);
+
+        Assert.Null(op);
+    }
+
+    [Fact]
+    public void ImportedRightSubtypeConvertsToNullableLeftInterface()
+    {
+        const string Source = @"package Issue2540.ImportedIface
+
+import System
+import System.IO
+
+class C {
+    func Pick(resource IDisposable?) IDisposable { return resource ?? MemoryStream() }
+}
+";
+        var diagnostics = EmitDiagnostics(Source);
+        Assert.DoesNotContain(diagnostics, d => d.Id == "GS0129");
+        Assert.Empty(diagnostics);
+    }
+
+    [Fact]
+    public void RightDelegateFactoryConvertsToNullableLeftDelegate()
+    {
+        const string Source = @"package Issue2540.Delegate
+
+interface ILogger { func Name() string; }
+class NullLogger : ILogger { func Name() string { return ""null"" } }
+class C {
+    func Pick(factory (() -> ILogger)?) () -> ILogger {
+        return factory ?? (() -> NullLogger())
+    }
+}
+";
+        var diagnostics = EmitDiagnostics(Source);
+        Assert.DoesNotContain(diagnostics, d => d.Id == "GS0129");
+        Assert.Empty(diagnostics);
+    }
+
+    [Fact]
+    public void UnrelatedDelegateFactoryReturnStillReportsError()
+    {
+        const string Source = @"package Issue2540.InvalidDelegate
+
+interface ILogger { }
+class Other { }
+class C {
+    func Bad(factory (() -> ILogger)?) () -> ILogger {
+        return factory ?? (() -> Other())
+    }
+}
+";
+        var diagnostics = EmitDiagnostics(Source);
+        Assert.Contains(diagnostics, d => d.Id == "GS0129");
     }
 
     [Fact]

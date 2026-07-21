@@ -93,16 +93,10 @@ public sealed partial class CSharpToGSharpTranslator
     // (GS0102). Null (default) preserves the exact prior no-filter behavior.
     private readonly HashSet<string> retainedFilePaths;
 
-    // Issue #2292: one AnonymousTypeRegistry per resolved G# package, shared
-    // across every document this translator instance translates (every
-    // pipeline caller creates ONE CSharpToGSharpTranslator per project and
-    // calls TranslateDocument once per file in that project — see
-    // TranslateStage/TestParityStage), so two unrelated files sharing the
-    // same package draw synthetic anonymous-type names from ONE counter and
-    // reuse an identical shape's data class instead of each starting a fresh
-    // dictionary/counter at zero (which allowed a distinct shape in file B to
-    // mint the same name as an unrelated shape already declared in file A —
-    // a GS0102 collision once both files' output is compiled together).
+    // One registry per resolved G# package deduplicates declarations across
+    // documents (#2292). Synthetic names themselves are derived from the full
+    // ordered shape (#2598), so distinct shapes cannot reuse a simple name
+    // across imported packages or independently translated projects.
     private readonly Dictionary<string, AnonymousTypeRegistry> anonymousTypeRegistriesByPackage =
         new(StringComparer.Ordinal);
 
@@ -211,7 +205,7 @@ public sealed partial class CSharpToGSharpTranslator
         IMethodSymbol entryPoint = context.Compilation.GetEntryPoint(default);
         INamedTypeSymbol entryType = entryPoint?.ContainingType;
 
-        // Issue #2292: share the anonymous-type registry with every other
+        // Share the anonymous-type registry with every other
         // document already translated (by this same translator instance)
         // into the same package, so distinct/identical shapes across FILES
         // never collide (see `anonymousTypeRegistriesByPackage`'s comment).
@@ -229,7 +223,15 @@ public sealed partial class CSharpToGSharpTranslator
         }
 
         var typeMapper = new CSharpTypeMapper(anonymousTypeRegistry);
-        var visitor = new DeclarationVisitor(context, typeMapper, openBases, staticUsingTargets, entryPoint, partialTypeParts, this.preservePartialParts, this.markMergedTypePartial);
+        var visitor = new DeclarationVisitor(
+            context,
+            typeMapper,
+            openBases,
+            staticUsingTargets,
+            entryPoint,
+            partialTypeParts,
+            this.preservePartialParts,
+            this.markMergedTypePartial);
 
         // Issue #2382: a NATIVE C# top-level-statements program (`GlobalStatementSyntax`
         // members directly under the compilation unit — no enclosing class/method
@@ -522,8 +524,14 @@ public sealed partial class CSharpToGSharpTranslator
 
     private string ResolvePackage(CompilationUnitSyntax root, TranslationContext context)
     {
-        List<BaseNamespaceDeclarationSyntax> namespaces = root.DescendantNodes()
-            .OfType<BaseNamespaceDeclarationSyntax>()
+        List<(string Name, Location Location)> namespaces = EnumerateTopLevelDeclarations(root)
+            .Select(member => (
+                Symbol: context.GetDeclaredSymbol(member),
+                Location: member.GetLocation()))
+            .Where(item => item.Symbol?.ContainingNamespace is { IsGlobalNamespace: false })
+            .Select(item => (
+                item.Symbol.ContainingNamespace.ToDisplayString(),
+                item.Location))
             .ToList();
 
         if (namespaces.Count == 0)
@@ -531,14 +539,14 @@ public sealed partial class CSharpToGSharpTranslator
             return null;
         }
 
-        string dominant = namespaces[0].Name.ToString();
-        IEnumerable<string> distinct = namespaces.Select(n => n.Name.ToString()).Distinct();
+        string dominant = namespaces[0].Name;
+        IEnumerable<string> distinct = namespaces.Select(n => n.Name).Distinct();
         if (distinct.Count() > 1)
         {
             context.Report(new TranslationDiagnostic(
                 nameof(SyntaxKind.NamespaceDeclaration),
                 $"Multiple namespaces in one file; hoisting to the dominant namespace '{dominant}' (ADR-0115 §B.1).",
-                namespaces[0].Name.GetLocation(),
+                namespaces[0].Location,
                 TranslationSeverity.Warning));
         }
 

@@ -662,7 +662,20 @@ internal static class OverloadResolution
     /// Optional binder callback that recognizes an argument's symbolic object
     /// shape as projectable to a candidate CLR parameter type.
     /// </param>
-    public static Result<T> Resolve<T>(IEnumerable<T> candidates, IReadOnlyList<Type> argTypes, IReadOnlyList<Type> explicitTypeArgs = null, Func<Type, Type> projectTypeArgument = null, IReadOnlyList<bool> interpolatedStringArgs = null, IReadOnlyList<string> argumentNames = null, Func<MethodInfo, ImmutableArray<TypeSymbol>> recoverTypeArgSymbols = null, Func<Type, Type, bool> supplementaryInterfaceCheck = null, Func<int, Type, bool> constantNarrowingArgumentCheck = null, Func<int, Type, bool> structuralProjectionArgumentCheck = null)
+    /// <param name="methodGroupInference">
+    /// Optional callback that resolves a deferred method group from the input
+    /// types of the candidate's delegate parameter for generic inference.
+    /// </param>
+    /// <param name="methodGroupArgumentCheck">
+    /// Optional callback identifying which source arguments are deferred method
+    /// groups, distinguishing them from other naturally untyped arguments.
+    /// </param>
+    /// <param name="deferredInferenceArgs">
+    /// Argument slots whose CLR delegate shape contains symbolic types and
+    /// therefore must not contribute erased evidence to generic inference.
+    /// Their original CLR types still participate in applicability and ranking.
+    /// </param>
+    public static Result<T> Resolve<T>(IEnumerable<T> candidates, IReadOnlyList<Type> argTypes, IReadOnlyList<Type> explicitTypeArgs = null, Func<Type, Type> projectTypeArgument = null, IReadOnlyList<bool> interpolatedStringArgs = null, IReadOnlyList<string> argumentNames = null, Func<MethodInfo, bool, ImmutableArray<TypeSymbol>> recoverTypeArgSymbols = null, Func<Type, Type, bool> supplementaryInterfaceCheck = null, Func<int, Type, bool> constantNarrowingArgumentCheck = null, Func<int, Type, bool> structuralProjectionArgumentCheck = null, Func<int, IReadOnlyList<Type>, Tuple<Type[], Type>> methodGroupInference = null, Func<int, bool> methodGroupArgumentCheck = null, IReadOnlyList<bool> deferredInferenceArgs = null)
         where T : MethodBase
     {
         var applicable = new List<(T Method, ImplicitConversionKind[] Conversions, Type[] ParamTypes, int[] Mapping, bool IsExpanded)>();
@@ -686,7 +699,7 @@ internal static class OverloadResolution
             // rest.
             try
             {
-                EvaluateCandidate(rawCandidate, argTypes, explicitTypeArgs, projectTypeArgument, applicable, interpolatedStringArgs, argumentNames, recoverTypeArgSymbols, supplementaryInterfaceCheck, constantNarrowingArgumentCheck, structuralProjectionArgumentCheck);
+                EvaluateCandidate(rawCandidate, argTypes, explicitTypeArgs, projectTypeArgument, applicable, interpolatedStringArgs, argumentNames, recoverTypeArgSymbols, supplementaryInterfaceCheck, constantNarrowingArgumentCheck, structuralProjectionArgumentCheck, methodGroupInference, methodGroupArgumentCheck, deferredInferenceArgs);
             }
             catch (Exception ex) when (IsMetadataLoadFailure(ex))
             {
@@ -1066,16 +1079,23 @@ internal static class OverloadResolution
     /// definition from the supplied argument types. Implements a deliberately
     /// scoped subset of C# §7.5.2 "Type inference": only the input-type
     /// inference phase against argument CLR types, plus exact unification on
-    /// recursive generic / array shapes. Lambdas and unbound delegate-typed
-    /// arguments are not considered. Returns <see langword="true"/> with
+    /// recursive generic / array shapes. Deferred lambdas are not considered;
+    /// a deferred method group can contribute output inference through
+    /// <paramref name="methodGroupInference"/> after its delegate input types
+    /// are inferred from the other arguments. Returns <see langword="true"/> with
     /// <paramref name="typeArgs"/> populated when every method type parameter
     /// receives a single consistent bound; <see langword="false"/> otherwise.
     /// </summary>
     /// <param name="openMethod">An open generic method definition (i.e. <see cref="MethodBase.IsGenericMethodDefinition"/> is <see langword="true"/>).</param>
     /// <param name="argTypes">CLR types of the supplied arguments.</param>
     /// <param name="typeArgs">On success, the inferred type arguments in declaration order.</param>
+    /// <param name="methodGroupInference">Optional deferred method-group signature resolver.</param>
     /// <returns>Whether inference succeeded.</returns>
-    public static bool TryInferTypeArguments(MethodInfo openMethod, IReadOnlyList<Type> argTypes, out Type[] typeArgs)
+    public static bool TryInferTypeArguments(
+        MethodInfo openMethod,
+        IReadOnlyList<Type> argTypes,
+        out Type[] typeArgs,
+        Func<int, IReadOnlyList<Type>, Tuple<Type[], Type>> methodGroupInference = null)
     {
         typeArgs = null;
         if (openMethod is null || !openMethod.IsGenericMethodDefinition)
@@ -1119,6 +1139,17 @@ internal static class OverloadResolution
             if (!UnifyForInference(parameters[i].ParameterType, arg, bounds))
             {
                 return false;
+            }
+        }
+
+        if (methodGroupInference != null)
+        {
+            for (var i = 0; i < argTypes.Count; i++)
+            {
+                if (argTypes[i] is null)
+                {
+                    TryInferMethodGroupArgument(parameters[i].ParameterType, i, bounds, methodGroupInference);
+                }
             }
         }
 
@@ -1388,6 +1419,57 @@ internal static class OverloadResolution
         }
 
         return false;
+    }
+
+    private static bool TryInferMethodGroupArgument(
+        Type delegateType,
+        int argumentIndex,
+        Dictionary<string, Type> bounds,
+        Func<int, IReadOnlyList<Type>, Tuple<Type[], Type>> methodGroupInference)
+    {
+        if (!TryGetDelegateSignature(delegateType, out var delegateParameters, out var delegateReturn))
+        {
+            return false;
+        }
+
+        var closedInputs = new Type[delegateParameters.Length];
+        for (var i = 0; i < delegateParameters.Length; i++)
+        {
+            if (!TryCloseInferredType(delegateParameters[i], bounds, out closedInputs[i]))
+            {
+                return false;
+            }
+        }
+
+        var signature = methodGroupInference(argumentIndex, closedInputs);
+        if (signature?.Item1 is null
+            || signature.Item1.Length != delegateParameters.Length
+            || signature.Item2 is null)
+        {
+            return false;
+        }
+
+        var inferred = new Dictionary<string, Type>(bounds, StringComparer.Ordinal);
+        for (var i = 0; i < delegateParameters.Length; i++)
+        {
+            if (!UnifyForInference(delegateParameters[i], signature.Item1[i], inferred))
+            {
+                return false;
+            }
+        }
+
+        if (!UnifyForInference(delegateReturn, signature.Item2, inferred))
+        {
+            return false;
+        }
+
+        bounds.Clear();
+        foreach (var pair in inferred)
+        {
+            bounds.Add(pair.Key, pair.Value);
+        }
+
+        return true;
     }
 
     private static bool IsSafeArrayInterfaceVariance(Type target, Type source)
@@ -2186,7 +2268,7 @@ internal static class OverloadResolution
     /// so the per-candidate work can be guarded against reflection load
     /// failures (issue #321) without disturbing the surrounding control flow.
     /// </summary>
-    private static void EvaluateCandidate<T>(T rawCandidate, IReadOnlyList<Type> argTypes, IReadOnlyList<Type> explicitTypeArgs, Func<Type, Type> projectTypeArgument, List<(T Method, ImplicitConversionKind[] Conversions, Type[] ParamTypes, int[] Mapping, bool IsExpanded)> applicable, IReadOnlyList<bool> interpolatedStringArgs = null, IReadOnlyList<string> argumentNames = null, Func<MethodInfo, ImmutableArray<TypeSymbol>> recoverTypeArgSymbols = null, Func<Type, Type, bool> supplementaryInterfaceCheck = null, Func<int, Type, bool> constantNarrowingArgumentCheck = null, Func<int, Type, bool> structuralProjectionArgumentCheck = null)
+    private static void EvaluateCandidate<T>(T rawCandidate, IReadOnlyList<Type> argTypes, IReadOnlyList<Type> explicitTypeArgs, Func<Type, Type> projectTypeArgument, List<(T Method, ImplicitConversionKind[] Conversions, Type[] ParamTypes, int[] Mapping, bool IsExpanded)> applicable, IReadOnlyList<bool> interpolatedStringArgs = null, IReadOnlyList<string> argumentNames = null, Func<MethodInfo, bool, ImmutableArray<TypeSymbol>> recoverTypeArgSymbols = null, Func<Type, Type, bool> supplementaryInterfaceCheck = null, Func<int, Type, bool> constantNarrowingArgumentCheck = null, Func<int, Type, bool> structuralProjectionArgumentCheck = null, Func<int, IReadOnlyList<Type>, Tuple<Type[], Type>> methodGroupInference = null, Func<int, bool> methodGroupArgumentCheck = null, IReadOnlyList<bool> deferredInferenceArgs = null)
         where T : MethodBase
     {
         {
@@ -2228,23 +2310,27 @@ internal static class OverloadResolution
                     }
                     catch (ArgumentException)
                     {
+                        var recoveredSymbols = recoverTypeArgSymbols?.Invoke(gmi, false) ?? default;
+
                         // Issue #1325: live reflection rejects the `object`
                         // erasure of a user value type against a `struct`
                         // constraint. Retry over a value-type placeholder when
                         // the recovered symbols satisfy the real constraints.
-                        if (!TryCloseOverUserValueTypePlaceholders(gmi, explicitTypeArgsArray, recoverTypeArgSymbols?.Invoke(gmi) ?? default, out closed))
+                        if (TryCloseOverUserValueTypePlaceholders(gmi, explicitTypeArgsArray, recoveredSymbols, out closed))
+                        {
+                            paramTypeRewrite = static t => SubstituteClrType(t, typeof(UserValueTypeConstraintPlaceholder), typeof(object));
+                        }
+                        else if (!TryCloseOverUserReferenceTypePlaceholders(gmi, explicitTypeArgsArray, recoveredSymbols, out closed))
                         {
                             // Generic constraints not satisfied — drop this candidate.
                             return;
                         }
-
-                        paramTypeRewrite = static t => SubstituteClrType(t, typeof(UserValueTypeConstraintPlaceholder), typeof(object));
                     }
 
                     // Issue #750 / ADR-0088: same constraint check as the
                     // inference path. Required because MetadataLoadContext's
                     // MakeGenericMethod does not validate constraints.
-                    if (!SatisfiesGenericConstraints(gmi, explicitTypeArgsArray, recoverTypeArgSymbols?.Invoke(closed) ?? default))
+                    if (!SatisfiesGenericConstraints(gmi, explicitTypeArgsArray, recoverTypeArgSymbols?.Invoke(closed, false) ?? default))
                     {
                         return;
                     }
@@ -2266,17 +2352,58 @@ internal static class OverloadResolution
                 // unification, so the mapping must already be known before
                 // inference; we use this open candidate's parameters to compute it.
                 IReadOnlyList<Type> inferenceArgTypes = argTypes;
+                if (deferredInferenceArgs != null)
+                {
+                    var deferred = argTypes.ToArray();
+                    for (var i = 0; i < deferred.Length && i < deferredInferenceArgs.Count; i++)
+                    {
+                        if (deferredInferenceArgs[i])
+                        {
+                            deferred[i] = null;
+                        }
+                    }
+
+                    inferenceArgTypes = deferred;
+                }
+
+                var inferenceMethodGroup = methodGroupInference;
                 if (argumentNames != null && HasAnyNamedArgument(argumentNames))
                 {
-                    if (!TryBuildOrderedArgTypesForInference(mi, argTypes, argumentNames, out var orderedArgTypes))
+                    if (!TryBuildOrderedArgTypesForInference(mi, inferenceArgTypes, argumentNames, out var orderedArgTypes))
                     {
                         return;
                     }
 
                     inferenceArgTypes = orderedArgTypes;
+                    if (methodGroupInference != null
+                        && TryBuildNamedArgumentMapping(mi.GetParameters(), argTypes.Count, argumentNames, out var sourceToParameter))
+                    {
+                        var parameterToSource = Enumerable.Repeat(-1, mi.GetParameters().Length).ToArray();
+                        for (var sourceIndex = 0; sourceIndex < sourceToParameter.Length; sourceIndex++)
+                        {
+                            parameterToSource[sourceToParameter[sourceIndex]] = sourceIndex;
+                        }
+
+                        inferenceMethodGroup = (parameterIndex, delegateParameters) =>
+                            parameterIndex >= 0
+                                && parameterIndex < parameterToSource.Length
+                                && parameterToSource[parameterIndex] >= 0
+                                ? methodGroupInference(parameterToSource[parameterIndex], delegateParameters)
+                                : null;
+                    }
                 }
 
-                if (!TryInferTypeArguments(mi, inferenceArgTypes, out var typeArgs))
+                var symbolicTypeArgs = recoverTypeArgSymbols?.Invoke(mi, false) ?? default;
+                Type[] typeArgs = null;
+                var useRecoveredInference = deferredInferenceArgs?.Any(static deferred => deferred) == true
+                    && TryRecoverErasedTypeArguments(
+                        mi,
+                        symbolicTypeArgs,
+                        projectTypeArgument,
+                        out typeArgs);
+                if (!useRecoveredInference
+                    && !TryInferTypeArguments(mi, inferenceArgTypes, out typeArgs, inferenceMethodGroup)
+                    && !TryRecoverErasedTypeArguments(mi, symbolicTypeArgs, projectTypeArgument, out typeArgs))
                 {
                     return;
                 }
@@ -2316,17 +2443,21 @@ internal static class OverloadResolution
                 }
                 catch (ArgumentException)
                 {
+                    var recoveredSymbols = recoverTypeArgSymbols?.Invoke(mi, false) ?? default;
+
                     // Issue #1325: live reflection rejects the `object` erasure
                     // of a user value type against a `struct` constraint. Retry
                     // over a value-type placeholder when the recovered symbols
                     // satisfy the real constraints.
-                    if (!TryCloseOverUserValueTypePlaceholders(mi, typeArgs, recoverTypeArgSymbols?.Invoke(mi) ?? default, out closed))
+                    if (TryCloseOverUserValueTypePlaceholders(mi, typeArgs, recoveredSymbols, out closed))
+                    {
+                        paramTypeRewrite = static t => SubstituteClrType(t, typeof(UserValueTypeConstraintPlaceholder), typeof(object));
+                    }
+                    else if (!TryCloseOverUserReferenceTypePlaceholders(mi, typeArgs, recoveredSymbols, out closed))
                     {
                         // Generic constraints not satisfied — drop this candidate.
                         return;
                     }
-
-                    paramTypeRewrite = static t => SubstituteClrType(t, typeof(UserValueTypeConstraintPlaceholder), typeof(object));
                 }
 
                 // Issue #750 / ADR-0088: explicitly validate generic-parameter
@@ -2337,7 +2468,7 @@ internal static class OverloadResolution
                 // bound with T = Nullable<int> survives applicability and the
                 // resolver picks the wrong overload, emitting IL that fails
                 // verification at runtime.
-                if (!SatisfiesGenericConstraints(mi, typeArgs, recoverTypeArgSymbols?.Invoke(closed) ?? default))
+                if (!SatisfiesGenericConstraints(mi, typeArgs, recoverTypeArgSymbols?.Invoke(closed, false) ?? default))
                 {
                     return;
                 }
@@ -2380,6 +2511,25 @@ internal static class OverloadResolution
                 paramTypes[i] = paramTypeRewrite != null
                     ? paramTypeRewrite(parameters[paramIndex].ParameterType)
                     : parameters[paramIndex].ParameterType;
+
+                if (argTypes[i] is null
+                    && methodGroupInference != null
+                    && methodGroupArgumentCheck?.Invoke(i) == true)
+                {
+                    if (!TryGetDelegateSignature(paramTypes[i], out var delegateParameters, out var delegateReturn)
+                        || !IsMethodGroupSignatureCompatible(
+                            methodGroupInference(i, delegateParameters),
+                            delegateParameters,
+                            delegateReturn))
+                    {
+                        ok = false;
+                        break;
+                    }
+
+                    conversions[i] = ImplicitConversionKind.Identity;
+                    continue;
+                }
+
                 var conv = ClassifyImplicit(paramTypes[i], argTypes[i], supplementaryInterfaceCheck);
                 if (conv == ImplicitConversionKind.None)
                 {
@@ -2431,6 +2581,33 @@ internal static class OverloadResolution
         }
     }
 
+    private static bool IsMethodGroupSignatureCompatible(
+        Tuple<Type[], Type> signature,
+        IReadOnlyList<Type> delegateParameters,
+        Type delegateReturn)
+    {
+        if (signature?.Item1 is null
+            || signature.Item1.Length != delegateParameters.Count
+            || signature.Item2 is null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < delegateParameters.Count; i++)
+        {
+            if (ClassifyImplicit(signature.Item1[i], delegateParameters[i]) == ImplicitConversionKind.None)
+            {
+                return false;
+            }
+        }
+
+        var methodVoid = string.Equals(signature.Item2.FullName, "System.Void", StringComparison.Ordinal);
+        var delegateVoid = string.Equals(delegateReturn?.FullName, "System.Void", StringComparison.Ordinal);
+        return methodVoid || delegateVoid
+            ? methodVoid && delegateVoid
+            : ClassifyImplicit(delegateReturn, signature.Item2) != ImplicitConversionKind.None;
+    }
+
     /// <summary>
     /// Issue #506: evaluates a candidate in <em>expanded</em> form — the trailing
     /// <c>params T[]</c> parameter accepts zero or more positional arguments, each
@@ -2444,10 +2621,11 @@ internal static class OverloadResolution
     /// applicability check in <see cref="EvaluateCandidate"/> but rewrites the
     /// trailing parameter type to the element type for ranking purposes.
     /// </summary>
-    private static void EvaluateExpandedParamsCandidate<T>(T rawCandidate, IReadOnlyList<Type> argTypes, IReadOnlyList<Type> explicitTypeArgs, Func<Type, Type> projectTypeArgument, List<(T Method, ImplicitConversionKind[] Conversions, Type[] ParamTypes, int[] Mapping, bool IsExpanded)> applicable, IReadOnlyList<string> argumentNames = null, Func<MethodInfo, ImmutableArray<TypeSymbol>> recoverTypeArgSymbols = null, Func<Type, Type, bool> supplementaryInterfaceCheck = null, Func<int, Type, bool> constantNarrowingArgumentCheck = null, Func<int, Type, bool> structuralProjectionArgumentCheck = null)
+    private static void EvaluateExpandedParamsCandidate<T>(T rawCandidate, IReadOnlyList<Type> argTypes, IReadOnlyList<Type> explicitTypeArgs, Func<Type, Type> projectTypeArgument, List<(T Method, ImplicitConversionKind[] Conversions, Type[] ParamTypes, int[] Mapping, bool IsExpanded)> applicable, IReadOnlyList<string> argumentNames = null, Func<MethodInfo, bool, ImmutableArray<TypeSymbol>> recoverTypeArgSymbols = null, Func<Type, Type, bool> supplementaryInterfaceCheck = null, Func<int, Type, bool> constantNarrowingArgumentCheck = null, Func<int, Type, bool> structuralProjectionArgumentCheck = null)
         where T : MethodBase
     {
         T candidate = rawCandidate;
+        Func<Type, Type> paramTypeRewrite = null;
 
         // Issue #506 follow-up: close open generic candidates before applicability
         // classification. Explicit type arguments win; otherwise infer from the
@@ -2460,16 +2638,29 @@ internal static class OverloadResolution
                 && gmi.GetGenericArguments().Length == explicitTypeArgs.Count)
             {
                 MethodInfo closed;
+                var recoveredSymbols = default(ImmutableArray<TypeSymbol>);
                 try
                 {
                     closed = gmi.MakeGenericMethod(explicitTypeArgs.ToArray());
                 }
                 catch (ArgumentException)
                 {
-                    return;
+                    recoveredSymbols = recoverTypeArgSymbols?.Invoke(gmi, true) ?? default;
+                    var explicitTypeArgsArray = explicitTypeArgs.ToArray();
+                    if (TryCloseOverUserValueTypePlaceholders(gmi, explicitTypeArgsArray, recoveredSymbols, out closed))
+                    {
+                        paramTypeRewrite = static t => SubstituteClrType(t, typeof(UserValueTypeConstraintPlaceholder), typeof(object));
+                    }
+                    else if (!TryCloseOverUserReferenceTypePlaceholders(gmi, explicitTypeArgsArray, recoveredSymbols, out closed))
+                    {
+                        return;
+                    }
                 }
 
-                if (!SatisfiesGenericConstraints(gmi, explicitTypeArgs.ToArray(), recoverTypeArgSymbols?.Invoke(closed) ?? default))
+                if (!SatisfiesGenericConstraints(
+                    gmi,
+                    explicitTypeArgs.ToArray(),
+                    recoveredSymbols.IsDefault ? recoverTypeArgSymbols?.Invoke(closed, true) ?? default : recoveredSymbols))
                 {
                     return;
                 }
@@ -2503,16 +2694,28 @@ internal static class OverloadResolution
             }
 
             MethodInfo closed;
+            var recoveredSymbols = default(ImmutableArray<TypeSymbol>);
             try
             {
                 closed = mi.MakeGenericMethod(typeArgs);
             }
             catch (ArgumentException)
             {
-                return;
+                recoveredSymbols = recoverTypeArgSymbols?.Invoke(mi, true) ?? default;
+                if (TryCloseOverUserValueTypePlaceholders(mi, typeArgs, recoveredSymbols, out closed))
+                {
+                    paramTypeRewrite = static t => SubstituteClrType(t, typeof(UserValueTypeConstraintPlaceholder), typeof(object));
+                }
+                else if (!TryCloseOverUserReferenceTypePlaceholders(mi, typeArgs, recoveredSymbols, out closed))
+                {
+                    return;
+                }
             }
 
-            if (!SatisfiesGenericConstraints(mi, typeArgs, recoverTypeArgSymbols?.Invoke(closed) ?? default))
+            if (!SatisfiesGenericConstraints(
+                mi,
+                typeArgs,
+                recoveredSymbols.IsDefault ? recoverTypeArgSymbols?.Invoke(closed, true) ?? default : recoveredSymbols))
             {
                 return;
             }
@@ -2628,6 +2831,7 @@ internal static class OverloadResolution
                 target = parameters[slot].ParameterType;
             }
 
+            target = paramTypeRewrite?.Invoke(target) ?? target;
             paramTypes[i] = target;
             var conv = ClassifyImplicit(target, argTypes[i], supplementaryInterfaceCheck);
             if (conv == ImplicitConversionKind.None)
@@ -3715,6 +3919,37 @@ internal static class OverloadResolution
         return true;
     }
 
+    private static bool TryRecoverErasedTypeArguments(
+        MethodInfo openMethod,
+        ImmutableArray<TypeSymbol> recoveredSymbols,
+        Func<Type, Type> projectTypeArgument,
+        out Type[] typeArgs)
+    {
+        typeArgs = null;
+        if (openMethod is null
+            || recoveredSymbols.IsDefaultOrEmpty
+            || recoveredSymbols.Length != openMethod.GetGenericArguments().Length
+            || recoveredSymbols.Any(static symbol => symbol is null))
+        {
+            return false;
+        }
+
+        var result = new Type[recoveredSymbols.Length];
+        for (var i = 0; i < result.Length; i++)
+        {
+            var symbol = recoveredSymbols[i];
+            if (!MemberLookup.TryProjectErasedClrType(symbol, out var clrType))
+            {
+                return false;
+            }
+
+            result[i] = projectTypeArgument?.Invoke(clrType) ?? clrType;
+        }
+
+        typeArgs = result;
+        return true;
+    }
+
     /// <summary>
     /// Issue #750 / ADR-0088: validates that <paramref name="typeArgs"/>
     /// satisfies every CLR-level generic-parameter constraint declared on
@@ -3795,6 +4030,9 @@ internal static class OverloadResolution
             var argIsUserValueType = !typeArgSymbols.IsDefaultOrEmpty
                 && i < typeArgSymbols.Length
                 && IsValueTypeErasedSymbol(typeArgSymbols[i]);
+            var argIsUserReferenceType = !typeArgSymbols.IsDefaultOrEmpty
+                && i < typeArgSymbols.Length
+                && typeArgSymbols[i] is StructSymbol { IsClass: true, ClrType: null };
 
             if ((special & GenericParameterAttributes.ReferenceTypeConstraint) != 0)
             {
@@ -3826,18 +4064,34 @@ internal static class OverloadResolution
                 // reference types require an actual ctor.
                 if (!arg.IsValueType && !argIsUserValueType)
                 {
-                    try
+                    if (argIsUserReferenceType)
                     {
-                        var ctor = arg.GetConstructor(Type.EmptyTypes);
-                        if (ctor is null || !ctor.IsPublic)
+                        var userClass = (StructSymbol)typeArgSymbols[i];
+                        if (userClass.IsAbstract
+                            || userClass.HasPrimaryConstructor
+                            || (!userClass.EffectiveExplicitConstructors.IsDefaultOrEmpty
+                                && !userClass.EffectiveExplicitConstructors.Any(
+                                    constructor => constructor.Parameters.Length == 0
+                                        && constructor.Function.Accessibility == Accessibility.Public)))
                         {
                             return false;
                         }
                     }
-                    catch (Exception ex) when (IsMetadataLoadFailure(ex))
+                    else
                     {
-                        // Conservative: a load failure means we can't disprove
-                        // the constraint; keep the candidate alive.
+                        try
+                        {
+                            var ctor = arg.GetConstructor(Type.EmptyTypes);
+                            if (ctor is null || !ctor.IsPublic)
+                            {
+                                return false;
+                            }
+                        }
+                        catch (Exception ex) when (IsMetadataLoadFailure(ex))
+                        {
+                            // Conservative: a load failure means we can't disprove
+                            // the constraint; keep the candidate alive.
+                        }
                     }
                 }
             }
@@ -3889,6 +4143,21 @@ internal static class OverloadResolution
                 if (argIsUserValueType && !constraint.IsInterface)
                 {
                     if (ValueTypeErasedSymbolSatisfiesBaseConstraint(typeArgSymbols[i], constraint))
+                    {
+                        continue;
+                    }
+
+                    return false;
+                }
+
+                // A same-compilation user class also has no CLR Type during
+                // binding and is represented by an object placeholder. Check
+                // its symbolic base chain for concrete class constraints.
+                if (argIsUserReferenceType && !constraint.IsInterface)
+                {
+                    if (UserReferenceTypeErasedSymbolSatisfiesBaseConstraint(
+                        (StructSymbol)typeArgSymbols[i],
+                        constraint))
                     {
                         continue;
                     }
@@ -4017,6 +4286,116 @@ internal static class OverloadResolution
         }
 
         return false;
+    }
+
+    private static bool UserReferenceTypeErasedSymbolSatisfiesBaseConstraint(
+        StructSymbol symbol,
+        Type constraint)
+    {
+        if (constraint is null || constraint.IsSameAs(typeof(object)))
+        {
+            return true;
+        }
+
+        for (var current = symbol; current != null; current = current.BaseClass)
+        {
+            Type importedBase = current.ImportedBaseType?.ClrType;
+            if (importedBase != null)
+            {
+                try
+                {
+                    return ClrTypeUtilities.IsAssignableByName(constraint, importedBase);
+                }
+                catch (Exception ex) when (IsMetadataLoadFailure(ex))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryCloseOverUserReferenceTypePlaceholders(
+        MethodInfo openDef,
+        Type[] typeArgs,
+        ImmutableArray<TypeSymbol> recoveredSymbols,
+        out MethodInfo closed)
+    {
+        closed = null;
+        if (openDef is null
+            || typeArgs is null
+            || recoveredSymbols.IsDefaultOrEmpty
+            || recoveredSymbols.Length != typeArgs.Length
+            || !SatisfiesGenericConstraints(openDef, typeArgs, recoveredSymbols))
+        {
+            return false;
+        }
+
+        var placeholders = (Type[])typeArgs.Clone();
+        var replaced = false;
+        for (var i = 0; i < placeholders.Length; i++)
+        {
+            if (recoveredSymbols[i] is not StructSymbol { IsClass: true, ClrType: null } symbol)
+            {
+                continue;
+            }
+
+            Type importedBase = null;
+            for (var current = symbol; current != null && importedBase == null; current = current.BaseClass)
+            {
+                importedBase = current.ImportedBaseType?.ClrType;
+            }
+
+            if (importedBase == null)
+            {
+                continue;
+            }
+
+            placeholders[i] = FindReferenceTypeConstraintPlaceholder(
+                importedBase,
+                openDef.GetGenericArguments()[i]);
+            replaced = true;
+        }
+
+        if (!replaced)
+        {
+            return false;
+        }
+
+        try
+        {
+            closed = openDef.MakeGenericMethod(placeholders);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static Type FindReferenceTypeConstraintPlaceholder(Type importedBase, Type genericParameter)
+    {
+        var special = genericParameter.GenericParameterAttributes
+            & GenericParameterAttributes.SpecialConstraintMask;
+        if (!importedBase.IsAbstract
+            || (special & GenericParameterAttributes.DefaultConstructorConstraint) == 0)
+        {
+            return importedBase;
+        }
+
+        try
+        {
+            return importedBase.Assembly.GetTypes().FirstOrDefault(type =>
+                !type.IsAbstract
+                && importedBase.IsAssignableFrom(type)
+                && type.GetConstructor(Type.EmptyTypes) is { IsPublic: true })
+                ?? importedBase;
+        }
+        catch (Exception ex) when (IsMetadataLoadFailure(ex) || ex is ReflectionTypeLoadException)
+        {
+            return importedBase;
+        }
     }
 
     /// <summary>
@@ -4550,34 +4929,13 @@ internal static class OverloadResolution
             // throw on BaseType traversal; fall through to interface walk.
         }
 
-        Type[] ifaces;
-        try
+        var projected = FindClosedGenericFromDefinition(type, openDefinition, openDefName);
+        if (projected != null)
         {
-            ifaces = type.GetInterfaces();
+            return projected;
         }
-        catch (InvalidOperationException)
-        {
-            return null;
-        }
-        catch (NotSupportedException)
-        {
-            // Issue #666: TypeBuilderInstantiation (produced when
-            // FunctionTypeSymbol.BuildClrType constructs a host-runtime Func<>
-            // with MetadataLoadContext type arguments) throws
-            // NotSupportedException from GetInterfaces(). Treat as "no match"
-            // and let inference continue from other parameters.
 
-            // Fallback: if the type itself is a closed generic whose open
-            // definition matches by name, return it directly. This handles
-            // Func<T,bool> / Action<T> shapes from BuildClrType.
-            if (type.IsGenericType && !type.IsGenericTypeDefinition
-                && MatchesOpenDefinition(type.GetGenericTypeDefinition(), openDefinition, openDefName))
-            {
-                return type;
-            }
-
-            return null;
-        }
+        var ifaces = ClrTypeUtilities.SafeGetInterfaces(type);
 
         foreach (var iface in ifaces)
         {
@@ -4588,6 +4946,64 @@ internal static class OverloadResolution
         }
 
         return null;
+    }
+
+    private static Type FindClosedGenericFromDefinition(Type type, Type openDefinition, string openDefinitionName)
+    {
+        if (type == null || !type.IsGenericType || type.IsGenericTypeDefinition)
+        {
+            return null;
+        }
+
+        try
+        {
+            var definition = type.GetGenericTypeDefinition();
+            var parameters = definition.GetGenericArguments();
+            var arguments = type.GetGenericArguments();
+            foreach (var candidate in definition.GetInterfaces())
+            {
+                var projected = Project(candidate);
+                if (projected != null)
+                {
+                    return projected;
+                }
+            }
+
+            for (var candidate = definition.BaseType; candidate != null; candidate = candidate.BaseType)
+            {
+                var projected = Project(candidate);
+                if (projected != null)
+                {
+                    return projected;
+                }
+            }
+
+            return null;
+
+            Type Project(Type candidate)
+            {
+                if (!candidate.IsGenericType
+                    || !MatchesOpenDefinition(
+                        candidate.GetGenericTypeDefinition(),
+                        openDefinition,
+                        openDefinitionName))
+                {
+                    return null;
+                }
+
+                var projected = candidate;
+                for (var i = 0; i < parameters.Length; i++)
+                {
+                    projected = SubstituteClrType(projected, parameters[i], arguments[i]);
+                }
+
+                return projected;
+            }
+        }
+        catch (Exception ex) when (IsMetadataLoadFailure(ex) || ex is ArgumentException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

@@ -627,7 +627,7 @@ public sealed partial class CSharpToGSharpTranslator
             // past the translated switch and emit that target only when needed.
             bool needsExitLabel = node.DescendantNodes()
                 .OfType<BreakStatementSyntax>()
-                .Any(b => BreakTargetsSwitch(b, node) && !IsRedundantSwitchSectionBreak(b));
+                .Any(b => GetBreakTarget(b) == node && !IsRedundantSwitchSectionBreak(b));
 
             // Issue #1884: a `goto case K;` / `goto default;` anywhere in this
             // switch (but not in a nested switch, whose own gotos target its
@@ -726,6 +726,21 @@ public sealed partial class CSharpToGSharpTranslator
                 }
             }
 
+            if (this.RequiresEnumStatementFallback(node))
+            {
+                // Empty blocks do not round-trip, so discard a literal as the
+                // canonical side-effect-free statement.
+                cases.Add(new SwitchStatementCase(
+                    null,
+                    new BlockStatement(new GStatement[]
+                    {
+                        new LocalDeclarationStatement(
+                            BindingKind.Let,
+                            "_",
+                            initializer: LiteralExpression.Int("0")),
+                    })));
+            }
+
             yield return new SwitchStatement(subject, cases);
             if (needsExitLabel)
             {
@@ -734,6 +749,78 @@ public sealed partial class CSharpToGSharpTranslator
                     new BlockStatement(new List<GStatement>()));
             }
         }
+
+        private bool RequiresEnumStatementFallback(SwitchStatementSyntax node)
+        {
+            if (this.context.GetTypeInfo(node.Expression).Type is not INamedTypeSymbol { TypeKind: TypeKind.Enum } enumType)
+            {
+                return false;
+            }
+
+            var missingValues = new HashSet<object>(
+                enumType.GetMembers()
+                    .OfType<IFieldSymbol>()
+                    .Where(field => field.HasConstantValue)
+                    .Select(field => field.ConstantValue));
+
+            foreach (SwitchLabelSyntax label in node.Sections.SelectMany(section => section.Labels))
+            {
+                switch (label)
+                {
+                    case DefaultSwitchLabelSyntax:
+                        return false;
+
+                    case CaseSwitchLabelSyntax valueLabel:
+                        RemoveConstantValue(valueLabel.Value, missingValues);
+                        break;
+
+                    case CasePatternSwitchLabelSyntax { WhenClause: null } patternLabel
+                        when IsTotalPattern(patternLabel.Pattern):
+                        return false;
+
+                    case CasePatternSwitchLabelSyntax { WhenClause: null } patternLabel:
+                        RemoveCoveredPatternValues(patternLabel.Pattern, missingValues);
+                        break;
+                }
+            }
+
+            return missingValues.Count > 0;
+        }
+
+        private void RemoveConstantValue(ExpressionSyntax expression, HashSet<object> values)
+        {
+            Optional<object> constant = this.context.SemanticModel.GetConstantValue(expression);
+            if (constant.HasValue)
+            {
+                values.Remove(constant.Value);
+            }
+        }
+
+        private void RemoveCoveredPatternValues(PatternSyntax pattern, HashSet<object> values)
+        {
+            switch (pattern)
+            {
+                case ConstantPatternSyntax constant:
+                    this.RemoveConstantValue(constant.Expression, values);
+                    break;
+
+                case BinaryPatternSyntax binary when binary.IsKind(SyntaxKind.OrPattern):
+                    this.RemoveCoveredPatternValues(binary.Left, values);
+                    this.RemoveCoveredPatternValues(binary.Right, values);
+                    break;
+
+                case ParenthesizedPatternSyntax parenthesized:
+                    this.RemoveCoveredPatternValues(parenthesized.Pattern, values);
+                    break;
+            }
+        }
+
+        private static bool IsTotalPattern(PatternSyntax pattern)
+            => pattern is DiscardPatternSyntax or VarPatternSyntax
+            || (pattern is ParenthesizedPatternSyntax parenthesized && IsTotalPattern(parenthesized.Pattern))
+            || (pattern is BinaryPatternSyntax binary
+                && binary.IsKind(SyntaxKind.OrPattern)
+                && (IsTotalPattern(binary.Left) || IsTotalPattern(binary.Right)));
 
         private BlockStatement TranslateSwitchSectionBody(SwitchSectionSyntax section, string injectLabel = null)
         {
@@ -764,31 +851,24 @@ public sealed partial class CSharpToGSharpTranslator
 
         private IEnumerable<GStatement> TranslateBreakStatement(BreakStatementSyntax node)
         {
-            // The nearest breakable ancestor is the semantic target. Blocks,
-            // conditionals, try/using/lock statements, local functions, and
-            // lambdas do not require special cases; nested loops/switches do.
-            SwitchStatementSyntax enclosingSwitch = node.Ancestors()
-                .OfType<SwitchStatementSyntax>()
-                .FirstOrDefault();
-
-            if (enclosingSwitch != null && BreakTargetsSwitch(node, enclosingSwitch))
+            SyntaxNode target = GetBreakTarget(node);
+            if (target is SwitchStatementSyntax targetSwitch)
             {
                 if (IsRedundantSwitchSectionBreak(node))
                 {
                     return System.Array.Empty<GStatement>();
                 }
 
-                return new[] { (GStatement)new GotoStatement(SwitchExitLabelName(enclosingSwitch)) };
+                return new[] { (GStatement)new GotoStatement(SwitchExitLabelName(targetSwitch)) };
             }
 
             return new[] { (GStatement)new BreakStatement() };
         }
 
-        private static bool BreakTargetsSwitch(BreakStatementSyntax node, SwitchStatementSyntax target)
-        {
-            SyntaxNode breakTarget = node.Ancestors().FirstOrDefault(IsBreakTarget);
-            return breakTarget == target;
-        }
+        // The nearest loop or switch, rather than either kind in isolation,
+        // determines whether G# keeps the break or lowers it to a switch exit.
+        private static SyntaxNode GetBreakTarget(BreakStatementSyntax node)
+            => node.Ancestors().FirstOrDefault(IsBreakTarget);
 
         private static bool IsBreakTarget(SyntaxNode node)
             => node is SwitchStatementSyntax
@@ -829,15 +909,22 @@ public sealed partial class CSharpToGSharpTranslator
         {
             // `yield return x` maps to the G# iterator `yield x` (sample
             // TupleSequenceIterators.gs); the enclosing func's return type is
-            // rewritten to `sequence[T]`. `yield break` maps to plain `break`
-            // (settled fact: G# has no `yield break`; ADR-0115 §B).
+            // rewritten to `sequence[T]`. G# has no `yield break`, so jump to
+            // the end of the nearest iterator body regardless of nested loops.
             if (node.Expression == null)
             {
-                return new[] { (GStatement)new BreakStatement() };
+                SyntaxNode target = GetBreakTarget(node);
+                return new[] { (GStatement)new GotoStatement(IteratorExitLabelName(target)) };
             }
 
             return new[] { (GStatement)new YieldStatement(this.TranslateExpression(node.Expression)) };
         }
+
+        private static SyntaxNode GetBreakTarget(YieldStatementSyntax node)
+            => node.Ancestors().First(n => n is MethodDeclarationSyntax or LocalFunctionStatementSyntax);
+
+        private static string IteratorExitLabelName(SyntaxNode node)
+            => $"__iteratorExit{node.SpanStart}";
 
         private GStatement TranslateForEachVariable(ForEachVariableStatementSyntax node)
         {

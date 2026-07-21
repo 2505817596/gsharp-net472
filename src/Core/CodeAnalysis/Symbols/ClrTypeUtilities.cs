@@ -259,6 +259,14 @@ public static class ClrTypeUtilities
             return true;
         }
 
+        if (target.IsGenericType
+            && source.IsGenericType
+            && AreSame(target.GetGenericTypeDefinition(), source.GetGenericTypeDefinition())
+            && GenericArgumentsAreAssignable(target, source))
+        {
+            return true;
+        }
+
         // Same-context fast path covers inheritance / interfaces.
         if (ReferenceEquals(target.Assembly, source.Assembly) || target.GetType() == source.GetType())
         {
@@ -886,19 +894,53 @@ public static class ClrTypeUtilities
             return Array.Empty<Type>();
         }
 
-        // Issue #1678: Type.GetInterfaces() walks the full transitive interface
-        // graph on every call; memoize it per Type so a receiver used at N call
-        // sites (or matched against N interface methods) pays that walk once.
+        // Some MetadataLoadContext Type implementations return only direct
+        // interfaces. Complete the graph explicitly and include interfaces
+        // inherited through base classes, then cache that canonical result.
         return interfacesCache.GetValue(type, static t =>
         {
-            try
+            var result = new List<Type>();
+            var visited = new HashSet<Type>();
+
+            void Visit(Type current)
             {
-                return t.GetInterfaces();
+                if (current == null || !visited.Add(current))
+                {
+                    return;
+                }
+
+                Type[] direct;
+                try
+                {
+                    direct = current.GetInterfaces();
+                }
+                catch (Exception ex) when (IsMetadataLoadFailure(ex))
+                {
+                    direct = Array.Empty<Type>();
+                }
+
+                foreach (var iface in direct)
+                {
+                    if (!result.Contains(iface))
+                    {
+                        result.Add(iface);
+                    }
+
+                    Visit(iface);
+                }
+
+                try
+                {
+                    Visit(current.BaseType);
+                }
+                catch (Exception ex) when (IsMetadataLoadFailure(ex))
+                {
+                    // A partial graph is still useful to callers.
+                }
             }
-            catch (Exception ex) when (IsMetadataLoadFailure(ex))
-            {
-                return Array.Empty<Type>();
-            }
+
+            Visit(t);
+            return result.ToArray();
         });
     }
 
@@ -919,6 +961,42 @@ public static class ClrTypeUtilities
         MemberCache<FieldInfo>.Cache.Clear();
         MemberCache<EventInfo>.Cache.Clear();
         MemberCache<ConstructorInfo>.Cache.Clear();
+    }
+
+    private static bool GenericArgumentsAreAssignable(Type target, Type source)
+    {
+        var parameters = target.GetGenericTypeDefinition().GetGenericArguments();
+        var targetArguments = target.GetGenericArguments();
+        var sourceArguments = source.GetGenericArguments();
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            if (AreSame(targetArguments[i], sourceArguments[i]))
+            {
+                continue;
+            }
+
+            if (targetArguments[i].IsValueType || sourceArguments[i].IsValueType)
+            {
+                return false;
+            }
+
+            var variance = parameters[i].GenericParameterAttributes & GenericParameterAttributes.VarianceMask;
+            if (variance == GenericParameterAttributes.Covariant
+                && IsAssignableByName(targetArguments[i], sourceArguments[i]))
+            {
+                continue;
+            }
+
+            if (variance == GenericParameterAttributes.Contravariant
+                && IsAssignableByName(sourceArguments[i], targetArguments[i]))
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        return true;
     }
 
     private static bool IsConstructedGenericWithTypeBuilderArgument(Type type)
@@ -1064,6 +1142,35 @@ public static class ClrTypeUtilities
         {
             var member = directLookup(type, flags);
             return member != null && CanLoadSignature(member) ? member : null;
+        }
+        catch (AmbiguousMatchException)
+        {
+            for (var declaringType = type; declaringType != null; declaringType = declaringType.BaseType)
+            {
+                TMember match = null;
+                foreach (var member in safeEnumerate(type, flags))
+                {
+                    if (!string.Equals(member.Name, name, StringComparison.Ordinal)
+                        || !AreSame(member.DeclaringType, declaringType))
+                    {
+                        continue;
+                    }
+
+                    if (match != null)
+                    {
+                        return null;
+                    }
+
+                    match = member;
+                }
+
+                if (match != null)
+                {
+                    return match;
+                }
+            }
+
+            return null;
         }
         catch (Exception ex) when (IsMetadataLoadFailure(ex))
         {

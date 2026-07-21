@@ -241,7 +241,15 @@ public sealed class TranslateStage : IMigrationStage
             List<string> retainedFilePaths = hasAnalyzerReferences
                 ? currentProject.Documents.Select(d => d.FilePath).ToList()
                 : null;
-            var translator = new CSharpToGSharpTranslator(markMergedTypePartial: hasAnalyzerReferences, retainedFilePaths: retainedFilePaths);
+            var translator = new CSharpToGSharpTranslator(
+                markMergedTypePartial: hasAnalyzerReferences,
+                retainedFilePaths: retainedFilePaths);
+
+            EmitFriendAssemblyAnnotations(
+                context,
+                currentProject,
+                isReferencedProject,
+                usedOutputPaths);
 
             foreach (LoadedDocument document in currentProject.Documents)
             {
@@ -377,6 +385,51 @@ public sealed class TranslateStage : IMigrationStage
         EmitNerdbankGitVersioningBumps(context);
 
         return artifacts.Count == 0 ? StageOutcome.Passed() : StageOutcome.Failed(artifacts);
+    }
+
+    private static void EmitFriendAssemblyAnnotations(
+        StageExecutionContext context,
+        LoadedCSharpProject project,
+        bool isReferencedProject,
+        ISet<string> usedOutputPaths)
+    {
+        const string attributeName = "System.Runtime.CompilerServices.InternalsVisibleToAttribute";
+        List<string> friendAssemblies = project.Compilation.Assembly.GetAttributes()
+            .Where(attribute =>
+                attribute.AttributeClass?.ToDisplayString() == attributeName &&
+                attribute.ConstructorArguments.Length == 1 &&
+                attribute.ConstructorArguments[0].Value is string)
+            .Select(attribute => (string)attribute.ConstructorArguments[0].Value)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (friendAssemblies.Count == 0)
+        {
+            return;
+        }
+
+        string source = string.Join(
+            Environment.NewLine,
+            friendAssemblies.Select(name =>
+                "@assembly:InternalsVisibleTo(" +
+                Microsoft.CodeAnalysis.CSharp.SymbolDisplay.FormatLiteral(name, quote: true) +
+                ")")) + Environment.NewLine;
+        string relativePath = UniqueOutputPath(
+            PrefixReferencedProject("AssemblyInfo.gs", project, isReferencedProject),
+            usedOutputPaths);
+        string path = Path.Combine(context.AppRunDir, relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        File.WriteAllText(path, source);
+
+        string emittedRelativePath = MigrationPipeline.SanitizeAppId(context.App.Id) + "/" +
+            relativePath.Replace(Path.DirectorySeparatorChar, '/');
+        context.EmittedFiles.Add(new EmittedGsFile(
+            path,
+            emittedRelativePath,
+            context.App.ProjectPath,
+            source)
+        {
+            IsFromReferencedProject = isReferencedProject,
+        });
     }
 
     /// <summary>

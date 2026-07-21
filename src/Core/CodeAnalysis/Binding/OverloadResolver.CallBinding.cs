@@ -45,6 +45,39 @@ internal sealed partial class OverloadResolver
         return false;
     }
 
+    private bool TryResolveImplicitInheritedTypeArguments(
+        TypeArgumentListSyntax typeArgumentList,
+        out Type[] clrTypeArguments,
+        out ImmutableArray<TypeSymbol> typeArgumentSymbols)
+    {
+        clrTypeArguments = null;
+        typeArgumentSymbols = default;
+        if (typeArgumentList == null)
+        {
+            return true;
+        }
+
+        clrTypeArguments = new Type[typeArgumentList.Arguments.Count];
+        var symbols = ImmutableArray.CreateBuilder<TypeSymbol>(typeArgumentList.Arguments.Count);
+        for (var i = 0; i < typeArgumentList.Arguments.Count; i++)
+        {
+            var symbol = bindTypeClause(typeArgumentList.Arguments[i]);
+            if (symbol == null)
+            {
+                return false;
+            }
+
+            symbols.Add(symbol);
+            var clrType = NullableLifting.GetEffectiveClrType(symbol);
+            clrTypeArguments[i] = clrType != null
+                ? binderCtx.References.MapClrTypeToReferences(clrType)
+                : binderCtx.References.GetCoreType("System.Object");
+        }
+
+        typeArgumentSymbols = symbols.MoveToImmutable();
+        return true;
+    }
+
     /// <summary>
     /// Issue #1159: returns the implicit-<c>this</c> parameter that an
     /// unqualified instance-member reference should bind against. For a direct
@@ -149,11 +182,12 @@ internal sealed partial class OverloadResolver
 
     /// <summary>
     /// Issue #2403: whether <paramref name="syntax"/>'s unqualified callee name
-    /// could resolve to a genuine user-defined callable — a same-compilation
+    /// could resolve to a genuine non-constructor callable — a same-compilation
     /// free/extension <see cref="FunctionSymbol"/> reachable through
     /// <see cref="Scope"/>, or an implicit-<c>this</c> instance/static sibling
     /// method (including a private one) on the enclosing struct/class or
-    /// interface body — checked BEFORE the CLR constructor/conversion
+    /// interface body, or an inherited CLR method on the implicit receiver —
+    /// checked BEFORE the CLR constructor/conversion
     /// fallbacks a few lines below in <see cref="BindCallExpression"/> run. A
     /// same-named imported CLR type (e.g. <c>System.Net.Http.HttpClient</c>)
     /// must not shadow a colliding user method in call position, mirroring how
@@ -175,7 +209,7 @@ internal sealed partial class OverloadResolver
     /// the CLR paths run exactly as before, so genuine constructor/conversion
     /// calls (e.g. `StringBuilder(16)`) are unaffected.
     /// </remarks>
-    private bool HasUserCallableCandidate(CallExpressionSyntax syntax)
+    private bool HasNonConstructorCallableCandidate(CallExpressionSyntax syntax)
     {
         var name = syntax.Identifier.Text;
 
@@ -198,6 +232,14 @@ internal sealed partial class OverloadResolver
             // overload set of the enclosing type — mirror that union here.
             if (!TypeMemberModel.GetMethods(receiverStruct, name, MemberQuery.Instance(MemberKinds.Method)).IsDefaultOrEmpty
                 || !TypeMemberModel.GetMethods(receiverStruct, name, MemberQuery.Static(MemberKinds.Method)).IsDefaultOrEmpty)
+            {
+                return true;
+            }
+
+            // An imported type with the same simple name as an inherited CLR
+            // method must not turn an implicit-receiver call into construction.
+            var inheritedClr = ExpressionBinder.GetInheritedClrBaseType(receiverStruct) ?? typeof(object);
+            if (MemberLookup.SafeGetMethodsIncludingSelfAndInterfaces(inheritedClr, name).Count > 0)
             {
                 return true;
             }
@@ -273,16 +315,16 @@ internal sealed partial class OverloadResolver
             }
         }
 
-        // Issue #2403: a resolvable user-defined callable (same-compilation
+        // Issue #2403 / #2549: a resolvable non-constructor callable (same-compilation
         // free/extension function, or an implicit-`this` instance/static
-        // sibling method) with this name takes precedence over ALL THREE CLR
+        // sibling/inherited CLR method) with this name takes precedence over ALL THREE CLR
         // constructor/conversion fallback paths below, mirroring how a
         // same-named source method always shadows a colliding imported CLR
         // type (e.g. `System.Net.Http.HttpClient`) in call position. Computed
-        // once and reused by all three gates; see HasUserCallableCandidate's
+        // once and reused by all three gates; see HasNonConstructorCallableCandidate's
         // remarks for why only existence (not full overload applicability) is
         // checked here.
-        var hasUserCallable = HasUserCallableCandidate(syntax);
+        var hasNonConstructorCallable = HasNonConstructorCallableCandidate(syntax);
 
         // Issue #1263: when the construction carries an explicit type-argument
         // list (`Op[int32](5)`), resolve the constructed type by (name, arity)
@@ -301,7 +343,7 @@ internal sealed partial class OverloadResolver
         // takes precedence over CLR-imported-class construction a few lines
         // below, mirroring (a) how a same-named source function/method already
         // shadows a colliding imported CLR type in call position
-        // (HasUserCallableCandidate, issue #2403), and (b) how the
+        // (HasNonConstructorCallableCandidate, issue #2403), and (b) how the
         // struct/class-literal binder (BindStructLiteralExpression) already
         // checks TryLookupTypeAlias before ever falling back to
         // TryLookupImportedClass. Without this, `Type(...)` for a same-simple-
@@ -323,12 +365,12 @@ internal sealed partial class OverloadResolver
         // Also handles closed-generic imports (`List[int]()`,
         // `Dictionary[string, int]()`). Interpreter-only — resolves a
         // ConstructorInfo and emits BoundClrConstructorCallExpression.
-        if (!hasUserCallable && !hasSourceConstructibleType && tryBindClrConstructorCall(syntax, out var clrCtorCall))
+        if (!hasNonConstructorCallable && !hasSourceConstructibleType && tryBindClrConstructorCall(syntax, out var clrCtorCall))
         {
             return clrCtorCall;
         }
 
-        if (!hasUserCallable && syntax.Arguments.Count == 1 && lookupTypeWithArity(syntax.Identifier.Text, ctorPreferredArity) is TypeSymbol type)
+        if (!hasNonConstructorCallable && syntax.Arguments.Count == 1 && lookupTypeWithArity(syntax.Identifier.Text, ctorPreferredArity) is TypeSymbol type)
         {
             // Issue #663: when the call carries a `?` token (e.g. `string?(x)`),
             // wrap the resolved type in NullableTypeSymbol so the conversion
@@ -368,7 +410,7 @@ internal sealed partial class OverloadResolver
         // Issue #1069: a value struct (e.g. a `data struct`) declaring a
         // primary constructor is also positionally constructible —
         // `Entry(1, 2)` lowers to a struct literal initializing its fields.
-        if (!hasUserCallable
+        if (!hasNonConstructorCallable
             && lookupTypeWithArity(syntax.Identifier.Text, ctorPreferredArity) is StructSymbol classType
             && (classType.IsClass || classType.IsInline || classType.HasPrimaryConstructor))
         {
@@ -547,9 +589,17 @@ internal sealed partial class OverloadResolver
                 // inherited from a metadata base reached through one or more
                 // G#-defined base classes resolves — matching the qualified
                 // `this.Method(...)` path and G#-defined-base behavior.
+                if (!TryResolveImplicitInheritedTypeArguments(
+                    syntax.TypeArgumentList,
+                    out var inheritedClrTypeArgs,
+                    out var inheritedTypeArgSymbols))
+                {
+                    return new BoundErrorExpression(null);
+                }
+
                 var implicitBaseClr = ExpressionBinder.GetInheritedClrBaseType(implicitReceiverStruct) ?? typeof(object);
                 var implicitReceiverExpr = new BoundVariableExpression(null, effThis);
-                if (tryBindInheritedClrInstanceCall(implicitReceiverExpr, implicitBaseClr, syntax.Identifier.Text, boundArguments.ToImmutable(), syntax, out var implicitInheritedCall, null, default, argumentNames, allowProtectedInherited: true))
+                if (tryBindInheritedClrInstanceCall(implicitReceiverExpr, implicitBaseClr, syntax.Identifier.Text, boundArguments.ToImmutable(), syntax, out var implicitInheritedCall, inheritedClrTypeArgs, inheritedTypeArgSymbols, argumentNames, allowProtectedInherited: true))
                 {
                     return implicitInheritedCall;
                 }
@@ -583,6 +633,17 @@ internal sealed partial class OverloadResolver
 
                     var implicitReceiver = new BoundVariableExpression(null, effThis);
                     return BindUserInstanceCall(implicitReceiver, implicitIfaceMethod, boundArguments.ToImmutable(), syntax, argumentNames);
+                }
+
+                // Issue #2600: an interface default method's implicit `this`
+                // also exposes System.Object members. This is the bare-call
+                // counterpart of the qualified interface-receiver fallback
+                // from issue #2304 and applies in every expression context,
+                // including interpolation holes.
+                var implicitObjectReceiver = new BoundVariableExpression(null, effThis);
+                if (tryBindInheritedClrInstanceCall(implicitObjectReceiver, typeof(object), syntax.Identifier.Text, boundArguments.ToImmutable(), syntax, out var implicitObjectCall, null, default, argumentNames))
+                {
+                    return implicitObjectCall;
                 }
             }
 
