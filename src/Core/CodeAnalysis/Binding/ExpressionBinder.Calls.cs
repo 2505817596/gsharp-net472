@@ -109,9 +109,9 @@ internal sealed partial class ExpressionBinder
             // accessor instead of failing to find a field at all.
             if (TypeMemberModel.TryGetProperty(structType, memberName, out var property, out var propertyDeclaringType) && property.HasSetter)
             {
-                if (!AccessibilityChecker.IsAccessible(property.Accessibility, propertyDeclaringType, this.function))
+                if (!AccessibilityChecker.IsAccessible(property.SetterAccessibility, propertyDeclaringType, this.function))
                 {
-                    Diagnostics.ReportMemberInaccessible(initSyntax.FieldIdentifier.Location, property.Name, propertyDeclaringType.Name, property.Accessibility);
+                    Diagnostics.ReportMemberInaccessible(initSyntax.FieldIdentifier.Location, property.Name, propertyDeclaringType.Name, property.SetterAccessibility);
                 }
 
                 var propertyValueExpr = BindExpression(initSyntax.Value);
@@ -779,14 +779,23 @@ internal sealed partial class ExpressionBinder
                 return true;
             }
 
-            return TryBindClrConstructorFromType(
+            var bound = TryBindClrConstructorFromType(
                 clrType,
                 syntax,
                 out result,
+                out var noApplicableOverload,
                 resultTypeOverride: dataClassAggregate);
+            return bound || FinishClrConstructorBindingFailure(
+                syntax, name, noApplicableOverload, ref result);
         }
 
-        if (TryBindClrConstructorFromType(clrType, syntax, out result, openGenericDefinition, symbolicTypeArgs))
+        if (TryBindClrConstructorFromType(
+                clrType,
+                syntax,
+                out result,
+                out var clrNoApplicableOverload,
+                openGenericDefinition,
+                symbolicTypeArgs))
         {
             return true;
         }
@@ -799,7 +808,35 @@ internal sealed partial class ExpressionBinder
             return true;
         }
 
-        return false;
+        return FinishClrConstructorBindingFailure(
+            syntax, name, clrNoApplicableOverload, ref result);
+    }
+
+    private bool FinishClrConstructorBindingFailure(
+        CallExpressionSyntax syntax,
+        string typeName,
+        bool noApplicableOverload,
+        ref BoundExpression result)
+    {
+        if (syntax.TypeArgumentList == null)
+        {
+            result = null;
+            return false;
+        }
+
+        if (result != null)
+        {
+            return true;
+        }
+
+        if (!noApplicableOverload)
+        {
+            return false;
+        }
+
+        Diagnostics.ReportNoApplicableOverload(syntax.Identifier.Location, typeName);
+        result = new BoundErrorExpression(syntax);
+        return true;
     }
 
     /// <summary>
@@ -818,7 +855,7 @@ internal sealed partial class ExpressionBinder
     /// <param name="typeArgumentList">The call's <c>[T1, T2]</c> list.</param>
     /// <param name="clrArgs">On success, the resolved (mapped) CLR type arguments ready for MakeGenericType.</param>
     /// <param name="symbolicArgs">On success, the symbolic type arguments in source order.</param>
-    /// <param name="hasSymbolicArg">On success, whether any argument is a G# user-defined type or in-scope type parameter.</param>
+    /// <param name="hasSymbolicArg">On success, whether any argument carries information its CLR type cannot represent.</param>
     /// <returns>Whether all type arguments resolved.</returns>
     private bool TryResolveClrConstructionTypeArgs(
         TypeArgumentListSyntax typeArgumentList,
@@ -851,21 +888,11 @@ internal sealed partial class ExpressionBinder
                 continue;
             }
 
-            // Issue #671: a nested constructed generic that itself carries
-            // symbolic user-defined arguments (e.g. `List[MyGs]` used as an
-            // argument to `List[...]`) has a (type-erased) ClrType, but the
-            // outer construction must still preserve the symbolic shape so
-            // the emitter can recover the user-defined TypeDef tokens at the
-            // inner position. Flag the outer as symbolic so the symbolic args
-            // are retained, but keep the placeholder CLR type for
-            // MakeGenericType (the closed CLR shape erases to
-            // `Open<...,object,...>` at the outer level, and the emitter
-            // descends through the symbolic args to encode the real shape).
-            if (ta is ImportedTypeSymbol nested
-                && nested.OpenDefinition != null
-                && !nested.TypeArguments.IsDefaultOrEmpty
-                && nested.TypeArguments.Any(static a => a.ClrType == null
-                    || (a is ImportedTypeSymbol n && n.OpenDefinition != null && !n.TypeArguments.IsDefaultOrEmpty)))
+            // Issue #2664: preserve every symbolic argument shape that its CLR
+            // type cannot represent, including nullable references. Indexer and
+            // Add binding can then recover `T?` instead of target-typing `nil`
+            // against the erased non-null `T`.
+            if (TypeSymbol.RequiresSymbolicProjection(ta))
             {
                 hasSymbolicArg = true;
             }
@@ -894,6 +921,11 @@ internal sealed partial class ExpressionBinder
     /// <param name="clrType">The closed CLR type to construct.</param>
     /// <param name="syntax">The call syntax carrying the arguments and location.</param>
     /// <param name="result">The bound constructor call on success.</param>
+    /// <param name="noApplicableOverload">
+    /// Whether the type and its constructors resolved but none accepted the
+    /// supplied arguments. The caller reports this only after semantic-
+    /// aggregate constructor fallback has also failed.
+    /// </param>
     /// <param name="openGenericDefinition">
     /// Issue #671: when <paramref name="clrType"/> was closed with a
     /// <see cref="object"/> placeholder for one or more G# user-defined type
@@ -919,11 +951,13 @@ internal sealed partial class ExpressionBinder
         System.Type clrType,
         CallExpressionSyntax syntax,
         out BoundExpression result,
+        out bool noApplicableOverload,
         System.Type openGenericDefinition = null,
         ImmutableArray<TypeSymbol> symbolicTypeArgs = default,
         TypeSymbol resultTypeOverride = null)
     {
         result = null;
+        noApplicableOverload = false;
 
         if (clrType.IsAbstract || clrType.IsInterface)
         {
@@ -1077,6 +1111,12 @@ internal sealed partial class ExpressionBinder
 
         if (bestCtor == null)
         {
+            if (boundArguments.Any(static argument => argument.Type == TypeSymbol.Error))
+            {
+                result = new BoundErrorExpression(syntax);
+                return false;
+            }
+
             // Issue #524: CLR value types always have an implicit zero-init
             // default "constructor" — at the IL level that's `initobj T`, not
             // a `newobj` against any `.ctor`. Reflection's
@@ -1108,6 +1148,7 @@ internal sealed partial class ExpressionBinder
                 return true;
             }
 
+            noApplicableOverload = true;
             return false;
         }
 
@@ -1470,6 +1511,12 @@ internal sealed partial class ExpressionBinder
             return false;
         }
 
-        return TryBindClrConstructorFromType(nestedType, syntax, out result);
+        var bound = TryBindClrConstructorFromType(
+            nestedType,
+            syntax,
+            out result,
+            out var noApplicableOverload);
+        return bound || FinishClrConstructorBindingFailure(
+            syntax, nestedType.Name, noApplicableOverload, ref result);
     }
 }

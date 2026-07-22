@@ -47,7 +47,11 @@ internal sealed partial class MethodBodyEmitter
     //  * For any other function-typed value (a func-typed variable, call
     //    result, etc.) the runtime value is already a delegate; adapt it
     //    to the target delegate type via `dup / ldvirtftn Invoke / newobj`.
-    private void EmitFunctionToDelegateConversion(BoundExpression source, FunctionTypeSymbol sourceFn, Type targetDelegateHostType)
+    private void EmitFunctionToDelegateConversion(
+        BoundExpression source,
+        FunctionTypeSymbol sourceFn,
+        Type targetDelegateHostType,
+        EntityHandle? symbolicTargetCtorRef = null)
     {
         // Issue #1502: when the SOURCE function type carries a source-defined
         // user type (Struct/Class/Interface/Enum/Delegate) or a type parameter
@@ -73,6 +77,12 @@ internal sealed partial class MethodBodyEmitter
 
         if (source is BoundFunctionLiteralExpression literal)
         {
+            if (symbolicTargetCtorRef.HasValue)
+            {
+                this.EmitFunctionLiteral(literal, overrideDelegateType: null, symbolicDelegateCtorRef: symbolicTargetCtorRef.Value);
+                return;
+            }
+
             // Issue #1502: an async lambda whose Task-wrapped delegate shape
             // needs symbolic encoding (`Func<...,Task<TOutput>>`) is emitted
             // through the reified TypeSpec ctor ref.
@@ -107,6 +117,12 @@ internal sealed partial class MethodBodyEmitter
         // target delegate type.
         if (source is BoundMethodGroupExpression methodGroup)
         {
+            if (symbolicTargetCtorRef.HasValue)
+            {
+                this.EmitMethodGroupToNamedDelegate(methodGroup, symbolicTargetCtorRef.Value);
+                return;
+            }
+
             this.EmitMethodGroup(methodGroup, overrideDelegateType: sourceNeedsSymbolic ? null : targetDelegateType);
             return;
         }
@@ -130,9 +146,10 @@ internal sealed partial class MethodBodyEmitter
             invokeRef = this.outer.memberRefs.GetMethodReference(sourceInvoke);
         }
 
-        var ctorRef = sourceNeedsSymbolic
+        var ctorRef = symbolicTargetCtorRef
+            ?? (sourceNeedsSymbolic
             ? this.outer.memberRefs.GetFunctionDelegateCtorRef(sourceFn)
-            : (EntityHandle)this.outer.memberRefs.GetDelegateCtorReference(targetDelegateType);
+            : (EntityHandle)this.outer.memberRefs.GetDelegateCtorReference(targetDelegateType));
 
         this.EmitNullGuardedDelegateToDelegateAdaptation(source, invokeRef, ctorRef);
     }
@@ -545,7 +562,9 @@ internal sealed partial class MethodBodyEmitter
         else
         {
             this.il.OpCode(isStatic || receiverIsValueType ? ILOpCode.Call : ILOpCode.Callvirt);
-            this.il.Token(this.outer.memberRefs.GetMethodReference(accessor));
+            this.il.Token(this.outer.memberRefs.GetMethodEntityHandle(
+                accessor,
+                subscription.EventContainingType));
         }
     }
 
@@ -980,12 +999,14 @@ internal sealed partial class MethodBodyEmitter
         this.il.Token(delegateTypeHandle);
     }
 
-    // Phase 4 emit parity: load a captured variable. In a MoveNext body,
-    // the variable may be hoisted to a state-machine field; emit the field
-    // load instead of a local/parameter load in that case.
+    // Phase 4 emit parity: load a captured variable. In an async or async-
+    // iterator MoveNext body, the variable may be hoisted to a state-machine
+    // field; emit the field load instead of a local/parameter load.
     private void EmitCapturedVariableLoad(VariableSymbol captured)
     {
-        if (this.asyncFieldMap != null && this.asyncFieldMap.TryGetHoistedField(captured, out var hoistedField))
+        FieldSymbol hoistedField = null;
+        if ((this.asyncFieldMap != null && this.asyncFieldMap.TryGetHoistedField(captured, out hoistedField))
+            || (this.asyncIteratorEmitCtx != null && this.asyncIteratorEmitCtx.FieldMap.TryGetValue(captured, out hoistedField)))
         {
             // Load from the state machine: ldarg.0; ldfld <smStruct>::<hoistedField>
             if (!this.outer.cache.StructFieldDefs.TryGetValue(hoistedField, out var hoistedHandle))

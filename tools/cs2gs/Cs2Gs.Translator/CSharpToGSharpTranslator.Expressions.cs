@@ -32,7 +32,7 @@ public sealed partial class CSharpToGSharpTranslator
         private GExpression TranslateFieldExpression(FieldExpressionSyntax fieldExpression)
         {
             if (this.context.GetSymbolInfo(fieldExpression).Symbol is IFieldSymbol { AssociatedSymbol: IPropertySymbol owner } &&
-                this.state.FieldKeywordBackingFieldNames.TryGetValue(owner, out string backingName))
+                this.state.SynthesizedPropertyBackingFieldNames.TryGetValue(owner, out string backingName))
             {
                 return new IdentifierExpression(backingName);
             }
@@ -49,6 +49,7 @@ public sealed partial class CSharpToGSharpTranslator
             // has no G# equivalent; references to the bound local are rewritten to a
             // member access on the arm's type-pattern designator (`circle.Radius`).
             if (this.state.PatternBindings.Count > 0 &&
+                !IsDirectWrite(identifier) &&
                 this.context.GetSymbolInfo(identifier).Symbol is { } boundSymbol &&
                 this.state.PatternBindings.TryGetValue(boundSymbol, out GExpression replacement))
             {
@@ -103,6 +104,22 @@ public sealed partial class CSharpToGSharpTranslator
 
             return new IdentifierExpression(SanitizeIdentifier(identifier.Identifier.Text));
         }
+
+        private static bool IsDirectWrite(IdentifierNameSyntax identifier) =>
+            identifier.Parent switch
+            {
+                AssignmentExpressionSyntax assignment when assignment.Left == identifier => true,
+                PrefixUnaryExpressionSyntax prefix
+                    when prefix.Operand == identifier &&
+                         prefix.Kind() is SyntaxKind.PreIncrementExpression or SyntaxKind.PreDecrementExpression => true,
+                PostfixUnaryExpressionSyntax postfix
+                    when postfix.Operand == identifier &&
+                         postfix.Kind() is SyntaxKind.PostIncrementExpression or SyntaxKind.PostDecrementExpression => true,
+                ArgumentSyntax argument
+                    when argument.Expression == identifier &&
+                         argument.RefKindKeyword.Kind() is SyntaxKind.RefKeyword or SyntaxKind.OutKeyword => true,
+                _ => false,
+            };
 
         // Builds the receiver expression used to qualify a bare sibling static
         // member reference through its owning type. For a non-generic owner this is
@@ -422,14 +439,10 @@ public sealed partial class CSharpToGSharpTranslator
             // does not match against the `Ac4DsiV1?` `this` slot (GS0159). Keep the
             // declared-nullable receiver so the extension resolves.
             // A C# nullable *value* type (`T?` lowering to `System.Nullable<T>`)
-            // exposes `.Value` and `.HasValue`, but G# models a value-type `T?`
-            // directly (no `Nullable<T>` member surface) and relies on Kotlin-style
-            // smart-casts, so those members do not exist on the G# side. Rewrite
-            // them to the idiomatic G# equivalents (#914):
-            //   * `x.Value`    -> `x!!`      (assert non-null, matching C#'s throw-
-            //                                 if-null semantics; harmless once the
-            //                                 local is already smart-cast-narrowed).
-            //   * `x.HasValue` -> `x != nil` (a plain null test on the raw receiver).
+            // exposes `.Value` and `.HasValue`. Runtime lambdas use G#'s idiomatic
+            // `x!!` unwrap, but `!!` is forbidden in expression trees: retain
+            // `.Value` there so lowering produces the CLR Nullable<T>.Value
+            // property node. `HasValue` remains the plain `x != nil` null test.
             // Guard on the receiver's *declared* type being `System.Nullable<T>` so
             // a user type with a member literally named `Value`/`HasValue` is
             // unaffected. Nullable *reference* types (`string?`) have a non-
@@ -440,7 +453,10 @@ public sealed partial class CSharpToGSharpTranslator
                 switch (member.Name.Identifier.Text)
                 {
                     case "Value":
-                        return new NonNullAssertionExpression(this.TranslateExpression(member.Expression));
+                        GExpression nullableValue = this.TranslateExpression(member.Expression);
+                        return this.IsWithinExpressionTreeLambda(member.Expression)
+                            ? new MemberAccessExpression(nullableValue, "Value")
+                            : new NonNullAssertionExpression(nullableValue);
                     case "HasValue":
                         // Parenthesize the null test so it composes correctly
                         // under any surrounding operator. C# `!x.HasValue` would
@@ -546,9 +562,10 @@ public sealed partial class CSharpToGSharpTranslator
         {
             GExpression translated = this.TranslateExpression(recv);
 
-            if (this.ReceiverNeedsNullForgiveness(recv, isDereferenceReceiver: true)
-                || this.ReceiverIsNullableReferenceFieldOrProperty(recv)
-                || this.NullableReferenceValueMayBeNull(recv))
+            if (!this.IsWithinExpressionTreeLambda(recv)
+                && (this.ReceiverNeedsNullForgiveness(recv, isDereferenceReceiver: true)
+                    || this.ReceiverIsNullableReferenceFieldOrProperty(recv)
+                    || this.NullableReferenceValueMayBeNull(recv)))
             {
                 translated = new NonNullAssertionExpression(translated);
             }
@@ -779,14 +796,20 @@ public sealed partial class CSharpToGSharpTranslator
             ExpressionSyntax value,
             GExpression translated,
             ITypeSymbol targetType,
-            ISymbol targetSymbol)
+            ISymbol targetSymbol,
+            bool includePromotedValue = false)
         {
             if (translated is NonNullAssertionExpression
+                || IsNullOrSuppressedNull(value)
                 || value is PostfixUnaryExpressionSyntax
                     { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression }
+                || targetSymbol is IFieldSymbol { IsConst: true } or ILocalSymbol { IsConst: true }
                 || this.IsWithinExpressionTreeLambda(value)
                 || !this.TargetWillRemainNonNullableReference(targetType, targetSymbol)
-                || !this.NullableReferenceValueMayBeNull(value))
+                || (!this.NullableReferenceValueMayBeNull(value)
+                    && !(includePromotedValue
+                        && this.IsObliviousCompilation()
+                        && this.IsNullablePromotedValue(value))))
             {
                 return translated;
             }
@@ -826,9 +849,27 @@ public sealed partial class CSharpToGSharpTranslator
                 return true;
             }
 
-            return typeInfo.Nullability.FlowState == NullableFlowState.MaybeNull
+            bool nullableByShape = value switch
+            {
+                ParenthesizedExpressionSyntax parenthesized =>
+                    this.NullableReferenceValueMayBeNull(parenthesized.Expression),
+                CastExpressionSyntax cast =>
+                    this.NullableReferenceValueMayBeNull(cast.Expression),
+                ConditionalExpressionSyntax conditional =>
+                    this.NullableReferenceValueMayBeNull(conditional.WhenTrue)
+                        || this.NullableReferenceValueMayBeNull(conditional.WhenFalse),
+                SwitchExpressionSyntax switchExpression => switchExpression.Arms.Any(arm =>
+                    this.NullableReferenceValueMayBeNull(arm.Expression)),
+                BinaryExpressionSyntax coalesce
+                    when coalesce.IsKind(SyntaxKind.CoalesceExpression) =>
+                        this.NullableReferenceValueMayBeNull(coalesce.Right),
+                _ => false,
+            };
+
+            return nullableByShape
+                || (typeInfo.Nullability.FlowState == NullableFlowState.MaybeNull
                 && (type.NullableAnnotation == NullableAnnotation.Annotated
-                    || typeInfo.Nullability.Annotation == NullableAnnotation.Annotated);
+                    || typeInfo.Nullability.Annotation == NullableAnnotation.Annotated));
         }
 
         private (ITypeSymbol Type, ISymbol Symbol) FindContextualValueTarget(ExpressionSyntax value)
@@ -885,7 +926,8 @@ public sealed partial class CSharpToGSharpTranslator
 
         private bool IndexArgumentValueNeedsNullForgiveness(ExpressionSyntax value)
         {
-            if (value is PostfixUnaryExpressionSyntax
+            if (IsNullOrSuppressedNull(value)
+                || value is PostfixUnaryExpressionSyntax
                     { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression }
                 || this.IsWithinExpressionTreeLambda(value))
             {
@@ -1776,7 +1818,8 @@ public sealed partial class CSharpToGSharpTranslator
 
         private bool IsUnguardedForwardOfTaintedValueAsRuntimeLambdaResult(ExpressionSyntax use)
         {
-            if (!this.IsObliviousCompilation()
+            if (IsNullOrSuppressedNull(use)
+                || !this.IsObliviousCompilation()
                 || this.IsWithinExpressionTreeLambda(use)
                 || this.FindResultLambda(use) is not { } lambda
                 || this.GetLambdaTargetDelegateType(lambda) is not { DelegateInvokeMethod: { } invoke }

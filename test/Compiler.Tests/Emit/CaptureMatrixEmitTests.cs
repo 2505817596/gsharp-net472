@@ -259,6 +259,156 @@ public class CaptureMatrixEmitTests
                 Console.WriteLine(inner().Result)
             }
             """, "42\n");
+
+        yield return Row("Issue2662_ExactOahuCliApp", """
+            package Oahu.Cli.App
+            import System
+            import System.Collections.Generic
+
+            class JobUpdate {
+                var JobId string = ""
+                var Value int32 = 0
+            }
+
+            class JobScheduler {
+                init() {}
+
+                async func Drain(predicate Func[JobUpdate, bool]) IAsyncEnumerable[JobUpdate] {
+                    let update = JobUpdate()
+                    update.JobId = "job-42"
+                    update.Value = 42
+                    if predicate(update) {
+                        yield update
+                    }
+                }
+
+                async func ObserveAsync(jobId string) IAsyncEnumerable[JobUpdate] {
+                    await for u in this.Drain(u -> u.JobId == jobId) {
+                        yield u
+                    }
+                }
+            }
+
+            func Main() {
+                let e = JobScheduler().ObserveAsync("job-42").GetAsyncEnumerator()
+                if e.MoveNextAsync().AsTask().Result {
+                    Console.WriteLine(e.Current.Value)
+                }
+            }
+            """, "42\n");
+
+        yield return Row("Issue2662_ExactOahuCliAppAudibleJobExecutor_2ff82b6ad30d", """
+            package Oahu.Cli.App
+            import System
+            import System.Collections.Generic
+            import System.IO
+            import System.Threading.Tasks
+
+            class JobUpdate {
+                var Value int32 = 0
+            }
+
+            class AudibleJobExecutor {
+                async func ExecuteAsync(skip bool) IAsyncEnumerable[JobUpdate] {
+                    if skip {
+                        goto iteratorExit
+                    }
+                    using let resource = MemoryStream()
+                    let first = JobUpdate()
+                    first.Value = 42
+                    let runTask = Task.CompletedTask
+                    try {
+                        if await Task.FromResult(true) {
+                            yield first
+                        }
+                    } finally {
+                        try {
+                            await runTask
+                        } catch (Exception) {
+                        }
+                    }
+                    iteratorExit:
+                    {
+                    }
+                }
+            }
+
+            func Main() {
+                let e = AudibleJobExecutor().ExecuteAsync(false).GetAsyncEnumerator()
+                var total = 0
+                if e.MoveNextAsync().AsTask().Result {
+                    total = total + e.Current.Value
+                }
+                Console.WriteLine(total)
+            }
+            """, "42\n");
+
+        yield return Row("Issue2662_AudibleJobExecutor_YieldsOnlyTry", """
+            package Oahu.Cli.App
+            import System
+            import System.Collections.Generic
+
+            class AudibleJobExecutor {
+                async func ExecuteAsync() IAsyncEnumerable[int32] {
+                    try {
+                        yield 42
+                    } finally {
+                    }
+                }
+            }
+
+            func Main() {
+                let e = AudibleJobExecutor().ExecuteAsync().GetAsyncEnumerator()
+                if e.MoveNextAsync().AsTask().Result {
+                    Console.WriteLine(e.Current)
+                }
+            }
+            """, "42\n");
+
+        yield return Row("Issue2662_ExactOahuCliAppJsonlHistoryStore_8aff8d9048f7", """
+            package Oahu.Cli.App
+            import System
+            import System.Collections.Generic
+            import System.IO
+            import System.Threading.Tasks
+
+            class JobRecord {
+                var Value int32 = 0
+            }
+
+            class JsonlHistoryStore {
+                async func ReadAllAsync(skip bool) IAsyncEnumerable[JobRecord] {
+                    if skip {
+                        goto iteratorExit
+                    }
+                    using let reader = MemoryStream()
+                    var done = false
+                    while !done {
+                        let line = await Task.FromResult("42")
+                        var rec JobRecord? = nil
+                        try {
+                            rec = JobRecord()
+                            rec!!.Value = Int32.Parse(line)
+                        } catch (Exception) {
+                        }
+                        if rec != nil {
+                            yield rec!!
+                        }
+                        done = true
+                    }
+                    iteratorExit:
+                    {
+                    }
+                }
+            }
+
+            func Main() {
+                let e = JsonlHistoryStore().ReadAllAsync(false).GetAsyncEnumerator()
+                if e.MoveNextAsync().AsTask().Result {
+                    Console.WriteLine(e.Current.Value)
+                }
+            }
+            """, "42\n");
     }
 
     [Theory]

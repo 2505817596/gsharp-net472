@@ -426,7 +426,11 @@ public sealed partial class CSharpToGSharpTranslator
         private bool IsStaticUsingTarget(INamedTypeSymbol owner)
             => owner != null && this.staticUsingTargets.Contains(owner.OriginalDefinition);
 
-        private static Visibility MapVisibility(ISymbol symbol, TranslationContext context, SyntaxNode node)
+        private static Visibility MapVisibility(
+            ISymbol symbol,
+            TranslationContext context,
+            SyntaxNode node,
+            bool preserveStaticClassPrivate = false)
         {
             if (symbol is null)
             {
@@ -449,7 +453,7 @@ public sealed partial class CSharpToGSharpTranslator
                     // to the position default so the qualified reference still binds
                     // (a private helper of a static utility class is an internal
                     // implementation detail with no external callers to over-expose).
-                    if (IsMemberOfExtensionBearingStaticClass(symbol))
+                    if (!preserveStaticClassPrivate && IsMemberOfExtensionBearingStaticClass(symbol))
                     {
                         return Visibility.Default;
                     }
@@ -1028,19 +1032,13 @@ public sealed partial class CSharpToGSharpTranslator
             // so the member loop skips the now-lifted properties.
             ConstructorLift autoPropertyLift = ConstructorLift.None;
 
-            // A `data class`/`data struct` requires at least one field (GS0104) and
-            // derives those fields from positional/primary-constructor parameters,
-            // not from auto-properties (GS0189). A fieldless record, or a record
-            // whose data lives in body auto-properties that cannot be lifted to a
-            // primary constructor, therefore maps to a plain `class`/`struct`
-            // (ADR-0115 §B.4 / OD-T5). A record *struct* with an explicit
-            // parameter-copy constructor is the exception: it lifts to a primary
-            // `data struct` (handled by AnalyzeConstructorLift), so it is left alone
-            // — a plain G# `struct` cannot carry an explicit `init` constructor.
+            // Preserve init-only/required record properties as properties. Mutable
+            // body auto-properties may still use the existing primary-field lift,
+            // but data types now admit auto-properties and zero fields, so an
+            // unlifted property no longer forces a lossy plain-class downgrade.
             if ((kind == TypeDeclarationKind.DataClass || kind == TypeDeclarationKind.DataStruct) &&
                 node is RecordDeclarationSyntax record)
             {
-                bool fieldless = IsFieldlessRecord(record);
                 bool hasAutoPropData = RecordHasAutoPropertyDataMember(record);
                 bool hasExplicitInstanceCtor = record.Members
                     .OfType<ConstructorDeclarationSyntax>()
@@ -1058,27 +1056,6 @@ public sealed partial class CSharpToGSharpTranslator
                 if (hasAutoPropData && !hasExplicitInstanceCtor && record.ParameterList == null)
                 {
                     autoPropertyLift = this.AnalyzeAutoPropertyLift(record, symbol, kind.Value);
-                }
-
-                bool lifted = autoPropertyLift != ConstructorLift.None;
-
-                bool downgrade = kind == TypeDeclarationKind.DataClass
-                    ? (fieldless || hasAutoPropData) && !lifted
-                    : fieldless || (hasAutoPropData && !hasExplicitInstanceCtor && !lifted);
-
-                if (downgrade)
-                {
-                    kind = kind == TypeDeclarationKind.DataStruct
-                        ? TypeDeclarationKind.Struct
-                        : TypeDeclarationKind.Class;
-                    string reason = fieldless
-                        ? "a G# 'data' type requires at least one field (GS0104, ADR-0115 §B.4)"
-                        : "a G# 'data' type derives its fields from positional parameters and rejects auto-property members (GS0104/GS0189, ADR-0115 §B.4)";
-                    this.context.Report(new TranslationDiagnostic(
-                        nameof(SyntaxKind.RecordDeclaration),
-                        $"record '{node.Identifier.Text}' maps to a plain '{(kind == TypeDeclarationKind.Struct ? "struct" : "class")}' because {reason}.",
-                        node.GetLocation(),
-                        TranslationSeverity.Info));
                 }
             }
 
@@ -1425,8 +1402,10 @@ public sealed partial class CSharpToGSharpTranslator
         /// no positional primary-constructor parameters and no explicit instance
         /// constructor to conflict with (checked by the caller) — every eligible
         /// auto-property becomes one primary-constructor parameter, in
-        /// declaration order, with the property's inline initializer (if any)
-        /// carried over as the parameter's default value. Bails (returns
+        /// declaration order, with the property's inline initializer carried
+        /// over as the parameter's default value. A property without an
+        /// initializer receives <c>default(T)</c>, matching the value assigned
+        /// by C#'s synthesized parameterless record constructor. Bails (returns
         /// <see cref="ConstructorLift.None"/>) if any auto-property participates
         /// in an interface/override contract (OD-T1): a G# primary-constructor
         /// parameter is not a property, so lifting it would break the contract
@@ -1466,6 +1445,11 @@ public sealed partial class CSharpToGSharpTranslator
                     IsContractProperty(propSymbol))
                 {
                     return ConstructorLift.None;
+                }
+
+                if (propSymbol.IsRequired || propSymbol.SetMethod?.IsInitOnly == true)
+                {
+                    continue;
                 }
 
                 GTypeReference type = this.typeMapper.Map(propSymbol.Type, this.context, prop.Identifier.GetLocation());
@@ -1510,7 +1494,7 @@ public sealed partial class CSharpToGSharpTranslator
 
                 GExpression defaultValue = prop.Initializer != null
                     ? this.TranslateExpression(prop.Initializer.Value)
-                    : null;
+                    : new DefaultValueExpression(type);
 
                 primaryParameters.Add(new Parameter(SanitizeIdentifier(prop.Identifier.Text), type, defaultValue: defaultValue));
                 propertiesAsParams.Add(propSymbol);

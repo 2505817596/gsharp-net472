@@ -57,16 +57,17 @@ internal sealed partial class MethodBodyEmitter
         // Materialise the delegate with a `.ctor` MemberRef parented at the
         // constructed `Comparison<!TResult>` TypeSpec so the runtime instance
         // matches the callee's reified parameter.
-        if (conv.Expression is BoundFunctionLiteralExpression constructedDelegateLiteral
+        if (conv.Expression.Type is FunctionTypeSymbol constructedDelegateSource
             && conv.Type is ImportedTypeSymbol constructedDelegateTarget
             && constructedDelegateTarget.OpenDefinition != null
-            && constructedDelegateTarget.HasTypeParameterArgument
+            && constructedDelegateTarget.HasSubstitutableTypeArgument
             && ClrTypeUtilities.IsDelegateType(constructedDelegateTarget.ClrType))
         {
-            this.EmitFunctionLiteral(
-                constructedDelegateLiteral,
-                overrideDelegateType: null,
-                symbolicDelegateCtorRef: this.outer.memberRefs.GetConstructedDelegateCtorRef(constructedDelegateTarget));
+            this.EmitFunctionToDelegateConversion(
+                conv.Expression,
+                constructedDelegateSource,
+                constructedDelegateTarget.ClrType,
+                this.outer.memberRefs.GetConstructedDelegateCtorRef(constructedDelegateTarget));
             return;
         }
 
@@ -81,6 +82,28 @@ internal sealed partial class MethodBodyEmitter
             && conv.Type is DelegateTypeSymbol namedTargetDelegate)
         {
             this.EmitFunctionToNamedDelegateConversion(conv.Expression, namedSourceFn, namedTargetDelegate);
+            return;
+        }
+
+        // Issue #2672: an erased-lambda adapter can receive an imported named
+        // delegate while its original body expects the equivalent structural
+        // function. Rebuild the value over the named delegate's Invoke target
+        // so the adapter body and its outer delegate constructor both verify.
+        if (conv.Type is FunctionTypeSymbol delegateTargetFn
+            && conv.Expression.Type is ImportedTypeSymbol { ClrType: Type importedDelegateSource }
+            && ClrTypeUtilities.IsDelegateType(importedDelegateSource))
+        {
+            var invoke = importedDelegateSource.GetMethod("Invoke")
+                ?? throw new InvalidOperationException(
+                    $"Delegate type '{importedDelegateSource.FullName}' has no Invoke method.");
+            var ctor = this.outer.userTokens.FunctionTypeNeedsSymbolicDelegate(delegateTargetFn)
+                ? this.outer.memberRefs.GetFunctionDelegateCtorRef(delegateTargetFn)
+                : (EntityHandle)this.outer.memberRefs.GetDelegateCtorReference(
+                    this.outer.signatures.ResolveDelegateClrType(delegateTargetFn));
+            this.EmitNullGuardedDelegateToDelegateAdaptation(
+                conv.Expression,
+                this.outer.memberRefs.GetMethodReference(invoke),
+                ctor);
             return;
         }
 
@@ -552,9 +575,9 @@ internal sealed partial class MethodBodyEmitter
             $"Conversion from '{from.Name}' to '{to.Name}' is not yet supported by the emitter.");
     }
 
-    // Issues #1356/#2542: nullable return widening erases to the same CLR type,
-    // and Func's return slot is CLR-covariant for reference upcasts. Both are
-    // no-ops; parameters must remain exact.
+    // Issues #1356/#2542/#2618: reference nullability erases from parameter and
+    // return slots, and Func's return slot is CLR-covariant for reference
+    // upcasts. These conversions are representation-preserving no-ops.
     private static bool IsRepresentationPreservingFunctionConversion(
         FunctionTypeSymbol from,
         FunctionTypeSymbol to)
@@ -566,10 +589,15 @@ internal sealed partial class MethodBodyEmitter
 
         for (var i = 0; i < from.Arity; i++)
         {
-            if (from.ParameterTypes[i] != to.ParameterTypes[i])
+            if (!HaveSameReferenceRepresentation(from.ParameterTypes[i], to.ParameterTypes[i]))
             {
                 return false;
             }
+        }
+
+        if (from.ReturnType == to.ReturnType)
+        {
+            return true;
         }
 
         if (to.ReturnType is NullableTypeSymbol toNullableReturn
@@ -586,6 +614,44 @@ internal sealed partial class MethodBodyEmitter
 
         var returnConversion = Conversion.ClassifyNonStructural(from.ReturnType, to.ReturnType);
         return returnConversion.Exists && returnConversion.IsImplicit;
+    }
+
+    private static bool HaveSameReferenceRepresentation(TypeSymbol left, TypeSymbol right)
+    {
+        while (left is NullabilityAnnotatedTypeSymbol leftAnnotated)
+        {
+            left = leftAnnotated.BaseType;
+        }
+
+        while (right is NullabilityAnnotatedTypeSymbol rightAnnotated)
+        {
+            right = rightAnnotated.BaseType;
+        }
+
+        if (left is NullableTypeSymbol leftReferenceNullable
+            && Conversion.IsReferenceLikeTarget(leftReferenceNullable.UnderlyingType))
+        {
+            left = leftReferenceNullable.UnderlyingType;
+        }
+
+        if (right is NullableTypeSymbol rightReferenceNullable
+            && Conversion.IsReferenceLikeTarget(rightReferenceNullable.UnderlyingType))
+        {
+            right = rightReferenceNullable.UnderlyingType;
+        }
+
+        if (left == right)
+        {
+            return true;
+        }
+
+        if (!Conversion.IsReferenceLikeTarget(left) || !Conversion.IsReferenceLikeTarget(right))
+        {
+            return false;
+        }
+
+        return Conversion.ClassifyNonStructural(left, right).IsImplicit
+            && Conversion.ClassifyNonStructural(right, left).IsImplicit;
     }
 
     // Issue #1236: emit a lifted numeric widening between two distinct value-type
@@ -644,7 +710,7 @@ internal sealed partial class MethodBodyEmitter
         this.il.LoadLocalAddress(srcSlot);
         this.il.OpCode(ILOpCode.Call);
         this.il.Token(getValueOrDefault);
-        this.TryEmitNumericConversion(fromUnderlying, toUnderlying);
+        this.TryEmitNumericConversion(fromUnderlying, toUnderlying, conv.IsChecked);
         this.il.OpCode(ILOpCode.Newobj);
         this.il.Token(this.outer.memberRefs.GetCtorReference(toCtor));
         this.il.Branch(ILOpCode.Br, end);

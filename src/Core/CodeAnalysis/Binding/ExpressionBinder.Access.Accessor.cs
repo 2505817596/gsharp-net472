@@ -61,6 +61,21 @@ internal sealed partial class ExpressionBinder
             return qualifiedClrLiteral;
         }
 
+        // Resolve an exact CLR namespace/type path before the flat source-type
+        // fallback below can select an unrelated same-simple-name source type.
+        if (!syntax.IsNullConditional
+            && !QualifiedAccessStartsWithValue(syntax)
+            && syntax.LeftPart is NameExpressionSyntax qualifiedClrRoot
+            && syntax.RightPart is not NameExpressionSyntax)
+        {
+            ExpressionSyntax qualifiedClrMember = syntax.RightPart;
+            if (TryBindFullyQualifiedClrStaticAccess(
+                qualifiedClrRoot, ref qualifiedClrMember, out var qualifiedClrType))
+            {
+                return BindAccessorStep(null, qualifiedClrType, qualifiedClrMember);
+            }
+        }
+
         // A same-compilation SOURCE type constructed/referenced through a
         // package-qualified name — `Oahu.Decrypt.Mp4Operation(...)`,
         // `Oahu.Decrypt.Mp4Operation[TResult](...)`. Source types are visible by
@@ -1437,10 +1452,10 @@ internal sealed partial class ExpressionBinder
 
     /// <summary>
     /// Issue #687 (Option A): when a name resolves to a value but also matches an
-    /// in-scope type with the same simple name (an imported CLR class, user-defined
-    /// struct/class, or enum), surface that type so the caller can apply the
-    /// C#-style "color color" preference when the right-hand side of the accessor
-    /// is a static member of the type.
+    /// in-scope type with the same simple name (an imported/aliased CLR type,
+    /// user-defined struct/class, or enum), surface that type so the caller can
+    /// apply the C#-style "color color" preference when the right-hand side of
+    /// the accessor is a static member of the type.
     /// </summary>
     private bool TryResolveColorColorType(
         string name,
@@ -1470,6 +1485,13 @@ internal sealed partial class ExpressionBinder
                 enumSymbol = foundEnum;
                 return true;
             }
+        }
+
+        var clrType = lookupType(name);
+        if (clrType?.ClrType != null && !ReferenceEquals(clrType, TypeSymbol.Void))
+        {
+            importedClassSymbol = new ImportedClassSymbol(clrType.ClrType, leftName, references: scope.References);
+            return true;
         }
 
         if (scope.TryLookupImportedClass(name, leftName, out var importedClass))
@@ -1784,6 +1806,11 @@ internal sealed partial class ExpressionBinder
                 if (head is BoundErrorExpression)
                 {
                     return head;
+                }
+
+                if (nested.IsNullConditional)
+                {
+                    return BindNullConditionalAccessExpressionCore(head, nested.RightPart);
                 }
 
                 return BindAccessorStep(head, null, nested.RightPart);
@@ -2482,9 +2509,9 @@ internal sealed partial class ExpressionBinder
         {
             var closed = openClrType.MakeGenericType(clrArgs);
 
-            // Issue #1330: when any type argument is symbolic (an in-scope
-            // generic type parameter, or a user type with no CLR type yet), the
-            // closed CLR shape above is type-erased to `object`. Carry the
+            // Issues #1330/#2670: when any type argument is symbolic (including
+            // a nested imported generic over a same-compilation user type), the
+            // closed CLR shape above contains an object-erased slot. Carry the
             // symbolic constructed view alongside it so static-member access and
             // static calls recover symbolic member/return types
             // (`Comparer[TResult].Default : Comparer[TResult]`) and the emitter
@@ -2492,7 +2519,7 @@ internal sealed partial class ExpressionBinder
             // `Comparer<!TResult>` TypeSpec instead of the erased
             // `Comparer<object>` — yielding verifiable IL exactly as the
             // concrete-argument receiver does.
-            var symbolicReceiver = typeArgs.Any(static a => TypeSymbol.ContainsTypeParameter(a) || a.ClrType == null)
+            var symbolicReceiver = typeArgs.Any(TypeSymbol.RequiresSymbolicProjection)
                 ? ImportedTypeSymbol.GetConstructed(closed, openClrType, typeArgs)
                 : null;
             constructedImported = new ImportedClassSymbol(closed, receiverSyntax, symbolicReceiver, scope.References);
@@ -2737,9 +2764,9 @@ internal sealed partial class ExpressionBinder
 
         if (TypeMemberModel.TryGetStaticPropertyIncludingInherited(structSym, memberName, out var prop, out var propertyOwner))
         {
-            if (!AccessibilityChecker.IsAccessible(prop.Accessibility, propertyOwner, function))
+            if (!AccessibilityChecker.IsAccessible(prop.GetterAccessibility, propertyOwner, function))
             {
-                Diagnostics.ReportMemberInaccessible(ne.Location, prop.Name, propertyOwner.Name, prop.Accessibility);
+                Diagnostics.ReportMemberInaccessible(ne.Location, prop.Name, propertyOwner.Name, prop.GetterAccessibility);
             }
 
             return new BoundPropertyAccessExpression(null, receiver: null, propertyOwner, prop);
@@ -3229,6 +3256,19 @@ internal sealed partial class ExpressionBinder
             }
 
             return MakeStaticGenericCall(null);
+        }
+
+        if (structSym != null
+            && TryBindUserStructDelegateMemberInvocation(
+                receiver: null,
+                structSym,
+                methodName,
+                arguments,
+                ce,
+                isStatic: true,
+                out var delegateMemberCall))
+        {
+            return delegateMemberCall;
         }
 
         if (structSym != null

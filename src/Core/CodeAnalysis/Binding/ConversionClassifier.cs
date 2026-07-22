@@ -65,6 +65,7 @@ internal sealed class ConversionClassifier
     private readonly Func<TypeSymbol, bool> isFormattableStringTargetType;
     private readonly Func<InterpolatedStringExpressionSyntax, TypeSymbol, BoundExpression> bindInterpolatedStringAsFormattable;
     private readonly Func<BoundFunctionLiteralExpression, FunctionTypeSymbol, BoundFunctionLiteralExpression> createErasedFunctionLiteralAdapter;
+    private readonly Func<BoundClrMethodGroupExpression, FunctionTypeSymbol, BoundExpression> createClrMethodGroupAdapter;
     private readonly Func<BoundExpression, bool> isLvalue;
     private readonly Func<SyntaxToken, RefKind> getRefKindFromModifier;
     private readonly Func<RefKind, string> refKindToString;
@@ -96,6 +97,9 @@ internal sealed class ConversionClassifier
     /// wraps a function-literal expression in an erased-signature adapter
     /// for the target generic function type. Owned by the lambda binder
     /// (which holds the nested rewriter), surfaced here as a callback.</param>
+    /// <param name="createClrMethodGroupAdapter">Callback that wraps a
+    /// resolved CLR method group when its exact signature differs from the
+    /// structural function target.</param>
     /// <param name="isLvalue">Callback that classifies a bound expression
     /// as an l-value (addressable). Used by the conditional-ref-argument
     /// validator.</param>
@@ -113,6 +117,7 @@ internal sealed class ConversionClassifier
         Func<TypeSymbol, bool> isFormattableStringTargetType,
         Func<InterpolatedStringExpressionSyntax, TypeSymbol, BoundExpression> bindInterpolatedStringAsFormattable,
         Func<BoundFunctionLiteralExpression, FunctionTypeSymbol, BoundFunctionLiteralExpression> createErasedFunctionLiteralAdapter,
+        Func<BoundClrMethodGroupExpression, FunctionTypeSymbol, BoundExpression> createClrMethodGroupAdapter,
         Func<BoundExpression, bool> isLvalue,
         Func<SyntaxToken, RefKind> getRefKindFromModifier,
         Func<RefKind, string> refKindToString)
@@ -124,6 +129,7 @@ internal sealed class ConversionClassifier
         this.isFormattableStringTargetType = isFormattableStringTargetType ?? throw new ArgumentNullException(nameof(isFormattableStringTargetType));
         this.bindInterpolatedStringAsFormattable = bindInterpolatedStringAsFormattable ?? throw new ArgumentNullException(nameof(bindInterpolatedStringAsFormattable));
         this.createErasedFunctionLiteralAdapter = createErasedFunctionLiteralAdapter ?? throw new ArgumentNullException(nameof(createErasedFunctionLiteralAdapter));
+        this.createClrMethodGroupAdapter = createClrMethodGroupAdapter ?? throw new ArgumentNullException(nameof(createClrMethodGroupAdapter));
         this.isLvalue = isLvalue ?? throw new ArgumentNullException(nameof(isLvalue));
         this.getRefKindFromModifier = getRefKindFromModifier ?? throw new ArgumentNullException(nameof(getRefKindFromModifier));
         this.refKindToString = refKindToString ?? throw new ArgumentNullException(nameof(refKindToString));
@@ -516,29 +522,7 @@ internal sealed class ConversionClassifier
             // ClrType during binding, so resolve them symbolically first.
             if (TryResolveUserDefinedSymbolConversion(expression.Type, type, allowExplicit, out var userConvOp))
             {
-                var converted = userConvOp.Parameters.Length == 1
-                    ? BindConversion(diagnosticLocation, expression, userConvOp.Parameters[0].Type, allowExplicit)
-                    : expression;
-                return new BoundCallExpression(null, userConvOp, ImmutableArray.Create(converted));
-            }
-
-            // Issue #1283: lifted user-defined conversion to a nullable target.
-            // When the target is `U?` and the source `T` has a user-defined
-            // op_Implicit (or op_Explicit at an explicit position) producing the
-            // underlying `U`, apply the operator and then nullable-wrap the
-            // result (`U` -> `U?`). The recursive BindConversion call performs
-            // the standard nullable-wrap; it cannot recurse into a second
-            // user-defined operator because the produced value already has type
-            // `U`, the nullable's underlying type.
-            if (type is NullableTypeSymbol nullableTarget
-                && nullableTarget.UnderlyingType != expression.Type
-                && TryResolveUserDefinedSymbolConversion(expression.Type, nullableTarget.UnderlyingType, allowExplicit, out var liftedConvOp))
-            {
-                var liftedArg = liftedConvOp.Parameters.Length == 1
-                    ? BindConversion(diagnosticLocation, expression, liftedConvOp.Parameters[0].Type, allowExplicit)
-                    : expression;
-                var producedUnderlying = new BoundCallExpression(null, liftedConvOp, ImmutableArray.Create(liftedArg));
-                return BindConversion(diagnosticLocation, producedUnderlying, type, allowExplicit);
+                return BindUserDefinedSymbolConversion(diagnosticLocation, expression, type, userConvOp, allowExplicit);
             }
 
             // Stream E: fall back to a user-defined op_Implicit (and
@@ -590,10 +574,7 @@ internal sealed class ConversionClassifier
         {
             if (TryResolveUserDefinedSymbolConversion(expression.Type, type, allowExplicit, out var projectionUserConvOp))
             {
-                var converted = projectionUserConvOp.Parameters.Length == 1
-                    ? BindConversion(diagnosticLocation, expression, projectionUserConvOp.Parameters[0].Type, allowExplicit)
-                    : expression;
-                return new BoundCallExpression(null, projectionUserConvOp, ImmutableArray.Create(converted));
+                return BindUserDefinedSymbolConversion(diagnosticLocation, expression, type, projectionUserConvOp, allowExplicit);
             }
 
             if (expression.Type?.ClrType != null && type?.ClrType != null
@@ -792,8 +773,9 @@ internal sealed class ConversionClassifier
                     var substituted = TrySubstituteParameterTypeFromReceiver(
                         method, paramIndex, receiverType, symbolicMethodTypeArgs);
 
-                    // Issue #1512: a lambda argument bound to a generic method's
-                    // delegate parameter (e.g. `Func<Task,TResult>`) must convert
+                    // Issue #1512/#2643: a function-typed argument bound to a
+                    // generic method's delegate parameter (e.g.
+                    // `Func<Task,TResult>`) must convert
                     // to the SYMBOLIC delegate target recovered from the method's
                     // inferred type arguments (`Func<Task,T>`), not the closed CLR
                     // erasure (`Func<Task,object>`). Converting to the erased shape
@@ -810,7 +792,7 @@ internal sealed class ConversionClassifier
                     // delegate parameter closes over the method's own (still
                     // open) type argument must see the symbolic shape too.
                     if (substituted == null
-                        && (argument is BoundFunctionLiteralExpression
+                        && (argument.Type is FunctionTypeSymbol
                             || OverloadResolution.IsUnresolvedMethodGroupArgument(argument)))
                     {
                         substituted = TrySubstituteParameterTypeFromMethodTypeArgs(method, paramIndex, symbolicMethodTypeArgs);
@@ -979,8 +961,9 @@ internal sealed class ConversionClassifier
                     }
                     else if (substituted != null
                         && argument.Type != targetType
-                        && argument is not BoundFunctionLiteralExpression
-                        && !OverloadResolution.IsUnresolvedMethodGroupArgument(argument))
+                        && (!(argument is BoundFunctionLiteralExpression
+                                || OverloadResolution.IsUnresolvedMethodGroupArgument(argument))
+                            || !MemberLookup.TryGetLambdaTargetFunctionTypeFromSymbol(targetType, out _)))
                     {
                         // Issue #2391: overload resolution necessarily sees the
                         // receiver's erased CLR signature, but conversion must
@@ -1059,7 +1042,12 @@ internal sealed class ConversionClassifier
             && argument.Type != TypeSymbol.Error
             && TryResolveUserDefinedSymbolConversion(argument.Type, expectedType, allowExplicit: false, out var userConvOp))
         {
-            converted = new BoundCallExpression(null, userConvOp, ImmutableArray.Create(argument));
+            converted = BindUserDefinedSymbolConversion(
+                argument.Syntax?.Location ?? default,
+                argument,
+                expectedType,
+                userConvOp,
+                allowExplicit: false);
             return true;
         }
 
@@ -1069,7 +1057,7 @@ internal sealed class ConversionClassifier
 
     /// <summary>
     /// ADR-0087 §3 R5 / issue #765: when a method is invoked on a constructed
-    /// generic whose type arguments include user-defined symbolic types,
+    /// generic whose type arguments require symbolic projection,
     /// return the substituted symbolic parameter type for the call site so
     /// the binder does not insert a box conversion to the type-erased
     /// <see cref="object"/> shape. Returns <see langword="null"/> when no
@@ -1100,7 +1088,7 @@ internal sealed class ConversionClassifier
         TypeSymbol receiverType,
         ImmutableArray<TypeSymbol> symbolicMethodTypeArgs = default)
     {
-        // Issue #2385: the receiver type-argument gate below previously only
+        // Issues #2385/#2664: the receiver type-argument gate below previously only
         // matched a same-compilation user type when it was DIRECTLY a
         // StructSymbol/InterfaceSymbol/EnumSymbol/DelegateTypeSymbol (or
         // nested inside another ImportedTypeSymbol). A same-compilation
@@ -1112,7 +1100,7 @@ internal sealed class ConversionClassifier
         // misclassifying the argument as a boxing conversion and emitting an
         // invalid `box`/`ldnull` sequence against a value-type
         // `Nullable<T>` generic parameter slot (InvalidProgramException at
-        // runtime — see #2385). `TypeSymbol.ContainsSameCompilationUserType`
+        // runtime — see #2385). `TypeSymbol.RequiresSymbolicProjection`
         // is the general, already-established predicate for exactly this
         // shape (it recurses through NullableTypeSymbol/SliceTypeSymbol/
         // ArrayTypeSymbol/TupleTypeSymbol/nested ImportedTypeSymbol
@@ -1120,11 +1108,13 @@ internal sealed class ConversionClassifier
         // async-return-erasure bug), and is a structural superset of the old
         // ad hoc list, so replacing it here also generalizes to
         // same-compilation enums and array/tuple-wrapped shapes used as a
-        // generic type argument.
+        // generic type argument, and also retains nullable-reference
+        // annotations whose CLR type is otherwise identical to its underlying
+        // non-null reference.
         if (method == null
             || receiverType is not ImportedTypeSymbol imported
             || imported.TypeArguments.IsDefaultOrEmpty
-            || !imported.TypeArguments.Any(TypeSymbol.ContainsSameCompilationUserType))
+            || !imported.TypeArguments.Any(TypeSymbol.RequiresSymbolicProjection))
         {
             return null;
         }
@@ -1195,7 +1185,7 @@ internal sealed class ConversionClassifier
         var mapped = MemberLookup.MapOpenClrTypeToSymbolic(openParamType, openDef, imported.TypeArguments, openMethod, symbolicMethodTypeArgs);
         return mapped != null
             && mapped != TypeSymbol.Error
-            && (TypeSymbol.ContainsTypeParameter(mapped) || TypeSymbol.ContainsSameCompilationUserType(mapped))
+            && TypeSymbol.RequiresSymbolicProjection(mapped)
             ? mapped
             : null;
     }
@@ -1417,7 +1407,10 @@ internal sealed class ConversionClassifier
             var resolution = OverloadResolution.Resolve(applicable, argTypes);
             if (resolution.Outcome == OverloadResolution.ResolutionOutcome.Resolved)
             {
-                return new BoundClrMethodGroupExpression(group.Syntax, group.Receiver, resolution.Best, targetType);
+                var resolved = new BoundClrMethodGroupExpression(group.Syntax, group.Receiver, resolution.Best, targetType);
+                return targetType is FunctionTypeSymbol functionTarget
+                    ? this.createClrMethodGroupAdapter(resolved, functionTarget)
+                    : resolved;
             }
         }
 
@@ -2008,8 +2001,12 @@ internal sealed class ConversionClassifier
     /// same-package struct/class as a static <c>op_Implicit</c> /
     /// <c>op_Explicit</c> method. Searches both the source and target type's
     /// static methods, preferring implicit conversions over explicit ones, just
-    /// like C#. These symbols have no reflectible CLR type during binding, so
-    /// the lookup is symbolic.
+    /// like C#. A candidate is applicable when standard implicit conversions
+    /// reach its operand and leave its result; this admits numeric/reference
+    /// adaptation and nullable result lifting without chaining user operators.
+    /// Ambiguous candidate sets are rejected rather than depending on member
+    /// declaration order. These symbols have no reflectible CLR type during
+    /// binding, so the lookup is symbolic.
     /// </summary>
     /// <param name="sourceType">The type of the value being converted.</param>
     /// <param name="targetType">The type being converted to.</param>
@@ -2025,11 +2022,15 @@ internal sealed class ConversionClassifier
             return false;
         }
 
-        // Pass 1: implicit conversions on the source then the target type.
-        if (TryFindUserConversion(sourceType, "op_Implicit", sourceType, targetType, out method)
-            || TryFindUserConversion(targetType, "op_Implicit", sourceType, targetType, out method))
+        var foundImplicit = TryFindUserConversion(
+            sourceType,
+            targetType,
+            "op_Implicit",
+            out method,
+            out var ambiguousImplicit);
+        if (foundImplicit || ambiguousImplicit)
         {
-            return true;
+            return foundImplicit;
         }
 
         if (!allowExplicit)
@@ -2037,37 +2038,124 @@ internal sealed class ConversionClassifier
             return false;
         }
 
-        // Pass 2: explicit conversions on the source then the target type.
-        return TryFindUserConversion(sourceType, "op_Explicit", sourceType, targetType, out method)
-            || TryFindUserConversion(targetType, "op_Explicit", sourceType, targetType, out method);
+        return TryFindUserConversion(sourceType, targetType, "op_Explicit", out method, out _);
     }
 
-    private static bool TryFindUserConversion(TypeSymbol declaring, string opName, TypeSymbol source, TypeSymbol target, out FunctionSymbol method)
+    private static bool TryFindUserConversion(
+        TypeSymbol source,
+        TypeSymbol target,
+        string opName,
+        out FunctionSymbol method,
+        out bool ambiguous)
     {
         method = null;
-        var owner = (declaring as StructSymbol)?.Definition ?? declaring as StructSymbol;
-        if (owner == null || owner.StaticMethods.IsDefaultOrEmpty)
+        ambiguous = false;
+        var candidates = new List<(FunctionSymbol Method, int SourceRank, int TargetRank)>();
+        CollectUserConversions(GetUserConversionOwner(source), opName, source, target, candidates);
+        CollectUserConversions(GetUserConversionOwner(target), opName, source, target, candidates);
+        if (candidates.Count == 0)
         {
             return false;
+        }
+
+        var best = new List<FunctionSymbol>();
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var dominated = false;
+            for (var j = 0; j < candidates.Count; j++)
+            {
+                if (i == j)
+                {
+                    continue;
+                }
+
+                var other = candidates[j];
+                var candidate = candidates[i];
+                if (other.SourceRank <= candidate.SourceRank
+                    && other.TargetRank <= candidate.TargetRank
+                    && (other.SourceRank < candidate.SourceRank || other.TargetRank < candidate.TargetRank))
+                {
+                    dominated = true;
+                    break;
+                }
+            }
+
+            if (!dominated)
+            {
+                best.Add(candidates[i].Method);
+            }
+        }
+
+        if (best.Count != 1)
+        {
+            ambiguous = best.Count > 1;
+            return false;
+        }
+
+        method = best[0];
+        return true;
+    }
+
+    private static StructSymbol GetUserConversionOwner(TypeSymbol type)
+    {
+        while (type is NullableTypeSymbol nullable)
+        {
+            type = nullable.UnderlyingType;
+        }
+
+        return (type as StructSymbol)?.Definition ?? type as StructSymbol;
+    }
+
+    private static void CollectUserConversions(
+        StructSymbol owner,
+        string opName,
+        TypeSymbol source,
+        TypeSymbol target,
+        List<(FunctionSymbol Method, int SourceRank, int TargetRank)> candidates)
+    {
+        if (owner == null || owner.StaticMethods.IsDefaultOrEmpty)
+        {
+            return;
         }
 
         foreach (var candidate in owner.StaticMethods)
         {
             if (!string.Equals(candidate.Name, opName, StringComparison.Ordinal)
-                || candidate.Parameters.Length != 1)
+                || candidate.Parameters.Length != 1
+                || candidates.Any(c => ReferenceEquals(c.Method, candidate)))
             {
                 continue;
             }
 
-            if (Conversion.Classify(candidate.Parameters[0].Type, source).IsIdentity
-                && Conversion.Classify(candidate.Type, target).IsIdentity)
+            var sourceConversion = Conversion.ClassifyNonStructural(source, candidate.Parameters[0].Type);
+            var targetConversion = Conversion.ClassifyNonStructural(candidate.Type, target);
+            if (!sourceConversion.Exists || !sourceConversion.IsImplicit
+                || !targetConversion.Exists || !targetConversion.IsImplicit)
             {
-                method = candidate;
-                return true;
+                continue;
             }
-        }
 
-        return false;
+            candidates.Add((
+                candidate,
+                sourceConversion.IsIdentity ? 0 : 1,
+                targetConversion.IsIdentity ? 0 : 1));
+        }
+    }
+
+    private BoundExpression BindUserDefinedSymbolConversion(
+        TextLocation diagnosticLocation,
+        BoundExpression expression,
+        TypeSymbol targetType,
+        FunctionSymbol method,
+        bool allowExplicit)
+    {
+        var operand = BindConversion(
+            diagnosticLocation,
+            expression,
+            method.Parameters[0].Type,
+            allowExplicit: false);
+        var call = new BoundCallExpression(null, method, ImmutableArray.Create(operand));
+        return BindConversion(diagnosticLocation, call, targetType, allowExplicit);
     }
 
     /// <summary>

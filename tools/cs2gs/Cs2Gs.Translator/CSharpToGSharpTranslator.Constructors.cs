@@ -182,29 +182,6 @@ public sealed partial class CSharpToGSharpTranslator
 
             IReadOnlyList<AccessorDeclarationSyntax> declared = node.AccessorList.Accessors;
 
-            // Issue #1741: an accessor-level accessibility modifier (`{ get; private
-            // set; }`) narrows just that accessor; G# has no per-accessor
-            // accessibility, so it would silently widen back to the property's own
-            // accessibility. Diagnose the loss instead of translating it silently.
-            foreach (AccessorDeclarationSyntax accessor in declared)
-            {
-                SyntaxToken accessibilityModifier = accessor.Modifiers.FirstOrDefault(m =>
-                    m.IsKind(SyntaxKind.PrivateKeyword) ||
-                    m.IsKind(SyntaxKind.ProtectedKeyword) ||
-                    m.IsKind(SyntaxKind.InternalKeyword));
-                if (accessibilityModifier.IsKind(SyntaxKind.None))
-                {
-                    continue;
-                }
-
-                string accessorMods = string.Join(" ", accessor.Modifiers.Select(m => m.ValueText));
-                this.context.Report(new TranslationDiagnostic(
-                    accessor.Kind().ToString(),
-                    $"{displayName} accessor '{accessorMods} {accessor.Keyword.ValueText}' has narrower accessibility than the property; G# has no per-accessor accessibility, so it is widened to the property's own accessibility (ADR-0115 §B.11).",
-                    accessor.GetLocation(),
-                    TranslationSeverity.Warning));
-            }
-
             bool anyBodied = declared.Any(a => a.Body != null || a.ExpressionBody != null);
             bool hasSet = declared.Any(a => a.IsKind(SyntaxKind.SetAccessorDeclaration));
             bool hasGet = declared.Any(a => a.IsKind(SyntaxKind.GetAccessorDeclaration));
@@ -214,7 +191,7 @@ public sealed partial class CSharpToGSharpTranslator
             // maps to the canonical auto form `prop Name T` (ADR-0115 §B.11). An
             // init-only auto-property (get + init) keeps its explicit accessors so
             // the init-only semantics are preserved (issue #946).
-            if (!anyBodied && hasGet && hasSet)
+            if (!anyBodied && hasGet && hasSet && declared.All(a => a.Modifiers.Count == 0))
             {
                 return new List<PropertyAccessor>();
             }
@@ -258,6 +235,11 @@ public sealed partial class CSharpToGSharpTranslator
                     kind = AccessorKind.Set;
                 }
 
+                var accessorSymbol = this.context.GetDeclaredSymbol(accessor) as IMethodSymbol;
+                Visibility visibility = accessor.Modifiers.Count > 0
+                    ? MapVisibility(accessorSymbol, this.context, accessor, preserveStaticClassPrivate: true)
+                    : Visibility.Default;
+
                 bool bodied = accessor.Body != null || accessor.ExpressionBody != null;
                 BlockStatement body = bodied
                     ? this.TranslateBody(
@@ -296,7 +278,11 @@ public sealed partial class CSharpToGSharpTranslator
                     body = null;
                 }
 
-                accessors.Add(new PropertyAccessor(kind, body, expressionBody: arrowBody));
+                accessors.Add(new PropertyAccessor(
+                    kind,
+                    body,
+                    expressionBody: arrowBody,
+                    visibility: visibility));
             }
 
             return accessors;
@@ -1796,12 +1782,48 @@ public sealed partial class CSharpToGSharpTranslator
                     // lowers to G#'s async-iteration form `await for x in seq`
                     // (spec AwaitForRangeStmt). Without it, iterating an
                     // `IAsyncEnumerable<T>` with a plain `for` is rejected (GS0116).
+                    string loopIdentifier = SanitizeIdentifier(forEach.Identifier.Text);
+                    BlockStatement loopBody = this.TranslateStatementAsBlock(forEach.Statement);
+                    Conversion elementConversion = this.context.SemanticModel
+                        .GetForEachStatementInfo(forEach)
+                        .ElementConversion;
+                    if (!forEach.Type.IsVar && !elementConversion.IsImplicit)
+                    {
+                        string itemIdentifier = $"__foreach{this.state.DeconCounter++}";
+                        ITypeSymbol targetSymbol = this.context.GetTypeInfo(forEach.Type).Type;
+                        GTypeReference targetType = targetSymbol != null
+                            ? this.typeMapper.Map(targetSymbol, this.context, forEach.Type.GetLocation())
+                            : new NamedTypeReference(forEach.Type.ToString());
+                        GExpression converted = targetSymbol is { IsReferenceType: true }
+                            ? new BinaryExpression(
+                                new IdentifierExpression(itemIdentifier),
+                                "as",
+                                new TypeExpression(targetType))
+                            : new ConversionExpression(targetType, new IdentifierExpression(itemIdentifier));
+                        if (targetSymbol is { IsReferenceType: true, NullableAnnotation: not NullableAnnotation.Annotated })
+                        {
+                            converted = new NonNullAssertionExpression(converted);
+                        }
+
+                        var statements = new List<GStatement>(loopBody.Statements.Count + 1)
+                        {
+                            new LocalDeclarationStatement(
+                                BindingKind.Let,
+                                loopIdentifier,
+                                targetType,
+                                converted),
+                        };
+                        statements.AddRange(loopBody.Statements);
+                        loopBody = new BlockStatement(statements);
+                        loopIdentifier = itemIdentifier;
+                    }
+
                     return new[]
                     {
                         (GStatement)new ForInStatement(
-                            SanitizeIdentifier(forEach.Identifier.Text),
+                            loopIdentifier,
                             this.TranslateReceiverWithNullForgiveness(forEach.Expression),
-                            this.TranslateStatementAsBlock(forEach.Statement),
+                            loopBody,
                             isAwait: !forEach.AwaitKeyword.IsKind(SyntaxKind.None)),
                     };
 

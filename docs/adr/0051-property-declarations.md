@@ -149,7 +149,15 @@ class Foo {
 }
 ```
 
-Per-accessor accessibility modifiers (e.g., `private set`) are deferred to a follow-up phase. The initial implementation treats both accessors as having the same visibility as the property.
+An accessor may narrow the property's accessibility:
+
+```gs
+class Foo {
+    prop Name string { get; private set; }
+}
+```
+
+The getter remains public while `set_Name` is private in binding and CLR metadata.
 
 ### 5. Data struct interaction
 
@@ -174,7 +182,9 @@ data struct Rect {
 }
 ```
 
-Auto-properties inside `data struct` are diagnosed as an error — data struct construction is via struct literals that target fields directly; a backing-field auto-property would be unreachable.
+Auto-properties are supported inside `data class` and `data struct`. Composite
+literals target their setters/init accessors, while synthesized value equality,
+hashing, formatting, and deconstruction use their backing fields.
 
 ### 6. Attribute targeting
 
@@ -243,7 +253,6 @@ Negative:
 
 - New contextual keyword to learn — mitigated by its visibility only inside type bodies.
 - Two ways to expose data on a type (field vs property) — style guidance will recommend `prop` for public API surface and fields for internal/private storage.
-- Per-accessor visibility (`private set`) is deferred, limiting some patterns initially.
 
 Neutral:
 
@@ -256,11 +265,10 @@ Neutral:
 - **Annotation-based (`@property` on methods, Option B)**: Rejected as too verbose, error-prone (naming conventions), and hostile to interface declarations.
 - **`var`/`val` prefix (Option C)**: Rejected because GSharp uses `var`/`let` at statement scope with different semantics; reusing inside type bodies would confuse.
 - **All fields auto-emit as properties (Option E)**: Rejected as a breaking change and contrary to Go's explicitness philosophy.
-- **Per-accessor visibility in v1**: Deferred — adds parser/binder complexity for a feature that can be added incrementally later.
+- **Uniform accessor visibility only**: Rejected because it cannot preserve common CLR property ABIs such as a public getter with a private setter.
 
 ## Follow-ups
 
-- Per-accessor accessibility modifiers (`prop Name string { get; private set }`).
 - `prop` on extension declarations (extension properties).
 - Interaction with `inline struct` (should inline structs allow computed properties?).
 - `init`-only setter semantics (write-once in constructor, read-only thereafter).

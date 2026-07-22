@@ -42,6 +42,14 @@ public class IlVerifyRunner
         @"(?:\[(?<location>.*?)\]\s*\[offset[^\]]*\]\s*)?(?<message>.*)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    private static readonly Regex AvaloniaXamlClosureBuildPattern = new Regex(
+        @"(?:^|\+)XamlClosure_\d+::Build_\d+\(\[System\.ComponentModel\]System\.IServiceProvider\)$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex AvaloniaObjectSlotStackMismatchPattern = new Regex(
+        @"\[found ref 'object'\]\[expected ref '[^'\r\n]+'\] Unexpected type on the stack\.$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private static readonly object ToolRestoreSync = new();
     private static readonly Dictionary<string, bool> ToolAvailabilityByRepoRoot = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan DotnetToolTimeout = TimeSpan.FromMinutes(5);
@@ -206,7 +214,8 @@ public class IlVerifyRunner
         var ignored = new HashSet<string>(KnownIlVerifyFalsePositives, StringComparer.OrdinalIgnoreCase);
         return errors.Where(e =>
             (e.Code is null || !ignored.Contains(e.Code))
-            && !IsAvaloniaXamlCompilerFalsePositive(e)).ToList();
+            && !IsAvaloniaXamlCompilerFalsePositive(e)
+            && !IsAvaloniaXamlDelegateCtorFalsePositive(e)).ToList();
     }
 
     /// <summary>
@@ -259,11 +268,27 @@ public class IlVerifyRunner
         return string.IsNullOrEmpty(candidate) ? null : candidate;
     }
 
-    private static bool IsAvaloniaXamlCompilerFalsePositive(IlVerifyError error) =>
-        string.Equals(error.Code, "StackUnexpected", StringComparison.Ordinal)
-        && error.Method?.StartsWith(
-            "CompiledAvaloniaXaml.XamlIlContext+Context`1::",
-            StringComparison.Ordinal) == true;
+    private static bool IsAvaloniaXamlCompilerFalsePositive(IlVerifyError error)
+    {
+        if (!string.Equals(error.Code, "StackUnexpected", StringComparison.Ordinal)
+            || string.IsNullOrEmpty(error.Method))
+        {
+            return false;
+        }
+
+        bool generatedContextMethod = error.Method.StartsWith(
+                "CompiledAvaloniaXaml.XamlIlContext+Context`1::",
+                StringComparison.Ordinal);
+        bool generatedClosureObjectSlot = AvaloniaXamlClosureBuildPattern.IsMatch(error.Method)
+            && AvaloniaObjectSlotStackMismatchPattern.IsMatch(error.RawLine ?? string.Empty);
+        return generatedContextMethod || generatedClosureObjectSlot;
+    }
+
+    // Avalonia's XAML compiler binds static event handlers to RootObject. The
+    // byte-identical C# output fails ilverify's DelegateCtor check as well.
+    private static bool IsAvaloniaXamlDelegateCtorFalsePositive(IlVerifyError error) =>
+        string.Equals(error.Code, "DelegateCtor", StringComparison.Ordinal)
+        && error.Method?.Contains("::!XamlIlPopulate(", StringComparison.Ordinal) == true;
 
     private static IReadOnlyList<string> BuildReferenceSet(
         string assemblyPath,

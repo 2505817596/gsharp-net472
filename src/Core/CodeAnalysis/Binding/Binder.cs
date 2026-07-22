@@ -204,6 +204,7 @@ public sealed class Binder
             isFormattableStringTargetType: ExpressionBinder.IsFormattableStringTargetType,
             bindInterpolatedStringAsFormattable: (syntax, targetType) => expressions.BindInterpolatedStringAsFormattable(syntax, targetType),
             createErasedFunctionLiteralAdapter: (literal, targetFunctionType) => lambdas.CreateErasedFunctionLiteralAdapter(literal, targetFunctionType),
+            createClrMethodGroupAdapter: (group, targetFunctionType) => lambdas.CreateClrMethodGroupAdapter(group, targetFunctionType),
             isLvalue: ExpressionBinder.IsLvalue,
             getRefKindFromModifier: GetRefKindFromModifier,
             refKindToString: RefKindToString);
@@ -1935,7 +1936,9 @@ public sealed class Binder
             binder.statements.FinalizeUserLabels();
             var lowered = Lowerer.Lower(body);
 
-            if (requireAllPathsReturn && !ControlFlowGraph.AllPathsReturn(lowered))
+            if (requireAllPathsReturn
+                && !IsIteratorReturnType(accessor.Type)
+                && !ControlFlowGraph.AllPathsReturn(lowered))
             {
                 binder.Diagnostics.ReportAllPathsMustReturn(bodySyntax.OpenBraceToken.Location);
             }
@@ -1984,7 +1987,9 @@ public sealed class Binder
             binder.statements.FinalizeUserLabels();
             var lowered = Lowerer.Lower(body, structSym);
 
-            if (allPathsReturnLocation != null && !ControlFlowGraph.AllPathsReturn(lowered))
+            if (allPathsReturnLocation != null
+                && !IsIteratorReturnType(member.Type)
+                && !ControlFlowGraph.AllPathsReturn(lowered))
             {
                 binder.Diagnostics.ReportAllPathsMustReturn(allPathsReturnLocation.Value);
             }

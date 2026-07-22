@@ -148,8 +148,9 @@ internal sealed class MemberLookup
     }
 
     /// <summary>
-    /// Enumerates every public instance method on <paramref name="clrType"/>
-    /// and its transitive implemented interfaces with the given <paramref name="name"/>.
+    /// Enumerates every public instance method on <paramref name="clrType"/>,
+    /// its base chain, and its transitive implemented interfaces with the given
+    /// <paramref name="name"/>.
     /// The overload-resolution-facing variant, used by call sites that need to
     /// pass a candidate set into <see cref="OverloadResolution.Resolve"/>.
     /// Hides base-method-with-same-signature shadowing the same way C# does
@@ -160,6 +161,18 @@ internal sealed class MemberLookup
     /// <returns>The candidate list with self-slot methods first.</returns>
     public static IReadOnlyList<MethodInfo> SafeGetMethodsIncludingSelfAndInterfaces(Type clrType, string name)
     {
+        static Type GetBaseTypeSafe(Type type)
+        {
+            try
+            {
+                return type.BaseType;
+            }
+            catch (Exception ex) when (ClrTypeUtilities.IsMetadataLoadFailure(ex))
+            {
+                return null;
+            }
+        }
+
         if (clrType == null)
         {
             return Array.Empty<MethodInfo>();
@@ -186,6 +199,23 @@ internal sealed class MemberLookup
                 if (string.Equals(m.Name, n, StringComparison.Ordinal))
                 {
                     result.Add(m);
+                }
+            }
+
+            // Issues #2614 / #2638: an aggregate metadata walk may return a
+            // usable but incomplete set. Always probe each declaration level
+            // and union accessible methods without duplicating inherited slots.
+            for (var current = clrType; current != null; current = GetBaseTypeSafe(current))
+            {
+                foreach (var m in ClrTypeUtilities.SafeGetMethods(
+                    current,
+                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                {
+                    if (string.Equals(m.Name, n, StringComparison.Ordinal)
+                        && !IsMethodHiddenByExisting(result, m))
+                    {
+                        result.Add(m);
+                    }
                 }
             }
 
@@ -271,6 +301,32 @@ internal sealed class MemberLookup
         return null;
     }
 
+    /// <summary>Finds a public instance event on a CLR type or any implemented interface.</summary>
+    /// <param name="clrType">The CLR type to probe.</param>
+    /// <param name="name">The event name to match.</param>
+    /// <returns>The matching <see cref="EventInfo"/>, or <c>null</c>.</returns>
+    public static EventInfo SafeGetEventIncludingSelfAndInterfaces(Type clrType, string name)
+    {
+        if (clrType == null)
+        {
+            return null;
+        }
+
+        foreach (var type in EnumerateSelfAndInterfaces(clrType))
+        {
+            var eventInfo = ClrTypeUtilities.SafeGetEvent(
+                type,
+                name,
+                BindingFlags.Public | BindingFlags.Instance);
+            if (eventInfo != null)
+            {
+                return eventInfo;
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Issue #1181: collects the transitive closure of imported/BCL base
     /// interfaces declared on <paramref name="interfaceSymbol"/>. Delegates
@@ -298,6 +354,11 @@ internal sealed class MemberLookup
         foreach (var m in existing)
         {
             if (!string.Equals(m.Name, candidate.Name, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (m.GetGenericArguments().Length != candidate.GetGenericArguments().Length)
             {
                 continue;
             }
@@ -1005,10 +1066,9 @@ internal sealed class MemberLookup
             // Recurse through each symbolic argument's own open definition so
             // the erased closed shape becomes `IEnumerable<IEnumerator<object>>`
             // — matching the (identically erased) selector parameter type — and
-            // generic inference recovers the right `TSource`. Leaf type
-            // parameters and concrete arguments still erase to `object`, which
-            // mirrors how the selector's parameter type is erased, keeping the
-            // two shapes structurally aligned.
+            // generic inference recovers the right `TSource`. Symbolic leaves
+            // erase to `object`; concrete leaves keep their CLR identity, matching
+            // the selector parameter's erasure and keeping both shapes aligned.
             var symbolicArgs = symbolic.ToImmutable();
             Type erasedClosed =
                 TryBuildErasedClosedGeneric(openDef, openParams, symbolicArgs, contextObject)
@@ -1646,6 +1706,22 @@ internal sealed class MemberLookup
             return false;
         }
 
+        if (t is ImportedTypeSymbol imported
+            && imported.OpenDefinition is { } openDefinition
+            && !imported.TypeArguments.IsDefaultOrEmpty)
+        {
+            var contextObject = ResolveErasedObjectInContext(openDefinition);
+            erased = TryBuildErasedClosedGeneric(
+                openDefinition,
+                openDefinition.GetGenericArguments(),
+                imported.TypeArguments,
+                contextObject);
+            if (erased != null)
+            {
+                return true;
+            }
+        }
+
         if (t.ClrType != null)
         {
             erased = t.ClrType;
@@ -1748,6 +1824,9 @@ internal sealed class MemberLookup
                 // component eraser); the symbolic-argument recovery downstream
                 // re-derives the real element type for inference.
                 erased = userClass.ImportedBaseType?.ClrType ?? typeof(object);
+                return true;
+            case InterfaceSymbol:
+                erased = typeof(object);
                 return true;
             case TupleTypeSymbol tuple:
                 // Issue #1902: a query's transparent-identifier tuple
@@ -3691,21 +3770,13 @@ internal sealed class MemberLookup
     /// arguments it was constructed with (<see cref="ImportedTypeSymbol.OpenDefinition"/>
     /// / <see cref="ImportedTypeSymbol.TypeArguments"/>), instead of
     /// reflecting over the (possibly type-erased) closed
-    /// <see cref="TypeSymbol.ClrType"/>. A delegate's <c>Invoke</c> method
-    /// parameters/return map 1:1 onto the delegate type's own open generic
-    /// parameters by position (verified: <c>typeof(Func&lt;,&gt;).GetMethod("Invoke")</c>'s
-    /// parameter/return <see cref="Type"/> instances are reference-equal to
-    /// <c>typeof(Func&lt;,&gt;).GetGenericArguments()</c>), so this only needs to
-    /// substitute each such open-parameter slot with the corresponding entry
-    /// in <paramref name="typeArguments"/>. Returns <see langword="false"/>
-    /// (letting the caller fall back to the reflection-based
-    /// <see cref="TryGetDelegateFunctionType(Type, out FunctionTypeSymbol)"/>)
-    /// for any Invoke slot that is NOT directly one of the delegate's own
-    /// generic parameters (e.g. a named delegate whose Invoke signature nests
-    /// a type parameter inside another generic, such as <c>List&lt;T&gt;</c>) —
-    /// an intentionally conservative scope covering the overwhelmingly common
-    /// <c>Func</c>/<c>Action</c>/simple-named-delegate shape without
-    /// attempting general type substitution.
+    /// <see cref="TypeSymbol.ClrType"/>. The delegate's complete <c>Invoke</c>
+    /// signature is projected through
+    /// <see cref="MapOpenClrTypeToSymbolic(Type, Type, ImmutableArray{TypeSymbol}, MethodInfo, ImmutableArray{TypeSymbol})"/>.
+    /// This preserves fixed parameters and recursively substitutes nested
+    /// generic shapes such as the <c>Action&lt;Conversion&gt;</c> callback in
+    /// <c>ConvertDelegate&lt;T&gt;</c>, instead of falling back to the
+    /// delegate's object-erased closed CLR type.
     /// </summary>
     /// <param name="openDefinition">The delegate's open CLR generic definition (e.g. <c>typeof(Func&lt;,&gt;)</c>).</param>
     /// <param name="typeArguments">The symbolic type arguments the delegate was constructed with.</param>
@@ -3746,28 +3817,19 @@ internal sealed class MemberLookup
             return false;
         }
 
-        static bool TryMapSlot(Type invokeSlotType, Type openDefinitionForSlot, ImmutableArray<TypeSymbol> args, out TypeSymbol mapped)
-        {
-            if (invokeSlotType.IsGenericParameter
-                && ClrTypeUtilities.IsSameAs(invokeSlotType.DeclaringType, openDefinitionForSlot)
-                && invokeSlotType.GenericParameterPosition >= 0
-                && invokeSlotType.GenericParameterPosition < args.Length)
-            {
-                mapped = args[invokeSlotType.GenericParameterPosition];
-                return mapped != null;
-            }
-
-            mapped = null;
-            return false;
-        }
-
         var parameters = invoke.GetParameters();
         var parameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>(parameters.Length);
         var variadicBuilder = ImmutableArray.CreateBuilder<bool>(parameters.Length);
         var anyVariadic = false;
         foreach (var parameter in parameters)
         {
-            if (!TryMapSlot(parameter.ParameterType, openDefinition, typeArguments, out var mappedParam))
+            var mappedParam = MapOpenClrTypeToSymbolic(
+                parameter.ParameterType,
+                openDefinition,
+                typeArguments,
+                openMethodDefinition: null,
+                methodTypeArguments: default);
+            if (mappedParam == null || mappedParam == TypeSymbol.Error || TypeSymbol.ContainsTypeParameter(mappedParam))
             {
                 return false;
             }
@@ -3788,9 +3850,18 @@ internal sealed class MemberLookup
         {
             returnType = TypeSymbol.Void;
         }
-        else if (!TryMapSlot(invoke.ReturnType, openDefinition, typeArguments, out returnType))
+        else
         {
-            return false;
+            returnType = MapOpenClrTypeToSymbolic(
+                invoke.ReturnType,
+                openDefinition,
+                typeArguments,
+                openMethodDefinition: null,
+                methodTypeArguments: default);
+            if (returnType == null || returnType == TypeSymbol.Error || TypeSymbol.ContainsTypeParameter(returnType))
+            {
+                return false;
+            }
         }
 
         var variadicFlags = anyVariadic ? variadicBuilder.ToImmutable() : default;
@@ -3858,10 +3929,10 @@ internal sealed class MemberLookup
     /// generic whose symbolic arguments may themselves be constructed generics
     /// (e.g. <c>IEnumerable&lt;IEnumerator&lt;T&gt;&gt;</c>). Each top-level
     /// argument's <em>nested</em> generic structure is preserved by recursing
-    /// through its open definition, while leaf type parameters and concrete
-    /// leaves collapse to the context's <c>object</c> placeholder — matching the
-    /// erasure applied to selector/lambda parameter types, so generic inference
-    /// recovers the right element type for a chained extension call. Falls back
+    /// through its open definition. Symbolic leaves collapse to the context's
+    /// <c>object</c> placeholder while concrete leaves retain their CLR identity,
+    /// matching selector/lambda erasure so generic inference recovers the right
+    /// element type for a chained extension call. Falls back
     /// to a flat all-<c>object</c> erasure, then to <see langword="null"/>, when
     /// the richer construction is rejected (e.g. cross-context or constraint
     /// violations).
@@ -3923,8 +3994,9 @@ internal sealed class MemberLookup
     /// Issue #1422: projects a single symbolic type argument onto an erased CLR
     /// type in <paramref name="contextObject"/>'s load context. Nested
     /// constructed generics (carrying an <see cref="ImportedTypeSymbol.OpenDefinition"/>)
-    /// are rebuilt recursively so their generic shape survives; leaf type
-    /// parameters and other leaves collapse to <paramref name="contextObject"/>.
+    /// are rebuilt recursively so their generic shape survives; symbolic leaves
+    /// collapse to <paramref name="contextObject"/>, while concrete leaves retain
+    /// their CLR identity.
     /// Returns <see langword="null"/> when no useful erasure could be formed.
     /// </summary>
     /// <param name="symbolicArg">The symbolic type argument.</param>
@@ -3976,10 +4048,16 @@ internal sealed class MemberLookup
                 // case above.
                 return BuildErasedTupleInContext(tuple, contextObject);
             default:
-                // Concrete leaf (e.g. a fully-closed imported type): erase to the
-                // context placeholder so the shape stays in a single load context
-                // and mirrors how the same leaf is erased on the selector side.
-                return contextObject;
+                var concrete = symbolicArg.ClrType;
+                if (concrete == null)
+                {
+                    return contextObject;
+                }
+
+                return concrete.Assembly == typeof(object).Assembly
+                    && concrete.FullName is { } fullName
+                    ? contextObject.Assembly.GetType(fullName, throwOnError: false) ?? concrete
+                    : concrete;
         }
     }
 
@@ -4253,6 +4331,11 @@ internal sealed class MemberLookup
                 continue;
             }
 
+            if (m.GetGenericArguments().Length != candidate.GetGenericArguments().Length)
+            {
+                continue;
+            }
+
             var existingParams = m.GetParameters();
             var candidateParams = candidate.GetParameters();
             if (existingParams.Length != candidateParams.Length)
@@ -4461,6 +4544,37 @@ internal sealed class MemberLookup
                 && string.Equals(openDef.FullName, "System.Linq.Expressions.Expression`1", StringComparison.Ordinal))
             {
                 UnifyForMethodTypeArgs(openArgs[0], actual, openMethod, result);
+                return;
+            }
+
+            // Issue #2643: infer through the Invoke signature rather than
+            // assuming a delegate's generic arguments are its parameters plus
+            // return. Named delegates such as ConvertDelegate<T> can mix fixed,
+            // nested-generic, and type-parameter slots in an unrelated order.
+            if (actual is FunctionTypeSymbol namedDelegateFunction
+                && ClrTypeUtilities.IsDelegateType(openClr))
+            {
+                var invoke = openClr.GetMethodSafe("Invoke");
+                var invokeParameters = invoke?.GetParameters();
+                if (invokeParameters != null
+                    && invokeParameters.Length == namedDelegateFunction.ParameterTypes.Length)
+                {
+                    for (var j = 0; j < invokeParameters.Length; j++)
+                    {
+                        UnifyForMethodTypeArgs(
+                            invokeParameters[j].ParameterType,
+                            namedDelegateFunction.ParameterTypes[j],
+                            openMethod,
+                            result);
+                    }
+
+                    if (!FunctionTypeSymbol.IsVoidReturn(namedDelegateFunction.ReturnType)
+                        && !invoke.ReturnType.IsSameAs(typeof(void)))
+                    {
+                        UnifyForMethodTypeArgs(invoke.ReturnType, namedDelegateFunction.ReturnType, openMethod, result);
+                    }
+                }
+
                 return;
             }
 

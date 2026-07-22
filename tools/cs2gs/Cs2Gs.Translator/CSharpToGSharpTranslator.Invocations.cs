@@ -255,7 +255,8 @@ public sealed partial class CSharpToGSharpTranslator
                 && (this.ReceiverNeedsNullForgiveness(
                         invocation.Expression,
                         isDereferenceReceiver: true)
-                    || this.ReceiverIsNullableReferenceFieldOrProperty(invocation.Expression)))
+                    || this.ReceiverIsNullableReferenceFieldOrProperty(invocation.Expression))
+                && !this.IsWithinExpressionTreeLambda(invocation.Expression))
             {
                 target = new NonNullAssertionExpression(target);
             }
@@ -1514,6 +1515,7 @@ public sealed partial class CSharpToGSharpTranslator
             ISymbol targetSymbolForPromotionCheck)
         {
             if (translatedValue is NonNullAssertionExpression
+                || IsNullOrSuppressedNull(valueExpression)
                 || !this.TargetWillRemainNonNullableReference(
                     targetType,
                     targetSymbolForPromotionCheck))
@@ -1521,11 +1523,11 @@ public sealed partial class CSharpToGSharpTranslator
                 return translatedValue;
             }
 
-            bool needsForgiveness =
-                (this.IsObliviousCompilation() && this.IsNullablePromotedValue(valueExpression))
-                || this.IsImportedObliviousNullableMember(this.context.GetSymbolInfo(valueExpression).Symbol);
-
-            return needsForgiveness ? new NonNullAssertionExpression(translatedValue) : translatedValue;
+            return (this.NullableReferenceValueMayBeNull(valueExpression)
+                    || (this.IsObliviousCompilation()
+                        && this.IsNullablePromotedValue(valueExpression)))
+                ? new NonNullAssertionExpression(translatedValue)
+                : translatedValue;
         }
 
         // Object-initializer member assignment (`Field = value` inside `T{ ... }`
@@ -2238,6 +2240,7 @@ public sealed partial class CSharpToGSharpTranslator
             if (this.IsObliviousCompilation()
                 && targetSymbol is { IsReferenceType: true }
                 && targetSymbol.NullableAnnotation != NullableAnnotation.Annotated
+                && !IsNullOrSuppressedNull(cast.Expression)
                 && cast.Expression is not PostfixUnaryExpressionSyntax { RawKind: (int)SyntaxKind.SuppressNullableWarningExpression }
                 && this.IsNullablePromotedValue(cast.Expression))
             {
