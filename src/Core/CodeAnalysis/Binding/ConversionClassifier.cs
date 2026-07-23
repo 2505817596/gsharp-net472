@@ -66,6 +66,7 @@ internal sealed class ConversionClassifier
     private readonly Func<InterpolatedStringExpressionSyntax, TypeSymbol, BoundExpression> bindInterpolatedStringAsFormattable;
     private readonly Func<BoundFunctionLiteralExpression, FunctionTypeSymbol, BoundFunctionLiteralExpression> createErasedFunctionLiteralAdapter;
     private readonly Func<BoundClrMethodGroupExpression, FunctionTypeSymbol, BoundExpression> createClrMethodGroupAdapter;
+    private readonly Func<FunctionSymbol, TypeSymbol, TypeSymbol> getMethodGroupObservableReturnType;
     private readonly Func<BoundExpression, bool> isLvalue;
     private readonly Func<SyntaxToken, RefKind> getRefKindFromModifier;
     private readonly Func<RefKind, string> refKindToString;
@@ -100,6 +101,8 @@ internal sealed class ConversionClassifier
     /// <param name="createClrMethodGroupAdapter">Callback that wraps a
     /// resolved CLR method group when its exact signature differs from the
     /// structural function target.</param>
+    /// <param name="getMethodGroupObservableReturnType">Callback that widens
+    /// an async method's declared result to its emitted Task/ValueTask shape.</param>
     /// <param name="isLvalue">Callback that classifies a bound expression
     /// as an l-value (addressable). Used by the conditional-ref-argument
     /// validator.</param>
@@ -118,6 +121,7 @@ internal sealed class ConversionClassifier
         Func<InterpolatedStringExpressionSyntax, TypeSymbol, BoundExpression> bindInterpolatedStringAsFormattable,
         Func<BoundFunctionLiteralExpression, FunctionTypeSymbol, BoundFunctionLiteralExpression> createErasedFunctionLiteralAdapter,
         Func<BoundClrMethodGroupExpression, FunctionTypeSymbol, BoundExpression> createClrMethodGroupAdapter,
+        Func<FunctionSymbol, TypeSymbol, TypeSymbol> getMethodGroupObservableReturnType,
         Func<BoundExpression, bool> isLvalue,
         Func<SyntaxToken, RefKind> getRefKindFromModifier,
         Func<RefKind, string> refKindToString)
@@ -130,6 +134,7 @@ internal sealed class ConversionClassifier
         this.bindInterpolatedStringAsFormattable = bindInterpolatedStringAsFormattable ?? throw new ArgumentNullException(nameof(bindInterpolatedStringAsFormattable));
         this.createErasedFunctionLiteralAdapter = createErasedFunctionLiteralAdapter ?? throw new ArgumentNullException(nameof(createErasedFunctionLiteralAdapter));
         this.createClrMethodGroupAdapter = createClrMethodGroupAdapter ?? throw new ArgumentNullException(nameof(createClrMethodGroupAdapter));
+        this.getMethodGroupObservableReturnType = getMethodGroupObservableReturnType ?? throw new ArgumentNullException(nameof(getMethodGroupObservableReturnType));
         this.isLvalue = isLvalue ?? throw new ArgumentNullException(nameof(isLvalue));
         this.getRefKindFromModifier = getRefKindFromModifier ?? throw new ArgumentNullException(nameof(getRefKindFromModifier));
         this.refKindToString = refKindToString ?? throw new ArgumentNullException(nameof(refKindToString));
@@ -441,6 +446,23 @@ internal sealed class ConversionClassifier
             return createErasedFunctionLiteralAdapter(literal, targetFunctionType);
         }
 
+        // Issue #2716: a throw-expression lambda naturally has a `never`
+        // result. Shape its synthesized method to the target result type; the
+        // body still throws and therefore needs no value conversion.
+        if (expression is BoundFunctionLiteralExpression neverCandidateLiteral
+            && neverCandidateLiteral.FunctionType is FunctionTypeSymbol neverCandidateFnType
+            && neverCandidateFnType.ReturnType == TypeSymbol.Never
+            && MemberLookup.TryGetLambdaTargetFunctionTypeFromSymbol(type, out var neverTargetFnType)
+            && !ReferenceEquals(neverTargetFnType.ReturnType, TypeSymbol.Never)
+            && Conversion.Classify(neverCandidateFnType, neverTargetFnType).IsImplicit)
+        {
+            var shaped = createErasedFunctionLiteralAdapter(neverCandidateLiteral, neverTargetFnType);
+            if (!ReferenceEquals(shaped, neverCandidateLiteral))
+            {
+                return BindConversion(diagnosticLocation, shaped, type, allowExplicit);
+            }
+        }
+
         // Issue #889: a `func`/arrow literal whose natural return type carries a
         // value (e.g. `() -> called = called + 1`, inferred as `() -> int32`)
         // converts to a void-returning delegate target (System.Action, a named
@@ -568,6 +590,18 @@ internal sealed class ConversionClassifier
         if (conversion.IsIdentity)
         {
             return expression;
+        }
+
+        // Issue #2732: Nullable<T>.ClrType aliases T, but its IL stack shape
+        // remains Nullable<T>. Lower an explicit nullable-to-underlying
+        // conversion to the existing `!!` unwrap before async hoisting.
+        if (expression.Type is NullableTypeSymbol sourceNullable
+            && (NullableLifting.IsValueTypeNullable(sourceNullable)
+                || NullableLifting.IsUserValueTypeNullable(sourceNullable))
+            && Conversion.ClassifyNonStructural(sourceNullable.UnderlyingType, type).IsIdentity)
+        {
+            var unwrap = BoundUnaryOperator.Bind(SyntaxKind.BangBangToken, expression.Type);
+            return new BoundUnaryExpression(null, unwrap, expression);
         }
 
         if (conversion.IsStructuralProjection)
@@ -1361,7 +1395,7 @@ internal sealed class ConversionClassifier
         var argTypes = new Type[invokeParams.Length + (closesExtensionReceiver ? 1 : 0)];
         if (closesExtensionReceiver)
         {
-            var receiverClr = group.Receiver.Type?.ClrType;
+            var receiverClr = NullableTypeSymbol.GetEffectiveClrType(group.Receiver.Type);
             if (receiverClr == null
                 && !MemberLookup.TryProjectErasedClrType(group.Receiver.Type, out receiverClr))
             {
@@ -1467,6 +1501,11 @@ internal sealed class ConversionClassifier
             return new BoundErrorExpression(null);
         }
 
+        var targetParameterRefKinds = GetMethodGroupTargetRefKinds(
+            targetType,
+            targetParameterTypes.Length,
+            out var targetReturnRefKind);
+
         FunctionSymbol pick = null;
         StructSymbol pickOwner = null;
         ImmutableArray<TypeSymbol> pickMethodTypeArguments = default;
@@ -1489,10 +1528,21 @@ internal sealed class ConversionClassifier
                 continue;
             }
 
+            candidateReturn = getMethodGroupObservableReturnType(candidate, candidateReturn);
+            var parameterOffset = candidate.IsExtension && group.Receiver != null ? 1 : 0;
+            if (candidate.ReturnRefKind != targetReturnRefKind)
+            {
+                continue;
+            }
+
             var paramsMatch = true;
             for (var i = 0; i < targetParameterTypes.Length; i++)
             {
-                if (!AreMethodGroupTypesEquivalent(candidateParameterTypes[i], targetParameterTypes[i]))
+                if (candidate.Parameters[i + parameterOffset].RefKind != targetParameterRefKinds[i]
+                    || !TryCanonicalizeMethodGroupType(
+                        candidateParameterTypes[i],
+                        targetParameterTypes[i],
+                        out candidateParameterTypes[i]))
                 {
                     paramsMatch = false;
                     break;
@@ -1504,7 +1554,10 @@ internal sealed class ConversionClassifier
                 continue;
             }
 
-            if (!AreMethodGroupTypesEquivalent(candidateReturn, targetReturnType))
+            if (!TryCanonicalizeMethodGroupType(
+                candidateReturn,
+                targetReturnType,
+                out candidateReturn))
             {
                 continue;
             }
@@ -2264,11 +2317,52 @@ internal sealed class ConversionClassifier
         return ClrTypeUtilities.IsAssignableByName(invokeReturn, methodReturn);
     }
 
-    private static bool AreMethodGroupTypesEquivalent(TypeSymbol left, TypeSymbol right)
-        => ReferenceEquals(left, right)
-            || (left?.ClrType != null
-                && right?.ClrType != null
-                && ClrTypeUtilities.AreSame(left.ClrType, right.ClrType));
+    private static bool TryCanonicalizeMethodGroupType(
+        TypeSymbol actual,
+        TypeSymbol expected,
+        out TypeSymbol canonical)
+    {
+        canonical = actual;
+        if (TypeSymbol.AreRuntimeEquivalentIgnoringReferenceNullability(actual, expected))
+        {
+            return true;
+        }
+
+        return MemberLookup.TryCanonicalizeStructuralFunctionType(actual, expected, out canonical)
+            && actual.ClrType != null
+            && expected.ClrType != null
+            && ClrTypeUtilities.AreSame(actual.ClrType, expected.ClrType);
+    }
+
+    private static ImmutableArray<RefKind> GetMethodGroupTargetRefKinds(
+        TypeSymbol targetType,
+        int parameterCount,
+        out RefKind returnRefKind)
+    {
+        returnRefKind = RefKind.None;
+        if (targetType is DelegateTypeSymbol userDelegate)
+        {
+            return userDelegate.Parameters.Select(parameter => parameter.RefKind).ToImmutableArray();
+        }
+
+        var invoke = targetType?.ClrType != null && ClrTypeUtilities.IsDelegateType(targetType.ClrType)
+            ? targetType.ClrType.GetMethodSafe("Invoke")
+            : null;
+        if (invoke == null)
+        {
+            return ImmutableArray.CreateRange(Enumerable.Repeat(RefKind.None, parameterCount));
+        }
+
+        returnRefKind = invoke.ReturnType.IsByRef ? RefKind.Ref : RefKind.None;
+        return invoke.GetParameters().Select(parameter =>
+            !parameter.ParameterType.IsByRef
+                ? RefKind.None
+                : parameter.IsOut
+                    ? RefKind.Out
+                    : parameter.IsIn
+                        ? RefKind.In
+                        : RefKind.Ref).ToImmutableArray();
+    }
 
     // ADR-0062: an inner ref-kind modifier on a conditional ref-argument branch
     // must agree with the outer modifier text (`ref`, `out`, `in`, or `&`).
@@ -2405,7 +2499,28 @@ internal sealed class ConversionClassifier
             inner = bce.Expression;
         }
 
-        if (inner is BoundLiteralExpression lit)
+        if (ExpressionBinder.IsIntegerType(inner.Type)
+            && ExpressionBinder.TryGetConstantIntegerValue(inner, out var integerValue)
+            && TryGetIntegralMetadataTarget(parameterType, out var integralTarget))
+        {
+            if (integralTarget == TypeSymbol.Char
+                && integerValue >= char.MinValue
+                && integerValue <= char.MaxValue)
+            {
+                value = (char)(ushort)integerValue;
+                return true;
+            }
+
+            if (ExpressionBinder.TryAdaptIntegerLiteral(integerValue, integralTarget, out value))
+            {
+                return true;
+            }
+
+            reason = $"integer constant '{integerValue}' is outside the range of parameter type '{parameterType.Name}'.";
+            value = null;
+            return false;
+        }
+        else if (inner is BoundLiteralExpression lit)
         {
             value = lit.Value;
         }
@@ -2437,28 +2552,95 @@ internal sealed class ConversionClassifier
             return false;
         }
 
-        // Numeric / bool / char / string / enum-underlying types are CLR Constant-table representable.
-        switch (value)
+        if (!Conversion.Classify(inner.Type, parameterType).IsImplicit)
         {
-            case bool:
-            case sbyte:
-            case byte:
-            case short:
-            case ushort:
-            case int:
-            case uint:
-            case long:
-            case ulong:
-            case float:
-            case double:
-            case char:
-            case string:
-                return true;
-            default:
-                reason = $"the default value type '{value.GetType().Name}' is not representable in CLR parameter metadata.";
-                value = null;
-                return false;
+            reason = $"the default value of type '{inner.Type.Name}' is not implicitly convertible to parameter type '{parameterType.Name}'.";
+            value = null;
+            return false;
         }
+
+        return TryNormalizeMetadataConstant(value, parameterType, out value, out reason);
+    }
+
+    private static bool TryGetIntegralMetadataTarget(TypeSymbol parameterType, out TypeSymbol target)
+    {
+        target = parameterType is NullableTypeSymbol nullable ? nullable.UnderlyingType : parameterType;
+        if (target is EnumSymbol enumType)
+        {
+            target = enumType.UnderlyingType;
+        }
+        else if (target.ClrType is System.Type { IsEnum: true } clrEnum)
+        {
+            target = TypeSymbol.FromClrType(Enum.GetUnderlyingType(clrEnum));
+        }
+
+        return target == TypeSymbol.Char || ExpressionBinder.IsIntegerType(target);
+    }
+
+    // Constant rows carry the parameter's converted primitive value, not the
+    // source literal's type (for example, `int64 x = 1` requires an I8 row).
+    private static bool TryNormalizeMetadataConstant(object value, TypeSymbol parameterType, out object normalized, out string reason)
+    {
+        normalized = null;
+        reason = null;
+        var target = parameterType is NullableTypeSymbol nullable ? nullable.UnderlyingType : parameterType;
+
+        try
+        {
+            if (target.ClrType is System.Type clrType && TryNormalizeClrConstant(value, clrType, out normalized))
+            {
+                return true;
+            }
+            else if (target is EnumSymbol)
+            {
+                normalized = Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else if ((target == TypeSymbol.NInt || target == TypeSymbol.NUInt)
+                && value is sbyte or byte or short or ushort or int or uint or long or ulong)
+            {
+                normalized = value;
+            }
+        }
+        catch (Exception)
+        {
+            normalized = null;
+        }
+
+        if (normalized != null)
+        {
+            return true;
+        }
+
+        reason = $"the default value type '{value.GetType().Name}' is not representable for parameter type '{parameterType.Name}' in CLR metadata.";
+        return false;
+    }
+
+    private static bool TryNormalizeClrConstant(object value, System.Type targetType, out object normalized)
+    {
+        normalized = null;
+        if (targetType.IsEnum)
+        {
+            targetType = Enum.GetUnderlyingType(targetType);
+        }
+
+        normalized = Type.GetTypeCode(targetType) switch
+        {
+            TypeCode.Boolean when value is bool => value,
+            TypeCode.Char when value is char => value,
+            TypeCode.SByte => Convert.ToSByte(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.Byte => Convert.ToByte(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.Int16 => Convert.ToInt16(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.UInt16 => Convert.ToUInt16(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.Int32 => Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.UInt32 => Convert.ToUInt32(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.Int64 => Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.UInt64 => Convert.ToUInt64(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.Single => Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.Double => Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture),
+            TypeCode.String when value is string => value,
+            _ => null,
+        };
+        return normalized != null;
     }
 
     // Issue #1182: extracts the constant default for a value-type `default(T)` /

@@ -245,7 +245,7 @@ internal sealed partial class DeclarationBinder
 
         BindStructInstanceMethods(syntax, package, structSymbol, baseBinding, memberBinding);
         BindStructProperties(syntax, package, structSymbol, memberBinding);
-        BindStructEvents(syntax, package, structSymbol, memberBinding);
+        BindStructEvents(syntax, package, structSymbol, baseBinding, memberBinding);
         BindStructSharedBlock(syntax, package, structSymbol, fieldBinding, memberBinding);
         RegisterStructConversionOperators(package, memberBinding.PendingConversionOperators);
         RegisterStructDeferredInitializers(package, structSymbol, fieldBinding);
@@ -333,7 +333,13 @@ internal sealed partial class DeclarationBinder
                 // `@Attr` annotations same as any other parameter list.
                 BindAndAttachParameterAttributes(paramSyntax, primaryCtorParam);
                 ctorBuilder.Add(primaryCtorParam);
-                fields.Add(new FieldSymbol(paramName, paramType, Accessibility.Public, isReadOnly: syntax.IsInline));
+
+                // Data-type positional members are CLR properties (matching
+                // C# records); their backing fields are synthesized below.
+                if (!syntax.IsData)
+                {
+                    fields.Add(new FieldSymbol(paramName, paramType, Accessibility.Public, isReadOnly: syntax.IsInline));
+                }
             }
 
             // ADR-0101 follow-up / issue #819: at most one variadic primary-ctor
@@ -1314,10 +1320,36 @@ internal sealed partial class DeclarationBinder
         var methodNames = memberBinding.MethodNames;
         var explicitInterfaceClauseNames = memberBinding.ExplicitInterfaceClauseNames;
 
-        // ADR-0051: bind property declarations.
-        if (!syntax.Properties.IsDefaultOrEmpty)
+        // ADR-0051: bind property declarations. Positional data members are
+        // synthesized as public get/init auto-properties so peer-language
+        // consumers see the same ABI as C# records.
+        if (!syntax.Properties.IsDefaultOrEmpty || (structSymbol.IsData && structSymbol.HasPrimaryConstructor))
         {
             var propertiesBuilder = ImmutableArray.CreateBuilder<PropertySymbol>();
+            if (structSymbol.IsData && structSymbol.HasPrimaryConstructor)
+            {
+                foreach (var parameter in structSymbol.PrimaryConstructorParameters)
+                {
+                    var property = new PropertySymbol(
+                        parameter.Name,
+                        parameter.Type,
+                        Accessibility.Public,
+                        hasGetter: true,
+                        hasSetter: true,
+                        isAutoProperty: true,
+                        isVirtual: false,
+                        isOverride: false,
+                        isInitOnly: true);
+                    property.BackingField = new FieldSymbol(
+                        $"<{parameter.Name}>k__BackingField",
+                        parameter.Type,
+                        structSymbol.IsClass ? Accessibility.Private : Accessibility.Internal,
+                        isReadOnly: false);
+                    propertiesBuilder.Add(property);
+                    existingNames.Add(parameter.Name);
+                }
+            }
+
             foreach (var propSyntax in syntax.Properties)
             {
                 // ADR-0118 / issue #944: an indexer member (`prop this[…] T`)
@@ -1621,6 +1653,7 @@ internal sealed partial class DeclarationBinder
         StructDeclarationSyntax syntax,
         PackageSymbol package,
         StructSymbol structSymbol,
+        StructBaseBindingResult baseBinding,
         StructMemberBindingContext memberBinding)
     {
         var existingNames = memberBinding.ExistingNames;
@@ -1664,6 +1697,11 @@ internal sealed partial class DeclarationBinder
                 {
                     continue;
                 }
+
+                handlerType = CanonicalizeInterfaceEventHandlerType(
+                    baseBinding,
+                    eventName,
+                    handlerType);
 
                 var eventAccessibility = resolveAccessibility(eventSyntax.AccessibilityModifier);
                 bool isFieldLike = eventSyntax.OpenBraceToken == null;
@@ -1847,6 +1885,98 @@ internal sealed partial class DeclarationBinder
 
             structSymbol.SetEvents(eventsBuilder.ToImmutable());
         }
+    }
+
+    private static TypeSymbol CanonicalizeInterfaceEventHandlerType(
+        StructBaseBindingResult baseBinding,
+        string eventName,
+        TypeSymbol handlerType)
+    {
+        if (handlerType is not FunctionTypeSymbol)
+        {
+            return handlerType;
+        }
+
+        TypeSymbol selected = null;
+        var ambiguous = false;
+
+        void Consider(TypeSymbol expected)
+        {
+            if (!MemberLookup.TryCanonicalizeStructuralFunctionType(
+                handlerType,
+                expected,
+                out var canonical))
+            {
+                return;
+            }
+
+            if (selected == null)
+            {
+                selected = canonical;
+            }
+            else if (!NamedDelegateIdentitiesMatch(selected, canonical))
+            {
+                ambiguous = true;
+            }
+        }
+
+        foreach (var iface in baseBinding.ImplementedInterfaces)
+        {
+            foreach (var interfaceEvent in (iface.Definition ?? iface).Events)
+            {
+                if (interfaceEvent.Name == eventName)
+                {
+                    Consider(interfaceEvent.Type);
+                }
+            }
+        }
+
+        foreach (var ifaceSymbol in baseBinding.ImplementedClrInterfaces)
+        {
+            var declaredInterface = ifaceSymbol?.ClrType;
+            if (declaredInterface?.IsInterface != true)
+            {
+                continue;
+            }
+
+            var interfaces = new List<Type> { declaredInterface };
+            interfaces.AddRange(declaredInterface.GetInterfaces());
+            foreach (var clrInterface in interfaces)
+            {
+                var containingType = ReferenceEquals(clrInterface, declaredInterface)
+                    ? ifaceSymbol
+                    : TypeSymbol.FromClrType(clrInterface);
+                foreach (var interfaceEvent in clrInterface.GetEvents(
+                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                {
+                    if (interfaceEvent.Name == eventName)
+                    {
+                        Consider(MemberLookup.GetClrEventHandlerTypeSymbol(
+                            containingType,
+                            interfaceEvent));
+                    }
+                }
+            }
+        }
+
+        return ambiguous ? handlerType : selected ?? handlerType;
+    }
+
+    private static bool NamedDelegateIdentitiesMatch(TypeSymbol left, TypeSymbol right)
+    {
+        if (ReferenceEquals(left, right))
+        {
+            return true;
+        }
+
+        if (left is DelegateTypeSymbol && right is DelegateTypeSymbol)
+        {
+            return TypeSignaturesEquivalent(left, right);
+        }
+
+        return left?.ClrType != null
+            && right?.ClrType != null
+            && ClrTypeUtilities.AreSame(left.ClrType, right.ClrType);
     }
 
     private void BindStructSharedBlock(

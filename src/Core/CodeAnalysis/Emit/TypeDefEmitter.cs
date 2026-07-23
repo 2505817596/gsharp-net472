@@ -286,9 +286,15 @@ internal sealed class TypeDefEmitter
 
             var sigBlob = new BlobBuilder();
             this.encodeTypeSymbol(new BlobEncoder(sigBlob).FieldSignature(), prop.Type);
+            var attributes = AccessibilityMap.MapFieldAccessibility(prop.BackingField.Accessibility);
+            if (prop.BackingField.IsReadOnly)
+            {
+                attributes |= FieldAttributes.InitOnly;
+            }
+
             var backingHandle = this.emitCtx.Metadata.AddFieldDefinition(
-                attributes: FieldAttributes.Private,
-                name: this.emitCtx.Metadata.GetOrAddString($"<{prop.Name}>k__BackingField"),
+                attributes,
+                name: this.emitCtx.Metadata.GetOrAddString(prop.BackingField.Name),
                 signature: this.emitCtx.Metadata.GetOrAddBlob(sigBlob));
             if (firstField.IsNil)
             {
@@ -1062,22 +1068,11 @@ internal sealed class TypeDefEmitter
         {
             var p = delegateSym.Parameters[i];
 
-            // ADR-0060 §12: stamp the Parameter row with .Out / .In for ref-kind delegate
-            // parameters, and attach IsReadOnlyAttribute for `in`.
-            var paramAttributes = ParameterAttributes.None;
-            if (p.RefKind == RefKind.Out)
-            {
-                paramAttributes |= ParameterAttributes.Out;
-            }
-            else if (p.RefKind == RefKind.In)
-            {
-                paramAttributes |= ParameterAttributes.In;
-            }
-
-            var paramHandle = this.emitCtx.Metadata.AddParameter(
-                attributes: paramAttributes,
-                name: this.emitCtx.Metadata.GetOrAddString(p.Name ?? $"arg{i + 1}"),
-                sequenceNumber: (ushort)(i + 1));
+            var paramHandle = ParameterMetadataEmitter.AddParameter(
+                this.emitCtx,
+                p,
+                i + 1,
+                fallbackName: $"arg{i + 1}");
             invokeParamHandles.Add(paramHandle);
 
             if (p.RefKind == RefKind.In)
@@ -1306,20 +1301,7 @@ internal sealed class TypeDefEmitter
         for (var i = 0; i < parameters.Length; i++)
         {
             var p = parameters[i];
-            var paramAttributes = ParameterAttributes.None;
-            if (p.RefKind == RefKind.Out)
-            {
-                paramAttributes |= ParameterAttributes.Out;
-            }
-            else if (p.RefKind == RefKind.In)
-            {
-                paramAttributes |= ParameterAttributes.In;
-            }
-
-            var paramHandle = this.emitCtx.Metadata.AddParameter(
-                attributes: paramAttributes,
-                name: this.emitCtx.Metadata.GetOrAddString(p.Name ?? string.Empty),
-                sequenceNumber: i + 1);
+            var paramHandle = ParameterMetadataEmitter.AddParameter(this.emitCtx, p, i + 1);
             handles.Add(paramHandle);
 
             if (p.RefKind == RefKind.In)
@@ -1628,19 +1610,8 @@ internal sealed class TypeDefEmitter
         for (var i = 0; i < parameters.Length; i++)
         {
             var p = parameters[i];
-            var attributes = p.HasExplicitDefaultValue
-                ? ParameterAttributes.Optional | ParameterAttributes.HasDefault
-                : ParameterAttributes.None;
-            var paramHandle = this.emitCtx.Metadata.AddParameter(
-                attributes: attributes,
-                name: this.emitCtx.Metadata.GetOrAddString(p.Name ?? string.Empty),
-                sequenceNumber: i + 1);
+            var paramHandle = ParameterMetadataEmitter.AddParameter(this.emitCtx, p, i + 1);
             handles.Add(paramHandle);
-
-            if (p.HasExplicitDefaultValue)
-            {
-                this.emitCtx.Metadata.AddConstant(paramHandle, p.ExplicitDefaultValue);
-            }
 
             if (p.IsVariadic)
             {
@@ -1653,24 +1624,26 @@ internal sealed class TypeDefEmitter
     }
 
     /// <summary>
-    /// Issue #306: emits a class constructor materialized from an explicit
+    /// Issue #306 / #2766: emits a class or plain-struct constructor materialized from an explicit
     /// <c>init(...)</c> declaration. The body first chains to the resolved base
     /// constructor (either the explicit <c>: base(args)</c> initializer or the
     /// conventional parameterless chain) and then runs the bound constructor
     /// body, which sees <c>this</c>, the constructor parameters, and the class's
     /// fields (as bare names).
     /// </summary>
-    /// <param name="classSym">The class whose explicit constructor is being emitted.</param>
-    /// <param name="ctor">The specific explicit ctor overload to emit. When <see langword="null"/> the legacy single-ctor entry on the class is used.</param>
+    /// <param name="classSym">The aggregate whose explicit constructor is being emitted.</param>
+    /// <param name="ctor">The specific explicit ctor overload to emit. When <see langword="null"/> the legacy single-ctor entry on the aggregate is used.</param>
     /// <returns>The emitted constructor's MethodDef handle.</returns>
     public MethodDefinitionHandle EmitClassConstructorWithBody(StructSymbol classSym, ConstructorSymbol ctor = null)
     {
         ctor ??= classSym.ExplicitConstructor;
         var function = ctor.Function;
         var init = ctor.BaseInitializer;
-        var baseCtorToken = init != null
-            ? this.GetBaseInitializerCtorToken(classSym, init)
-            : this.GetBaseCtorToken(classSym);
+        var baseCtorToken = classSym.IsClass
+            ? init != null
+                ? this.GetBaseInitializerCtorToken(classSym, init)
+                : this.GetBaseCtorToken(classSym)
+            : default;
 
         int bodyOffset = -1;
         if (!this.emitCtx.MetadataOnly)

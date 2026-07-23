@@ -1085,41 +1085,11 @@ internal sealed class LambdaBinder
             return element;
         }
 
-        // Issue #1785 / #2026 / #2232 / #2381: a same-compilation user type
-        // anywhere in the element's structure — a bare struct/enum/interface/
-        // delegate, a nullable wrapping one, a tuple element, an array/slice
-        // element (`[]DiagnosticCheck`, `[N]DiagnosticCheck`), or an imported
-        // generic type argument (`List[DiagnosticCheck]`,
-        // `Dictionary[string,DiagnosticCheck]`, arbitrarily nested) — must
-        // route through the symbolic Task<T> construction below rather than
-        // the ordinary reflection-based `taskOpen.MakeGenericType(element.
-        // ClrType)` path further down. Two distinct CLR-type shapes trigger
-        // this, both signalling "not really closed yet":
-        //   - a genuinely null ClrType (bare struct/enum/interface/tuple/
-        //     array/slice — `SliceTypeSymbol`/`ArrayTypeSymbol`'s CLR shape is
-        //     computed ONCE, at construction, as `elementType.ClrType?.
-        //     MakeArrayType()`, so it stays null forever once captured before
-        //     the element's TypeBuilder closes);
-        //   - a NON-null but OBJECT-ERASED ClrType (an imported generic like
-        //     `List<>` closed over a still-building same-compilation argument
-        //     resolves via reflection to `List<object>`, since imported
-        //     generics do not report a null ClrType the way same-compilation
-        //     types do).
-        // `ContainsSameCompilationUserType` (recursing through nullable/
-        // array/slice/tuple/imported-generic wrappers via `GetWrappedTypes`)
-        // and the emitter's `ArgIsSymbolicUserDefined` (the same recursive
-        // shape, reused so the async function's OBSERVABLE return type used
-        // for lambda/delegate target typing — e.g. `Task.Run(() ->
-        // RunAsync())`'s `TResult` inference — matches the REAL closed
-        // generic the kickoff method's CLR signature carries after emission)
-        // together detect both shapes regardless of which one `element.
-        // ClrType` happens to report. A still-OPEN generic type parameter
-        // (e.g. the caller's own `U` substituted in for a generic async
-        // callee's declared return type, or a constructed generic like
-        // `Box[U]`) is handled by the sibling `ContainsTypeParameter` check.
-        if ((TypeSymbol.ContainsSameCompilationUserType(element)
-            || GSharp.Core.CodeAnalysis.Emit.ReflectionMetadataEmitter.ArgIsSymbolicUserDefined(element)
-            || TypeSymbol.ContainsTypeParameter(element))
+        // Issues #1785/#2026/#2232/#2381/#2713: use the same symbolic-shape
+        // predicate as TupleTypeSymbol. This includes type parameters,
+        // same-compilation user types, and nullable-reference annotations
+        // whose information cannot be recovered from a CLR Type.
+        if (TypeSymbol.RequiresSymbolicProjection(element)
             && Scope.References.TryResolveType(wrapperOpenName, out var symbolicTaskOpen))
         {
             // Issue #502 / #320: a user-defined async result type has no CLR
@@ -2013,7 +1983,9 @@ internal sealed class LambdaBinder
                         new BoundReturnStatement(rewritten.Syntax, expression: null)));
             }
 
-            if (rewritten.Expression.Type == this.adapterReturnType)
+            // A bottom-typed return never reaches the target slot.
+            if (rewritten.Expression.Type == this.adapterReturnType
+                || rewritten.Expression.Type == TypeSymbol.Never)
             {
                 return rewritten;
             }

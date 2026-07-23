@@ -1095,8 +1095,8 @@ public sealed partial class CSharpToGSharpTranslator
                 ? autoPropertyLift
                 : this.AnalyzeConstructorLift(node, mergedMembers, symbol, kind.Value);
 
-            // Issues #1990/#2435: G# value aggregates have no explicit `init`
-            // member, but a C# struct constructor whose complete effect is a
+            // Issues #1990/#2435: G# data structs have no explicit `init`
+            // member, but a C# record-struct constructor whose complete effect is a
             // once-only set of member assignments can still be represented at
             // every call site as a struct literal. Keep the struct and omit those
             // constructor declarations; BuildObjectCreationCore resolves the
@@ -1106,7 +1106,7 @@ public sealed partial class CSharpToGSharpTranslator
             // the type or changing value semantics via a class downgrade.
             HashSet<ConstructorDeclarationSyntax> callSiteLoweredStructConstructors = null;
             if (!lift.DropConstructor &&
-                (kind == TypeDeclarationKind.Struct || kind == TypeDeclarationKind.DataStruct) &&
+                kind == TypeDeclarationKind.DataStruct &&
                 mergedMembers.OfType<ConstructorDeclarationSyntax>().Any(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword)))
             {
                 callSiteLoweredStructConstructors = new HashSet<ConstructorDeclarationSyntax>();
@@ -1136,13 +1136,13 @@ public sealed partial class CSharpToGSharpTranslator
                 {
                     this.context.ReportUnsupported(
                         node,
-                        $"'{node.Identifier.Text}' has no canonical G# form: it is a '{(kind == TypeDeclarationKind.DataStruct ? "record struct" : "struct")}' with an instance constructor that cannot be lowered to call-site struct literals. {unsupportedConstructorReason} A G# struct/data struct admits no explicit 'init(...)' constructor by design (ADR-0115 §B.5, §B.14; issues #1990 and #2435). Silently mapping it to a class would change value semantics to reference semantics (Equals/GetHashCode become reference-identity, default(T) becomes null, copies become aliases, storage becomes heap-allocated), so it is not auto-translated.");
+                        $"'{node.Identifier.Text}' has no canonical G# form: it is a record struct with an instance constructor that cannot be lowered to call-site struct literals. {unsupportedConstructorReason} A G# data struct admits no explicit 'init(...)' constructor by design (ADR-0115 §B.5, §B.14; issues #1990 and #2435). Silently mapping it to a class would change value semantics to reference semantics (Equals/GetHashCode become reference-identity, default(T) becomes null, copies become aliases, storage becomes heap-allocated), so it is not auto-translated.");
                     return null;
                 }
 
                 this.context.Report(new TranslationDiagnostic(
                     nameof(SyntaxKind.ConstructorDeclaration),
-                    $"struct '{node.Identifier.Text}' constructor overloads are lowered at their call sites to G# struct literals because G# value aggregates have no explicit 'init(...)' members (issue #2435).",
+                    $"record struct '{node.Identifier.Text}' constructor overloads are lowered at their call sites to G# struct literals because G# data structs have no explicit 'init(...)' members (issue #2435).",
                     node.GetLocation(),
                     TranslationSeverity.Info));
             }
@@ -1535,6 +1535,15 @@ public sealed partial class CSharpToGSharpTranslator
             INamedTypeSymbol symbol,
             TypeDeclarationKind kind)
         {
+            // Issues #2746/#2766: replacing any explicit class or plain-struct constructor with a G#
+            // primary constructor changes its CLR contract. Assignment-target
+            // names replace source parameter names, and private fields become
+            // public. Keep both on the normal constructor/member paths.
+            if (kind == TypeDeclarationKind.Class || kind == TypeDeclarationKind.Struct)
+            {
+                return ConstructorLift.None;
+            }
+
             // A C# `record struct` with an explicit (non-positional) constructor
             // cannot keep an in-body `init` member: the G# parser only accepts a
             // primary constructor on a `data struct`. Such a record-struct
@@ -1624,23 +1633,8 @@ public sealed partial class CSharpToGSharpTranslator
                         targetType = propertySymbol.Type;
                         targetProperty = propertySymbol;
 
-                        // OD-T1: G# primary-constructor parameters are NOT
-                        // properties, so a *class* that copies a constructor
-                        // parameter into a property which satisfies an interface or
-                        // overridden-member contract cannot lift — dropping the
-                        // property member would break the contract (GS0187) and
-                        // cascade to GS0214/GS0183 on derived/override members. Keep
-                        // the explicit `init(...)` so the get-only auto-property
-                        // survives (emitted as init-only `{ get; init; }`). A
-                        // property that is *not* a contract member is still lifted to
-                        // the primary constructor (the L1 canonical form). Value
-                        // types always lift: a G# `struct`/`data struct` cannot carry
-                        // an in-body `init` (ADR-0115 §B.3 / B.6 / T2).
-                        if (kind == TypeDeclarationKind.Class &&
-                            IsContractProperty(propertySymbol))
-                        {
-                            return ConstructorLift.None;
-                        }
+                        // Value types still lift because G# `struct`/`data struct`
+                        // cannot carry an in-body `init` (ADR-0115 §B.3 / B.6 / T2).
                     }
                     else
                     {

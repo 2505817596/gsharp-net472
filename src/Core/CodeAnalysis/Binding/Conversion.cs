@@ -153,6 +153,9 @@ public sealed class Conversion
         // conversion as identity rather than reporting a confusing "Cannot
         // convert type 'X' to 'X'"-looking error.
         if (IsImportedTypeIdentity(from) && IsImportedTypeIdentity(to)
+            && (!(from is ImportedTypeSymbol { OpenDefinition: not null, HasSubstitutableTypeArgument: true }
+                    || to is ImportedTypeSymbol { OpenDefinition: not null, HasSubstitutableTypeArgument: true })
+                || TypeSymbol.AreRuntimeEquivalentIgnoringReferenceNullability(from, to))
             && ClrTypeUtilities.AreSame(from.ClrType, to.ClrType))
         {
             return Conversion.Identity;
@@ -1228,6 +1231,18 @@ public sealed class Conversion
             return Conversion.None;
         }
 
+        // Issue #2735: an object-erased constructed generic must not fall
+        // through to the CLR assignability check below after its symbolic
+        // arguments failed the hierarchy/variance checks above. For example,
+        // NullLogger<Other>'s probe type NullLogger<object> implements the
+        // probe ILogger<object>, but it does not implement ILogger<Store>.
+        if (from is ImportedTypeSymbol { OpenDefinition: not null, HasSubstitutableTypeArgument: true }
+            && to is ImportedTypeSymbol mismatchedConstructedTarget
+            && TryGetConstructedGenericShape(mismatchedConstructedTarget, out _, out _))
+        {
+            return Conversion.None;
+        }
+
         if (from?.ClrType != null && to?.ClrType != null
             && !from.ClrType.IsValueType && !to.ClrType.IsValueType
             && !from.ClrType.IsPointer && !to.ClrType.IsPointer
@@ -2073,7 +2088,8 @@ public sealed class Conversion
     private static bool IsFunctionShapeAssignable(FunctionTypeSymbol from, FunctionTypeSymbol to)
     {
         if (from == null || to == null || from.Arity != to.Arity
-            || !(from.ReturnType == to.ReturnType || ReturnTypeWidens(from.ReturnType, to.ReturnType)))
+            || !(TypeSymbol.AreRuntimeEquivalentIgnoringReferenceNullability(from.ReturnType, to.ReturnType)
+                || ReturnTypeWidens(from.ReturnType, to.ReturnType)))
         {
             return false;
         }
@@ -2083,7 +2099,10 @@ public sealed class Conversion
             // Function parameters are contravariant: every value the target
             // may supply must be accepted by the source callable.
             var parameterConversion = ClassifyNonStructural(to.ParameterTypes[i], from.ParameterTypes[i]);
-            if (!parameterConversion.IsImplicit)
+            if (!parameterConversion.IsImplicit
+                && !TypeSymbol.AreRuntimeEquivalentIgnoringReferenceNullability(
+                    to.ParameterTypes[i],
+                    from.ParameterTypes[i]))
             {
                 return false;
             }
@@ -2140,6 +2159,11 @@ public sealed class Conversion
 
         var invokeReturnIsVoid = invokeReturnType == null
             || string.Equals(invokeReturnType.FullName, "System.Void", StringComparison.Ordinal);
+        if (fn.ReturnType == TypeSymbol.Never)
+        {
+            return true;
+        }
+
         if (fn.ReturnType == TypeSymbol.Void || fn.ReturnType == null)
         {
             return invokeReturnIsVoid;
@@ -2292,6 +2316,11 @@ public sealed class Conversion
 
         for (var i = 0; i < parameters.Length; i++)
         {
+            if (parameters[i].RefKind != RefKind.None)
+            {
+                return false;
+            }
+
             var fromType = fn.ParameterTypes[i];
             var toType = parameters[i].Type;
             if (fromType == null || toType == null)
@@ -2303,7 +2332,8 @@ public sealed class Conversion
             // existing CLR-typed func→delegate rule, which is name-based
             // assignability — i.e., identity or an implicit conversion.
             var conv = Classify(fromType, toType);
-            if (!conv.Exists || !conv.IsImplicit)
+            if ((!conv.Exists || !conv.IsImplicit)
+                && !TypeSymbol.AreRuntimeEquivalentIgnoringReferenceNullability(fromType, toType))
             {
                 return false;
             }
@@ -2322,7 +2352,8 @@ public sealed class Conversion
         }
 
         var retConv = Classify(fnReturn, targetReturn);
-        return retConv.Exists && retConv.IsImplicit;
+        return (retConv.Exists && retConv.IsImplicit)
+            || TypeSymbol.AreRuntimeEquivalentIgnoringReferenceNullability(fnReturn, targetReturn);
     }
 
     // Issue #2290: identifies the two symbol kinds that ever wrap a genuine
@@ -2457,6 +2488,13 @@ public sealed class Conversion
     /// </summary>
     private static bool ReturnTypeWidens(TypeSymbol fromReturn, TypeSymbol toReturn)
     {
+        // Issue #2716: `never` is the bottom type. A callable that cannot
+        // return satisfies every result slot, including void.
+        if (fromReturn == TypeSymbol.Never && toReturn != null)
+        {
+            return true;
+        }
+
         if (fromReturn == null || toReturn == null
             || fromReturn == TypeSymbol.Void || toReturn == TypeSymbol.Void)
         {

@@ -148,7 +148,7 @@ internal sealed partial class DeclarationBinder
                     structSymbol,
                     iface,
                     positionalInterfaceProps);
-                ResolveExplicitInterfaceEventImplementations(structSymbol, iface);
+                VerifyInterfaceEventImplementations(syntax, structSymbol, iface);
             }
 
             static void ResolveExplicitClrInterfaceImplementations(StructSymbol structSymbol)
@@ -522,6 +522,16 @@ internal sealed partial class DeclarationBinder
                         iface.Name,
                         iprop.Name + " (setter)");
                 }
+
+                // Positional data members now appear in Properties too. Route
+                // them through the existing positional compatibility check
+                // below; ordinary declared properties keep their established
+                // interface-verification behavior.
+                if (implProp.Declaration is null
+                    && TypeMemberModel.TryGetPrimaryConstructorParameter(structSymbol, iprop.Name, out _))
+                {
+                    found = false;
+                }
             }
 
             // Issue #2150: a data-class positional (primary-constructor)
@@ -553,22 +563,7 @@ internal sealed partial class DeclarationBinder
                 // (read/write) position — like a C# `in`/`out`
                 // parameter mismatch, both directions must hold, so the
                 // nullability must match EXACTLY.
-                var positionalUnderlyingType = positionalParam.Type is NullableTypeSymbol positionalNullable
-                    ? positionalNullable.UnderlyingType
-                    : positionalParam.Type;
-                var ifaceUnderlyingType = iprop.Type is NullableTypeSymbol ifaceNullable
-                    ? ifaceNullable.UnderlyingType
-                    : iprop.Type;
-
-                var underlyingTypesMatch = System.Collections.Generic.EqualityComparer<TypeSymbol>.Default.Equals(positionalUnderlyingType, ifaceUnderlyingType);
-                var ifaceIsNullable = iprop.Type is NullableTypeSymbol;
-                var implIsNullable = positionalParam.Type is NullableTypeSymbol;
-
-                var nullabilityCompatible = iprop.HasSetter
-                    ? ifaceIsNullable == implIsNullable
-                    : !(!ifaceIsNullable && implIsNullable);
-
-                if (!underlyingTypesMatch || !nullabilityCompatible)
+                if (!IsInterfacePropertyTypeCompatible(positionalParam.Type, iprop.Type, iprop.HasSetter))
                 {
                     // Name matches but the type is incompatible: the
                     // positional parameter does not satisfy the contract.
@@ -614,27 +609,74 @@ internal sealed partial class DeclarationBinder
         }
     }
 
-    private void ResolveExplicitInterfaceEventImplementations(StructSymbol structSymbol, InterfaceSymbol iface)
+    private static bool IsInterfacePropertyTypeCompatible(
+        TypeSymbol implementationType,
+        TypeSymbol interfaceType,
+        bool hasSetter)
     {
-        // ADR-0149: resolve explicit-interface EVENT implementations
-        // (`event (IFoo) Changed T`) — generalizes the #2362 property
-        // pre-pass immediately above to events for the first time.
-        // Mirrors the property pre-pass exactly: resolved against the
-        // interface's OPEN DEFINITION event table (constructed
-        // generic interfaces do not substitute Events either — see
-        // InterfaceSymbol.TryResolveMembers), and is a pure resolve
-        // pass with no ordinary implicit-event-contract diagnostic
-        // (there is currently no implicit interface-event contract
-        // check in this binder at all — adding one is out of scope
-        // for this explicit-implementation feature and would risk an
-        // unrelated regression across every existing interface-event
-        // declaration in the test suite).
-        var explicitEventDefIface = iface.Definition ?? iface;
-        if (!explicitEventDefIface.Events.IsDefaultOrEmpty)
+        var implementationUnderlyingType = implementationType is NullableTypeSymbol implementationNullable
+            ? implementationNullable.UnderlyingType
+            : implementationType;
+        var interfaceUnderlyingType = interfaceType is NullableTypeSymbol interfaceNullable
+            ? interfaceNullable.UnderlyingType
+            : interfaceType;
+        if (!System.Collections.Generic.EqualityComparer<TypeSymbol>.Default.Equals(
+            implementationUnderlyingType,
+            interfaceUnderlyingType))
         {
-            foreach (var openIevent in explicitEventDefIface.Events)
+            return false;
+        }
+
+        var interfaceIsNullable = interfaceType is NullableTypeSymbol;
+        var implementationIsNullable = implementationType is NullableTypeSymbol;
+        return hasSetter
+            ? interfaceIsNullable == implementationIsNullable
+            : interfaceIsNullable || !implementationIsNullable;
+    }
+
+    private void VerifyInterfaceEventImplementations(
+        StructDeclarationSyntax syntax,
+        StructSymbol structSymbol,
+        InterfaceSymbol iface)
+    {
+        var eventDefIface = iface.Definition ?? iface;
+        if (eventDefIface.Events.IsDefaultOrEmpty)
+        {
+            return;
+        }
+
+        foreach (var interfaceEvent in eventDefIface.Events)
+        {
+            if (TryResolveExplicitInterfaceEventImplementation(structSymbol, iface, interfaceEvent) != null)
             {
-                TryResolveExplicitInterfaceEventImplementation(structSymbol, iface, openIevent);
+                continue;
+            }
+
+            EventSymbol implementation = null;
+            for (var type = structSymbol; type != null && implementation == null; type = type.BaseClass)
+            {
+                foreach (var candidate in type.Events)
+                {
+                    if (candidate.HasExplicitInterfaceClause
+                        || candidate.Name != interfaceEvent.Name
+                        || (!ReferenceEquals(type, structSymbol) && candidate.Accessibility != Accessibility.Public)
+                        || !InterfaceEventTypesEquivalent(iface, interfaceEvent, candidate))
+                    {
+                        continue;
+                    }
+
+                    implementation = candidate;
+                    break;
+                }
+            }
+
+            if (implementation == null)
+            {
+                Diagnostics.ReportInterfaceMethodNotImplemented(
+                    syntax.Identifier.Location,
+                    structSymbol.Name,
+                    iface.Name,
+                    interfaceEvent.Name);
             }
         }
     }

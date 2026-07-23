@@ -46,6 +46,17 @@ internal sealed partial class MethodBodyEmitter
             return;
         }
 
+        // Issue #2771: emitter-owned variable operations (notably `?.`
+        // captures) bypass MoveNextBodyRewriter's bound-node substitution.
+        if (this.asyncFieldMap != null
+            && this.asyncFieldMap.TryGetHoistedField(variable, out var hoistedField))
+        {
+            this.il.OpCode(ILOpCode.Ldarg_0);
+            this.il.OpCode(ILOpCode.Ldfld);
+            this.il.Token(this.ResolveCurrentStateMachineFieldToken(hoistedField));
+            return;
+        }
+
         if (variable is ParameterSymbol ps && this.parameters.TryGetValue(ps, out var argIndex))
         {
             this.il.LoadArgument(argIndex);
@@ -86,9 +97,9 @@ internal sealed partial class MethodBodyEmitter
         }
 
         // Issue #503 follow-up (nested-closure transitive capture): the
-        // current method is a closure's Invoke and `variable` is one of
-        // the enclosing closure's captured outer locals. Load it via
-        // `ldarg.0; ldfld <displayClass>::<capField>`.
+        // current method is a closure's Invoke (or issue #2727's async
+        // MoveNext for that Invoke) and `variable` is one of the enclosing
+        // closure's captured outer locals.
         if (this.TryLoadFromEnclosingClosure(variable))
         {
             return;
@@ -107,6 +118,14 @@ internal sealed partial class MethodBodyEmitter
         }
 
         this.il.OpCode(ILOpCode.Ldarg_0);
+        // In MoveNext, arg0 is the state machine. Follow its hoisted `this`
+        // field to the closure before loading the captured value.
+        if (this.asyncFieldMap?.ThisField is FieldSymbol thisField)
+        {
+            this.il.OpCode(ILOpCode.Ldfld);
+            this.il.Token(this.ResolveCurrentStateMachineFieldToken(thisField));
+        }
+
         this.il.OpCode(ILOpCode.Ldfld);
         this.il.Token(this.outer.userTokens.ResolveFieldToken(this.enclosingClosure.ConstructedClassSym, capField));
         return true;
@@ -186,6 +205,20 @@ internal sealed partial class MethodBodyEmitter
 
     private void EmitStoreVariable(VariableSymbol variable)
     {
+        if (this.asyncFieldMap != null
+            && this.asyncFieldMap.TryGetHoistedField(variable, out var hoistedField))
+        {
+            // stfld needs the receiver below the value; the planned fallback
+            // local provides the stack reorder without changing value identity.
+            var valueSlot = this.locals[variable];
+            this.il.StoreLocal(valueSlot);
+            this.il.OpCode(ILOpCode.Ldarg_0);
+            this.il.LoadLocal(valueSlot);
+            this.il.OpCode(ILOpCode.Stfld);
+            this.il.Token(this.ResolveCurrentStateMachineFieldToken(hoistedField));
+            return;
+        }
+
         if (variable is ParameterSymbol ps && this.parameters.TryGetValue(ps, out var argIndex))
         {
             this.il.StoreArgument(argIndex);
@@ -1062,7 +1095,9 @@ internal sealed partial class MethodBodyEmitter
                     access.Type);
                 break;
             case FieldInfo field:
-                var fieldRef = this.outer.memberRefs.GetFieldReference(field);
+                var fieldRef = access.StaticContainerType != null
+                    ? this.outer.memberRefs.GetFieldReference(field, access.StaticContainerType)
+                    : this.outer.memberRefs.GetFieldReference(field);
                 this.il.OpCode(isStatic ? ILOpCode.Ldsfld : ILOpCode.Ldfld);
                 this.il.Token(fieldRef);
                 break;

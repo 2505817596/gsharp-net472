@@ -1425,6 +1425,19 @@ public sealed partial class CSharpToGSharpTranslator
                 return true;
             }
 
+            // Issue #2766: plain structs now preserve source constructors as
+            // callable G# init members. Keep the call itself instead of replaying
+            // assignments into a literal; record structs retain their separate
+            // data-struct lowering path (#2744).
+            if (!valueType.IsRecord &&
+                ctorSymbol.DeclaringSyntaxReferences.Length == 1 &&
+                ctorSymbol.DeclaringSyntaxReferences[0].GetSyntax() is ConstructorDeclarationSyntax)
+            {
+                usesCallablePrimaryConstructor = true;
+                unsupportedReason = null;
+                return true;
+            }
+
             if (!this.TryAnalyzeStructConstructor(
                 ctorSymbol,
                 valueType,
@@ -1770,15 +1783,13 @@ public sealed partial class CSharpToGSharpTranslator
                         return null;
                     }
 
-                    // Issue #2429: the indexer's VALUE type/promotion state is
-                    // resolved exactly like a plain `arr[i] = value` element-access
-                    // assignment (`ForgiveElementAccessAssignmentRhs`, issue
-                    // #2259) — `GetTypeInfo` on the (implicit) indexer access
-                    // itself gives the indexer's converted value type, and the
-                    // indexer PROPERTY symbol (not the value) is what the taint
-                    // fixpoint may have promoted.
-                    ITypeSymbol indexerValueType = this.context.GetTypeInfo(indexAccess).Type;
+                    // The constructed property symbol carries the indexer's
+                    // nullable substitution (`TValue` -> `object?`); type info
+                    // for the implicit access can lose that annotation.
                     ISymbol indexerSymbol = this.context.GetSymbolInfo(indexAccess).Symbol;
+                    ITypeSymbol indexerValueType =
+                        (indexerSymbol as IPropertySymbol)?.Type
+                        ?? this.context.GetTypeInfo(indexAccess).Type;
                     GExpression indexedValue = this.ForgiveInitializerElementValue(
                         indexedAssignment.Right,
                         this.TranslateExpression(indexedAssignment.Right),

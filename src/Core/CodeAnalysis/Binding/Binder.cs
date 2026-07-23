@@ -205,6 +205,10 @@ public sealed class Binder
             bindInterpolatedStringAsFormattable: (syntax, targetType) => expressions.BindInterpolatedStringAsFormattable(syntax, targetType),
             createErasedFunctionLiteralAdapter: (literal, targetFunctionType) => lambdas.CreateErasedFunctionLiteralAdapter(literal, targetFunctionType),
             createClrMethodGroupAdapter: (group, targetFunctionType) => lambdas.CreateClrMethodGroupAdapter(group, targetFunctionType),
+            getMethodGroupObservableReturnType: (method, returnType) =>
+                method.IsAsync && !IsAsyncIteratorReturnType(returnType)
+                    ? lambdas.WrapAsTask(returnType, method.AsyncReturnsValueTask)
+                    : returnType,
             isLvalue: ExpressionBinder.IsLvalue,
             getRefKindFromModifier: GetRefKindFromModifier,
             refKindToString: RefKindToString);
@@ -308,7 +312,7 @@ public sealed class Binder
             reportObsoleteUseIfApplicable: ReportObsoleteUseIfApplicable,
             isAsyncIteratorReturnType: IsAsyncIteratorReturnType,
             getCurrentFunction: () => this.function,
-            bindStatement: syntax => statements.BindStatement(syntax));
+            bindStatementList: (syntax, trailing) => statements.BindStatementList(syntax, trailingStatement: trailing));
 
         // statements/declarations still reference this.expressions through
         // the callbacks above; expressions is wired last so its constructor
@@ -1098,12 +1102,36 @@ public sealed class Binder
             // types / functions remain visible while the new binder's own
             // RootScope owns the `args` parameter declaration.
             var tlsBinder = new Binder(binder.scope, synthesizedEntryPoint);
-            foreach (var globalStatement in globalStatements)
+            string previousPackage = null;
+            SyntaxTree previousTree = null;
+            var contextSet = false;
+            try
             {
-                RunWithPackage(
-                    packageByTree[globalStatement.SyntaxTree],
-                    globalStatement.SyntaxTree,
-                    () => statements.Add(tlsBinder.statements.BindStatement(globalStatement.Statement)));
+                statements.AddRange(tlsBinder.statements.BindStatementList(
+                    globalStatements.Select(s => s.Statement).ToImmutableArray(),
+                    statement =>
+                    {
+                        var tree = statement.SyntaxTree;
+                        if (!contextSet)
+                        {
+                            previousPackage = binder.scope.SetCurrentDeclaringPackage(packageByTree[tree]?.Name);
+                            previousTree = binder.scope.SetCurrentReferencingSyntaxTree(tree);
+                            contextSet = true;
+                        }
+                        else
+                        {
+                            binder.scope.SetCurrentDeclaringPackage(packageByTree[tree]?.Name);
+                            binder.scope.SetCurrentReferencingSyntaxTree(tree);
+                        }
+                    }));
+            }
+            finally
+            {
+                if (contextSet)
+                {
+                    binder.scope.SetCurrentDeclaringPackage(previousPackage);
+                    binder.scope.SetCurrentReferencingSyntaxTree(previousTree);
+                }
             }
 
             // Issue #1884: all TLS global statements share the synthesized
@@ -1516,9 +1544,9 @@ public sealed class Binder
 
         // Issue #306: bind standalone user-defined constructor bodies. Like
         // instance methods, the constructor body sees `this`, the constructor
-        // parameters, and the class's fields (via bare names). The body is keyed
+        // parameters, and the aggregate's fields (via bare names). The body is keyed
         // in functionBodies by the constructor's underlying FunctionSymbol.
-        // ADR-0063 §9: a class may declare multiple init(...) constructors; each
+        // ADR-0063 §9 / issue #2766: an aggregate may declare multiple init(...) constructors; each
         // body is bound independently.
         foreach (var structSym in globalScope.Structs)
         {

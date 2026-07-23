@@ -1861,7 +1861,7 @@ internal sealed class ReflectionMetadataEmitter
             // which must run in the same relative order (before
             // user-declared methods) so the MethodDef rows line up.
             // Issue #2363: a zero-field data class skips Deconstruct (one
-            // fewer row) — see DataStructSynthesizer.HasZeroSynthesisFields
+            // fewer row) — see DataStructSynthesizer.HasZeroDeconstructionMembers
             // and EmitDataStructSynthesizedMembers's matching skip.
             // Issue #2361: when the class declares a compatible hand-written
             // ToString, one fewer row is reserved here too — the "ToString"
@@ -1872,8 +1872,8 @@ internal sealed class ReflectionMetadataEmitter
             // with a user ToString override reserves five rows).
             if (c.IsData)
             {
-                methodRow += 7
-                    - (DataStructSynthesizer.HasZeroSynthesisFields(c) ? 1 : 0)
+                methodRow += 10
+                    - (DataStructSynthesizer.HasZeroDeconstructionMembers(c) ? 1 : 0)
                     - (DataStructSynthesizer.HasUserToStringOverride(c) ? 1 : 0);
             }
 
@@ -1924,6 +1924,8 @@ internal sealed class ReflectionMetadataEmitter
                 MethodDefinitionHandle? raiseHandle = ev.RaiseMethodSymbol != null ? MetadataTokens.MethodDefinitionHandle(methodRow++) : null;
                 this.cache.EventAccessorHandles[ev] = (addHandle, removeHandle, raiseHandle);
             }
+
+            methodRow += this.interfaceImpls.PlanInheritedEventBridges(c, methodRow);
 
             // ADR-0053: plan method rows for static methods on classes.
             if (!c.StaticMethods.IsDefaultOrEmpty)
@@ -1990,12 +1992,17 @@ internal sealed class ReflectionMetadataEmitter
         var structFirstMethodRows = new Dictionary<StructSymbol, int>();
         void PlanStructMethods(StructSymbol s)
         {
-            if (s.Methods.IsDefaultOrEmpty && !s.IsInline && !s.IsData && s.Properties.IsDefaultOrEmpty && s.Events.IsDefaultOrEmpty && s.StaticMethods.IsDefaultOrEmpty && s.StaticProperties.IsDefaultOrEmpty && s.StaticEvents.IsDefaultOrEmpty && s.StaticFieldInitializers.IsEmpty && !s.HasStaticInitializerBlock)
+            if (s.Methods.IsDefaultOrEmpty && s.ExplicitConstructors.IsDefaultOrEmpty && !s.IsInline && !s.IsData && s.Properties.IsDefaultOrEmpty && s.Events.IsDefaultOrEmpty && s.StaticMethods.IsDefaultOrEmpty && s.StaticProperties.IsDefaultOrEmpty && s.StaticEvents.IsDefaultOrEmpty && s.StaticFieldInitializers.IsEmpty && !s.HasStaticInitializerBlock)
             {
                 return;
             }
 
             structFirstMethodRows[s] = methodRow;
+            if (!s.ExplicitConstructors.IsDefaultOrEmpty)
+            {
+                methodRow += s.ExplicitConstructors.Length;
+            }
+
             if (s.IsInline)
             {
                 methodRow += 8;
@@ -2013,7 +2020,7 @@ internal sealed class ReflectionMetadataEmitter
                 // class-side comment in PlanClassMethods above. The two
                 // skips compose independently.
                 methodRow += 7
-                    - (DataStructSynthesizer.HasZeroSynthesisFields(s) ? 1 : 0)
+                    - (DataStructSynthesizer.HasZeroDeconstructionMembers(s) ? 1 : 0)
                     - (DataStructSynthesizer.HasUserToStringOverride(s) ? 1 : 0);
 
                 // Rubber-duck follow-up to issue #2224: an anonymous-class
@@ -2027,7 +2034,7 @@ internal sealed class ReflectionMetadataEmitter
                 // `!classType.IsClass`). It needs one extra reserved row for
                 // a real newobj-callable instance constructor, emitted by
                 // DataStructSynthesizer.EmitDataStructSynthesizedMembers.
-                if (s.Fields.IsDefaultOrEmpty && s.HasPrimaryConstructor)
+                if (s.HasPrimaryConstructor)
                 {
                     classPrimaryCtorRows[s] = methodRow++;
                 }
@@ -2404,7 +2411,16 @@ internal sealed class ReflectionMetadataEmitter
         // classPrimaryCtorRows.
         foreach (var s in nonSmStructs)
         {
-            if (s.IsInline && structFirstMethodRows.TryGetValue(s, out var inlineCtorRow))
+            if (!s.ExplicitConstructors.IsDefaultOrEmpty
+                && structFirstMethodRows.TryGetValue(s, out var explicitCtorRow))
+            {
+                for (int i = 0; i < s.ExplicitConstructors.Length; i++)
+                {
+                    this.cache.ExplicitCtorHandles[s.ExplicitConstructors[i]] =
+                        MetadataTokens.MethodDefinitionHandle(explicitCtorRow + i);
+                }
+            }
+            else if (s.IsInline && structFirstMethodRows.TryGetValue(s, out var inlineCtorRow))
             {
                 this.cache.ClassPrimaryCtorHandles[s] = MetadataTokens.MethodDefinitionHandle(inlineCtorRow);
             }
@@ -3326,10 +3342,16 @@ internal sealed class ReflectionMetadataEmitter
 
             // ADR-0051 Phase 6: emit property accessor methods for classes.
             this.memberDefEmitter.EmitPropertyAccessors(c);
+            if (c.IsData)
+            {
+                this.dataStructSynth.EmitDataClassEqualityContractProperty(c);
+            }
+
             this.EmitDefaultMemberAttributeIfIndexer(c);
 
             // ADR-0052: emit event accessor methods for classes.
             this.memberDefEmitter.EmitEventAccessors(c);
+            this.interfaceImpls.EmitInheritedEventBridges(c);
 
             // ADR-0053: emit static methods for classes.
             if (!c.StaticMethods.IsDefaultOrEmpty)
@@ -3384,6 +3406,10 @@ internal sealed class ReflectionMetadataEmitter
             // ADR-0149: emit MethodImpl rows for explicit-interface-clause
             // event implementations (add/remove/raise accessors).
             this.interfaceImpls.EmitExplicitInterfaceEventMethodImpls(c);
+
+            // Issues #2718/#2742: bind custom and inherited event accessors
+            // directly to matching user/imported interface event slots.
+            this.interfaceImpls.EmitImplicitEventMethodImpls(c);
         }
 
         foreach (var c in topClasses)
@@ -3401,6 +3427,15 @@ internal sealed class ReflectionMetadataEmitter
         // 4b. Non-SM struct methods.
         void EmitStructMethodBodies(StructSymbol s)
         {
+            if (!s.ExplicitConstructors.IsDefaultOrEmpty)
+            {
+                foreach (var explicitCtor in s.ExplicitConstructors)
+                {
+                    var ctorHandle = this.typeDefEmitter.EmitClassConstructorWithBody(s, explicitCtor);
+                    this.cache.ExplicitCtorHandles[explicitCtor] = ctorHandle;
+                }
+            }
+
             if (s.IsInline)
             {
                 this.dataStructSynth.EmitInlineStructSynthesizedMembers(s);
@@ -3413,7 +3448,7 @@ internal sealed class ReflectionMetadataEmitter
                 this.dataStructSynth.EmitDataStructSynthesizedMembers(s);
             }
 
-            if (s.Methods.IsDefaultOrEmpty && s.Properties.IsDefaultOrEmpty && s.Events.IsDefaultOrEmpty && s.StaticMethods.IsDefaultOrEmpty && s.StaticProperties.IsDefaultOrEmpty && s.StaticEvents.IsDefaultOrEmpty && s.StaticFieldInitializers.IsEmpty && !s.HasStaticInitializerBlock)
+            if (s.Methods.IsDefaultOrEmpty && s.ExplicitConstructors.IsDefaultOrEmpty && s.Properties.IsDefaultOrEmpty && s.Events.IsDefaultOrEmpty && s.StaticMethods.IsDefaultOrEmpty && s.StaticProperties.IsDefaultOrEmpty && s.StaticEvents.IsDefaultOrEmpty && s.StaticFieldInitializers.IsEmpty && !s.HasStaticInitializerBlock)
             {
                 return;
             }
@@ -3488,6 +3523,9 @@ internal sealed class ReflectionMetadataEmitter
             // ADR-0149: emit MethodImpl rows for explicit-interface-clause
             // event implementations (add/remove/raise accessors).
             this.interfaceImpls.EmitExplicitInterfaceEventMethodImpls(s);
+
+            // Issues #2718/#2742: see the class path above.
+            this.interfaceImpls.EmitImplicitEventMethodImpls(s);
         }
 
         foreach (var s in topStructs)
@@ -4196,12 +4234,15 @@ internal sealed class ReflectionMetadataEmitter
         FunctionSymbol function,
         IReadOnlyDictionary<VariableSymbol, int> locals)
     {
-        if (!IsValueTypeSymbol(receiver.Type))
+        // A constrained type parameter needs an address even though its
+        // value/reference shape is unknown until the generic is closed.
+        if (!IsValueTypeSymbol(receiver.Type) && receiver.Type is not TypeParameterSymbol)
         {
             return false;
         }
 
         if (receiver is BoundVariableExpression bve
+            && bve.NarrowedType == null
             && this.CanLoadVariableAddressForReceiverSpill(bve.Variable, function, locals))
         {
             return false;
@@ -4680,16 +4721,10 @@ internal sealed class ReflectionMetadataEmitter
     // ClrType.IsValueType, which is null for in-flight user types — so the
     // kickoff method's real Task<T?> return type is closed over the emitted
     // Nullable<UserT> instead of falling back to the erased Task<object>.
-    // Issue #2381: generalized to reuse ArgIsSymbolicUserDefined so an
-    // imported generic collection closed over a same-compilation argument
-    // (`List[DiagnosticCheck]`, `Dictionary[string, DiagnosticCheck]`,
-    // `List[List[DiagnosticCheck]]`, arrays/slices of a user type, a
-    // nullable-wrapped user value type held as a type argument, …) routes
-    // through the same symbolic Task<T> construction as the bare
-    // struct/interface/enum/type-parameter case, instead of trusting the
-    // erased CLR type cached on the constructed ImportedTypeSymbol.
+    // Issues #2381/#2713: use the same symbolic projection predicate as
+    // WrapAsTask and async state-machine construction.
     private static bool IsAsyncUserDefinedResultType(TypeSymbol type)
-        => ArgIsSymbolicUserDefined(type);
+        => TypeSymbol.RequiresSymbolicProjection(type);
 
     private static bool TryCreateSymbolicAsyncTaskType(SynthesizedStateMachineType stateMachine, out TypeSymbol taskType)
     {
