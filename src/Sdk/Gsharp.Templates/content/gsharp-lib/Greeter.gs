@@ -6,12 +6,12 @@
 // <Program> type whose name is not a valid C# identifier; classes are the
 // stable cross-language entry point until GSharp grows top-level interop.
 
-package GsharpLibrary
+包 GsharpLibrary
 
-import System
+导入 System
 
-class Greeter {
-    func Greet(name string) string {
+类 Greeter {
+    函数 Greet(name 字符串) 字符串 {
         return "Hello, " + name + "!"
     }
 }

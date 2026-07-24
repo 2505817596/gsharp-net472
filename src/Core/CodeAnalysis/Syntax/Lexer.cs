@@ -51,6 +51,8 @@ public sealed class Lexer
     private int start;
     private SyntaxKind kind;
     private object value;
+    private SyntaxToken pendingToken;
+    private bool splitElseIfKeyword;
 
     // Issue #1677: set by ReadIdentifierOrKeyword when it determines the token is a plain
     // identifier (not a keyword). Lex() reuses this interned string instead of substringing
@@ -108,10 +110,18 @@ public sealed class Lexer
     /// <returns>A syntax token.</returns>
     public SyntaxToken Lex()
     {
+        if (pendingToken != null)
+        {
+            var token = pendingToken;
+            pendingToken = null;
+            return token;
+        }
+
         start = position;
         kind = SyntaxKind.BadToken;
         value = null;
         internedIdentifierText = null;
+        splitElseIfKeyword = false;
 
         switch (Current)
         {
@@ -555,6 +565,14 @@ public sealed class Lexer
             text = kind == SyntaxKind.IdentifierToken && internedIdentifierText != null
                 ? internedIdentifierText
                 : GetTrivialText(start, length);
+        }
+
+        if (splitElseIfKeyword)
+        {
+            const string elseText = "否则";
+            const string ifText = "如果";
+            pendingToken = new SyntaxToken(syntaxTree, SyntaxKind.IfKeyword, start + elseText.Length, ifText, null);
+            return new SyntaxToken(syntaxTree, SyntaxKind.ElseKeyword, start, elseText, null);
         }
 
         return new SyntaxToken(syntaxTree, kind, start, text, value);
@@ -1798,6 +1816,7 @@ public sealed class Lexer
         var length = position - start;
         var text = this.text.ToString(start, length);
         kind = SyntaxFacts.GetKeywordKind(text);
+        splitElseIfKeyword = text == "否则如果";
 
         if (kind == SyntaxKind.IdentifierToken)
         {

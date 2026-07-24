@@ -181,6 +181,17 @@
     "declarations": {
       "patterns": [
         {
+          "comment": "Explicit-interface function: `函数 (IFoo) Name(...)`",
+          "match": "(函数)\\s+(\\()([A-Za-z_][A-Za-z0-9_.]*(?:\\[[^\\]\\r\\n]+\\])?)(\\))\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.gsharp" },
+            "2": { "name": "punctuation.definition.interface.begin.gsharp" },
+            "3": { "name": "entity.name.type.interface.gsharp" },
+            "4": { "name": "punctuation.definition.interface.end.gsharp" },
+            "5": { "name": "entity.name.function.gsharp" }
+          }
+        },
+        {
           "comment": "Explicit-interface function: `func (IFoo) Name(...)`",
           "match": "\\b(func)\\s+(\\()([A-Za-z_][A-Za-z0-9_.]*(?:\\[[^\\]\\r\\n]+\\])?)(\\))\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
@@ -215,7 +226,7 @@
         },
         {
           "comment": "Aggregate declarations per ADR-0078: `class|struct|enum|interface Name`",
-          "match": "\\b(class|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "(\\b(?:class|struct|enum|interface)\\b|类)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "keyword.declaration.gsharp" },
             "2": { "name": "entity.name.type.gsharp" }
@@ -227,6 +238,14 @@
           "captures": {
             "1": { "name": "keyword.declaration.gsharp" },
             "2": { "name": "entity.name.type.gsharp" }
+          }
+        },
+        {
+          "comment": "Function declaration: `函数 Name(...)`",
+          "match": "(函数)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.gsharp" },
+            "2": { "name": "entity.name.function.gsharp" }
           }
         },
         {
@@ -242,8 +261,12 @@
     "keywords": {
       "patterns": [
         {
+          "name": "keyword.declaration.gsharp",
+          "match": "函数"
+        },
+        {
           "name": "keyword.control.gsharp",
-          "match": "\\b(if|else|for|while|do|guard|switch|case|default|break|continue|return|goto|fallthrough|range|select)\\b"
+          "match": "\\b(if|else|for|while|do|guard|switch|case|default|break|continue|return|goto|fallthrough|range|select)\\b|否则如果|如果|否则"
         },
         {
           "name": "keyword.control.flow.gsharp",
@@ -255,7 +278,7 @@
         },
         {
           "name": "keyword.declaration.gsharp",
-          "match": "\\b(func|class|struct|enum|interface|type|operator|sequence)\\b"
+          "match": "\\b(func|class|struct|enum|interface|type|operator|sequence)\\b|类"
         },
         {
           "name": "keyword.modifier.gsharp",
@@ -271,7 +294,7 @@
         },
         {
           "name": "keyword.other.gsharp",
-          "match": "\\b(import|package|using|var|let|is|as|scope|chan|map)\\b"
+          "match": "\\b(import|package|using|var|let|is|as|scope|chan|map)\\b|包|导入|变|定"
         },
         {
           "name": "keyword.declaration.anonymous-object.gsharp",
@@ -283,7 +306,7 @@
       "patterns": [
         {
           "name": "support.type.primitive.gsharp",
-          "match": "\\b(bool|uint8|int8|int16|uint16|int32|uint32|int64|uint64|nint|nuint|float32|float64|decimal|char|string|object|void|byte|sbyte|short|ushort|int|uint|long|ulong|float|double)\\b"
+          "match": "\\b(bool|uint8|int8|int16|uint16|int32|uint32|int64|uint64|nint|nuint|float32|float64|decimal|char|string|object|void|byte|sbyte|short|ushort|int|uint|long|ulong|float|double)\\b|字符串"
         }
       ]
     },
@@ -291,11 +314,11 @@
       "patterns": [
         {
           "name": "constant.language.boolean.true.gsharp",
-          "match": "\\btrue\\b"
+          "match": "\\btrue\\b|真"
         },
         {
           "name": "constant.language.boolean.false.gsharp",
-          "match": "\\bfalse\\b"
+          "match": "\\bfalse\\b|假"
         },
         {
           "name": "constant.language.null.gsharp",

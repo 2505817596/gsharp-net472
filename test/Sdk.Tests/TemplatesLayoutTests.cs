@@ -67,7 +67,7 @@ public class TemplatesLayoutTests
         Assert.True(File.Exists(path), path);
 
         var src = File.ReadAllText(path);
-        Assert.Contains("package ", src, System.StringComparison.Ordinal);
+        Assert.Contains("包 ", src, System.StringComparison.Ordinal);
         Assert.Contains("Console.WriteLine", src, System.StringComparison.Ordinal);
     }
 
@@ -117,9 +117,10 @@ public class TemplatesLayoutTests
         Assert.True(File.Exists(path), path);
 
         var src = File.ReadAllText(path);
-        Assert.Contains("package GsharpLibrary", src, System.StringComparison.Ordinal);
-        Assert.Contains("class Greeter", src, System.StringComparison.Ordinal);
-        Assert.Contains("func Greet", src, System.StringComparison.Ordinal);
+        Assert.Contains("包 GsharpLibrary", src, System.StringComparison.Ordinal);
+        Assert.Contains("类 Greeter", src, System.StringComparison.Ordinal);
+        Assert.Contains("字符串", src, System.StringComparison.Ordinal);
+        Assert.Contains("函数 Greet", src, System.StringComparison.Ordinal);
     }
 
     [Fact]
@@ -164,13 +165,13 @@ public class TemplatesLayoutTests
         Assert.True(File.Exists(path), path);
 
         var src = File.ReadAllText(path);
-        Assert.Contains("package GsharpWebApp", src, System.StringComparison.Ordinal);
-        Assert.Contains("import Microsoft.AspNetCore.Builder", src, System.StringComparison.Ordinal);
-        Assert.Contains("import Microsoft.AspNetCore.Routing", src, System.StringComparison.Ordinal);
+        Assert.Contains("包 GsharpWebApp", src, System.StringComparison.Ordinal);
+        Assert.Contains("导入 Microsoft.AspNetCore.Builder", src, System.StringComparison.Ordinal);
+        Assert.Contains("导入 Microsoft.AspNetCore.Routing", src, System.StringComparison.Ordinal);
 
         // The modern WebApplication host serves requests through minimal-API routing.
         Assert.Contains("WebApplication.CreateBuilder()", src, System.StringComparison.Ordinal);
-        Assert.Contains("Func[string]", src, System.StringComparison.Ordinal);
+        Assert.Contains("Func[字符串]", src, System.StringComparison.Ordinal);
         Assert.Contains("app.MapGet(", src, System.StringComparison.Ordinal);
         Assert.Contains("app.Run(", src, System.StringComparison.Ordinal);
     }
@@ -211,8 +212,9 @@ public class TemplatesLayoutTests
         Assert.True(File.Exists(path), path);
 
         var src = File.ReadAllText(path);
-        Assert.Contains("package GsharpLibrary", src, System.StringComparison.Ordinal);
-        Assert.Contains("class Greeter", src, System.StringComparison.Ordinal);
+        Assert.Contains("包 GsharpLibrary", src, System.StringComparison.Ordinal);
+        Assert.Contains("类 Greeter", src, System.StringComparison.Ordinal);
+        Assert.Contains("字符串", src, System.StringComparison.Ordinal);
     }
 
     [Fact]
@@ -239,9 +241,10 @@ public class TemplatesLayoutTests
         Assert.True(File.Exists(path), path);
 
         var src = File.ReadAllText(path);
-        Assert.Contains("package GsharpLibrary.Tests", src, System.StringComparison.Ordinal);
-        Assert.Contains("import Xunit", src, System.StringComparison.Ordinal);
-        Assert.Contains("class GreeterTests", src, System.StringComparison.Ordinal);
+        Assert.Contains("包 GsharpLibrary.Tests", src, System.StringComparison.Ordinal);
+        Assert.Contains("导入 Xunit", src, System.StringComparison.Ordinal);
+        Assert.Contains("类 GreeterTests", src, System.StringComparison.Ordinal);
+        Assert.Contains("字符串", src, System.StringComparison.Ordinal);
         Assert.Contains("@Fact", src, System.StringComparison.Ordinal);
         Assert.Contains("@Theory", src, System.StringComparison.Ordinal);
         Assert.Contains("@InlineData", src, System.StringComparison.Ordinal);

@@ -13,7 +13,19 @@ public class SyntaxFactsTests
 {
     [Theory]
     [InlineData("break", SyntaxKind.BreakKeyword)]
+    [InlineData("函数", SyntaxKind.FuncKeyword)]
     [InlineData("func", SyntaxKind.FuncKeyword)]
+    [InlineData("类", SyntaxKind.ClassKeyword)]
+    [InlineData("class", SyntaxKind.ClassKeyword)]
+    [InlineData("如果", SyntaxKind.IfKeyword)]
+    [InlineData("否则", SyntaxKind.ElseKeyword)]
+    [InlineData("否则如果", SyntaxKind.ElseKeyword)]
+    [InlineData("真", SyntaxKind.TrueKeyword)]
+    [InlineData("假", SyntaxKind.FalseKeyword)]
+    [InlineData("包", SyntaxKind.PackageKeyword)]
+    [InlineData("导入", SyntaxKind.ImportKeyword)]
+    [InlineData("变", SyntaxKind.VarKeyword)]
+    [InlineData("定", SyntaxKind.LetKeyword)]
     [InlineData("notAKeyword", SyntaxKind.IdentifierToken)]
     public void GetKeywordKind_ReturnsExpected(string text, SyntaxKind expected)
     {
@@ -22,7 +34,16 @@ public class SyntaxFactsTests
 
     [Theory]
     [InlineData(SyntaxKind.PlusToken, "+")]
-    [InlineData(SyntaxKind.FuncKeyword, "func")]
+    [InlineData(SyntaxKind.FuncKeyword, "函数")]
+    [InlineData(SyntaxKind.ClassKeyword, "类")]
+    [InlineData(SyntaxKind.IfKeyword, "如果")]
+    [InlineData(SyntaxKind.ElseKeyword, "否则")]
+    [InlineData(SyntaxKind.TrueKeyword, "真")]
+    [InlineData(SyntaxKind.FalseKeyword, "假")]
+    [InlineData(SyntaxKind.PackageKeyword, "包")]
+    [InlineData(SyntaxKind.ImportKeyword, "导入")]
+    [InlineData(SyntaxKind.VarKeyword, "变")]
+    [InlineData(SyntaxKind.LetKeyword, "定")]
     [InlineData(SyntaxKind.ColonEqualsToken, ":=")]
     [InlineData(SyntaxKind.DotDotToken, "..")]
     public void GetText_ReturnsExpected(SyntaxKind kind, string expected)

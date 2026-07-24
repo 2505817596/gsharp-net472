@@ -1,7 +1,7 @@
 // file: Program.gs
 
-package GsharpConsoleApp
+包 GsharpConsoleApp
 
-import System
+导入 System
 
 Console.WriteLine("Hello from GSharp!")

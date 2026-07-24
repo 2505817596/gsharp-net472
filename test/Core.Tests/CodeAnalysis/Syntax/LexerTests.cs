@@ -38,20 +38,61 @@ public class LexerTests
     }
 
     [Theory]
-    [InlineData("func", SyntaxKind.FuncKeyword)]
+    [InlineData("函数", SyntaxKind.FuncKeyword)]
+    [InlineData("func", SyntaxKind.FuncKeyword)] // Legacy compatibility spelling.
+    [InlineData("类", SyntaxKind.ClassKeyword)]
+    [InlineData("class", SyntaxKind.ClassKeyword)]
+    [InlineData("如果", SyntaxKind.IfKeyword)]
     [InlineData("if", SyntaxKind.IfKeyword)]
+    [InlineData("否则", SyntaxKind.ElseKeyword)]
     [InlineData("else", SyntaxKind.ElseKeyword)]
     [InlineData("for", SyntaxKind.ForKeyword)]
     [InlineData("return", SyntaxKind.ReturnKeyword)]
+    [InlineData("包", SyntaxKind.PackageKeyword)]
     [InlineData("package", SyntaxKind.PackageKeyword)]
+    [InlineData("导入", SyntaxKind.ImportKeyword)]
     [InlineData("import", SyntaxKind.ImportKeyword)]
+    [InlineData("变", SyntaxKind.VarKeyword)]
+    [InlineData("定", SyntaxKind.LetKeyword)]
+    [InlineData("真", SyntaxKind.TrueKeyword)]
     [InlineData("true", SyntaxKind.TrueKeyword)]
+    [InlineData("假", SyntaxKind.FalseKeyword)]
     [InlineData("false", SyntaxKind.FalseKeyword)]
     public void Lexes_Keyword(string text, SyntaxKind expected)
     {
         var tokens = SyntaxTree.ParseTokens(text);
         var token = Assert.Single(tokens);
         Assert.Equal(expected, token.Kind);
+    }
+
+    [Fact]
+    public void Parses_Chinese_Keywords()
+    {
+        var tree = SyntaxTree.Parse("包 P\n导入 System\n函数 Main() { 变 mutable = 1\n定 immutable = 2\n如果 真 { } 否则如果 假 { } 否则 { }\n}\n");
+
+        Assert.Empty(tree.Diagnostics);
+        var function = Assert.Single(tree.Root.Members.OfType<FunctionDeclarationSyntax>());
+        Assert.Equal(SyntaxKind.FuncKeyword, function.FunctionKeyword.Kind);
+        Assert.Equal("函数", function.FunctionKeyword.Text);
+    }
+
+    [Fact]
+    public void Lexes_Chinese_ElseIf_As_Else_And_If_Tokens()
+    {
+        var tokens = SyntaxTree.ParseTokens("否则如果");
+
+        Assert.Collection(
+            tokens,
+            token =>
+            {
+                Assert.Equal(SyntaxKind.ElseKeyword, token.Kind);
+                Assert.Equal("否则", token.Text);
+            },
+            token =>
+            {
+                Assert.Equal(SyntaxKind.IfKeyword, token.Kind);
+                Assert.Equal("如果", token.Text);
+            });
     }
 
     [Theory]

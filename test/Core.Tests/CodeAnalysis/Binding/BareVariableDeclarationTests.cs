@@ -61,6 +61,18 @@ s
     }
 
     [Fact]
+    public void BareChineseVarDeclaration_ChineseString_DefaultsToNil()
+    {
+        var source = @"
+变 s 字符串
+s
+";
+        var result = Evaluate(source);
+        Assert.Empty(result.Diagnostics);
+        Assert.Null(result.Value);
+    }
+
+    [Fact]
     public void BareVarDeclaration_ThenAssignment_UsesAssignedValue()
     {
         var source = @"

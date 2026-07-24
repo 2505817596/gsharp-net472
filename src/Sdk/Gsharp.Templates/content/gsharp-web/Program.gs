@@ -8,17 +8,17 @@
 // cleanly to the delegate `MapGet` expects, then it is registered for the "/"
 // route. `app.Run(url)` starts Kestrel and blocks until the process stops.
 
-package GsharpWebApp
+包 GsharpWebApp
 
-import System
-import Microsoft.AspNetCore.Builder
-import Microsoft.AspNetCore.Routing
-import Microsoft.Extensions.Hosting
+导入 System
+导入 Microsoft.AspNetCore.Builder
+导入 Microsoft.AspNetCore.Routing
+导入 Microsoft.Extensions.Hosting
 
-var builder = WebApplication.CreateBuilder()
-var app = builder.Build()
+变 builder = WebApplication.CreateBuilder()
+变 app = builder.Build()
 
-var hello Func[string] = func() string { return "Hello from GSharp on ASP.NET Core!" }
+变 hello Func[字符串] = 函数() 字符串 { return "Hello from GSharp on ASP.NET Core!" }
 app.MapGet("/", hello)
 
 // Start Kestrel and block until the process is stopped.

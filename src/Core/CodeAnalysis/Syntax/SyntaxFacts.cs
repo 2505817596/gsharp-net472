@@ -142,6 +142,7 @@ public static class SyntaxFacts
                 return SyntaxKind.CatchKeyword;
             case "chan":
                 return SyntaxKind.ChanKeyword;
+            case "类":
             case "class":
                 return SyntaxKind.ClassKeyword;
             case "const":
@@ -155,10 +156,13 @@ public static class SyntaxFacts
             case "do":
                 return SyntaxKind.DoKeyword;
             case "else":
+            case "否则":
+            case "否则如果":
                 return SyntaxKind.ElseKeyword;
             case "enum":
                 return SyntaxKind.EnumKeyword;
             case "false":
+            case "假":
                 return SyntaxKind.FalseKeyword;
             case "fallthrough":
                 return SyntaxKind.FallthroughKeyword;
@@ -166,7 +170,11 @@ public static class SyntaxFacts
                 return SyntaxKind.FinallyKeyword;
             case "for":
                 return SyntaxKind.ForKeyword;
+
+            // `func` remains accepted as a compatibility spelling while the
+            // language surface transitions to Chinese keywords.
             case "func":
+            case "函数":
                 return SyntaxKind.FuncKeyword;
             case "go":
                 return SyntaxKind.GoKeyword;
@@ -175,8 +183,10 @@ public static class SyntaxFacts
             case "guard":
                 return SyntaxKind.GuardKeyword;
             case "if":
+            case "如果":
                 return SyntaxKind.IfKeyword;
             case "import":
+            case "导入":
                 return SyntaxKind.ImportKeyword;
             case "interface":
                 return SyntaxKind.InterfaceKeyword;
@@ -185,6 +195,7 @@ public static class SyntaxFacts
             case "is":
                 return SyntaxKind.IsKeyword;
             case "let":
+            case "定":
                 return SyntaxKind.LetKeyword;
             case "map":
                 return SyntaxKind.MapKeyword;
@@ -197,6 +208,7 @@ public static class SyntaxFacts
             case "override":
                 return SyntaxKind.OverrideKeyword;
             case "package":
+            case "包":
                 return SyntaxKind.PackageKeyword;
             case "private":
                 return SyntaxKind.PrivateKeyword;
@@ -223,6 +235,7 @@ public static class SyntaxFacts
             case "throw":
                 return SyntaxKind.ThrowKeyword;
             case "true":
+            case "真":
                 return SyntaxKind.TrueKeyword;
             case "try":
                 return SyntaxKind.TryKeyword;
@@ -231,6 +244,7 @@ public static class SyntaxFacts
             case "using":
                 return SyntaxKind.UsingKeyword;
             case "var":
+            case "变":
                 return SyntaxKind.VarKeyword;
             case "while":
                 return SyntaxKind.WhileKeyword;
@@ -415,7 +429,7 @@ public static class SyntaxFacts
             case SyntaxKind.ChanKeyword:
                 return "chan";
             case SyntaxKind.ClassKeyword:
-                return "class";
+                return "类";
             case SyntaxKind.ConstKeyword:
                 return "const";
             case SyntaxKind.ContinueKeyword:
@@ -427,11 +441,11 @@ public static class SyntaxFacts
             case SyntaxKind.DoKeyword:
                 return "do";
             case SyntaxKind.ElseKeyword:
-                return "else";
+                return "否则";
             case SyntaxKind.EnumKeyword:
                 return "enum";
             case SyntaxKind.FalseKeyword:
-                return "false";
+                return "假";
             case SyntaxKind.FallthroughKeyword:
                 return "fallthrough";
             case SyntaxKind.FinallyKeyword:
@@ -439,7 +453,7 @@ public static class SyntaxFacts
             case SyntaxKind.ForKeyword:
                 return "for";
             case SyntaxKind.FuncKeyword:
-                return "func";
+                return "函数";
             case SyntaxKind.GoKeyword:
                 return "go";
             case SyntaxKind.GotoKeyword:
@@ -447,9 +461,9 @@ public static class SyntaxFacts
             case SyntaxKind.GuardKeyword:
                 return "guard";
             case SyntaxKind.IfKeyword:
-                return "if";
+                return "如果";
             case SyntaxKind.ImportKeyword:
-                return "import";
+                return "导入";
             case SyntaxKind.InterfaceKeyword:
                 return "interface";
             case SyntaxKind.InternalKeyword:
@@ -457,7 +471,7 @@ public static class SyntaxFacts
             case SyntaxKind.IsKeyword:
                 return "is";
             case SyntaxKind.LetKeyword:
-                return "let";
+                return "定";
             case SyntaxKind.MapKeyword:
                 return "map";
             case SyntaxKind.OpenKeyword:
@@ -469,7 +483,7 @@ public static class SyntaxFacts
             case SyntaxKind.OperatorKeyword:
                 return "operator";
             case SyntaxKind.PackageKeyword:
-                return "package";
+                return "包";
             case SyntaxKind.PrivateKeyword:
                 return "private";
             case SyntaxKind.ProtectedKeyword:
@@ -495,7 +509,7 @@ public static class SyntaxFacts
             case SyntaxKind.ThrowKeyword:
                 return "throw";
             case SyntaxKind.TrueKeyword:
-                return "true";
+                return "真";
             case SyntaxKind.TryKeyword:
                 return "try";
             case SyntaxKind.TypeKeyword:
@@ -503,7 +517,7 @@ public static class SyntaxFacts
             case SyntaxKind.UsingKeyword:
                 return "using";
             case SyntaxKind.VarKeyword:
-                return "var";
+                return "变";
             case SyntaxKind.WhileKeyword:
                 return "while";
             case SyntaxKind.LockKeyword:

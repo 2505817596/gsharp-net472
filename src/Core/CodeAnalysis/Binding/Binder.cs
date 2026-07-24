@@ -2610,6 +2610,7 @@ public sealed class Binder
             case "decimal":
             case "char":
             case "string":
+            case "字符串":
             case "object":
             // ADR-0098 / issue #729: friendly numeric aliases are treated as
             // reserved primitive type names so user-defined `type int = …`
@@ -5983,6 +5984,7 @@ public sealed class Binder
             case "char":
                 return TypeSymbol.Char;
             case "string":
+            case "字符串":
                 return TypeSymbol.String;
             case "object":
                 return TypeSymbol.Object;

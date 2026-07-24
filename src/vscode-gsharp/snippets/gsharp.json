@@ -2,9 +2,9 @@
   "Package + import header": {
     "prefix": "pkg",
     "body": [
-      "package ${1:GSharp.Example}",
+      "包 ${1:GSharp.Example}",
       "",
-      "import ${2:System}",
+      "导入 ${2:System}",
       "",
       "$0"
     ],
@@ -13,7 +13,7 @@
   "Function declaration": {
     "prefix": "fn",
     "body": [
-      "func ${1:name}(${2:params}) ${3:returnType} {",
+      "函数 ${1:name}(${2:params}) ${3:returnType} {",
       "\t$0",
       "}"
     ],
@@ -22,7 +22,7 @@
   "Async function": {
     "prefix": "afn",
     "body": [
-      "async func ${1:name}(${2:params}) ${3:Task} {",
+      "async 函数 ${1:name}(${2:params}) ${3:Task} {",
       "\t$0",
       "}"
     ],
@@ -31,7 +31,7 @@
   "Extension function": {
     "prefix": "extfn",
     "body": [
-      "func (${1:self} ${2:Type}) ${3:Name}(${4:params}) ${5:returnType} {",
+      "函数 (${1:self} ${2:Type}) ${3:Name}(${4:params}) ${5:returnType} {",
       "\t$0",
       "}"
     ],
@@ -40,7 +40,7 @@
   "Func literal (lambda)": {
     "prefix": "lambda",
     "body": [
-      "func(${1:params}) ${2:returnType} {",
+      "函数(${1:params}) ${2:returnType} {",
       "\t$0",
       "}"
     ],
@@ -49,7 +49,7 @@
   "Main entry point": {
     "prefix": "main",
     "body": [
-      "func Main() {",
+      "函数 Main() {",
       "\t$0",
       "}"
     ],
@@ -58,7 +58,7 @@
   "If statement": {
     "prefix": "if",
     "body": [
-      "if ${1:condition} {",
+      "如果 ${1:condition} {",
       "\t$0",
       "}"
     ],
@@ -67,9 +67,9 @@
   "If/else statement": {
     "prefix": "ife",
     "body": [
-      "if ${1:condition} {",
+      "如果 ${1:condition} {",
       "\t$2",
-      "} else {",
+      "} 否则 {",
       "\t$0",
       "}"
     ],
@@ -105,7 +105,7 @@
   "Class declaration": {
     "prefix": "class",
     "body": [
-      "type ${1:Name} class {",
+      "type ${1:Name} 类 {",
       "\t$0",
       "}"
     ],
@@ -114,7 +114,7 @@
   "Class with primary constructor": {
     "prefix": "classp",
     "body": [
-      "type ${1:Name} class(${2:params}) {",
+      "type ${1:Name} 类(${2:params}) {",
       "\t$0",
       "}"
     ],
@@ -177,7 +177,7 @@
   "Named delegate type": {
     "prefix": "delegate",
     "body": [
-      "type ${1:Name} = delegate func(${2:params}) ${3:returnType}"
+      "type ${1:Name} = delegate 函数(${2:params}) ${3:returnType}"
     ],
     "description": "Named delegate type (ADR-0059)."
   },
@@ -231,7 +231,7 @@
   "Switch expression arrow": {
     "prefix": "matchexpr",
     "body": [
-      "let ${1:result} = switch ${2:value} {",
+      "定 ${1:result} = switch ${2:value} {",
       "\tcase ${3:pattern} -> ${4:expr}",
       "\tdefault -> ${5:expr}",
       "}"
@@ -312,7 +312,7 @@
   "Ref parameter": {
     "prefix": "refparam",
     "body": [
-      "func ${1:name}(ref ${2:p} ${3:Type}) ${4:returnType} {",
+      "函数 ${1:name}(ref ${2:p} ${3:Type}) ${4:returnType} {",
       "\t$0",
       "}"
     ],
@@ -321,7 +321,7 @@
   "Out parameter": {
     "prefix": "outparam",
     "body": [
-      "func ${1:name}(out ${2:p} ${3:Type}) ${4:returnType} {",
+      "函数 ${1:name}(out ${2:p} ${3:Type}) ${4:returnType} {",
       "\t$2 = ${5:default}",
       "\t$0",
       "}"
@@ -331,7 +331,7 @@
   "Ref-aliasing local": {
     "prefix": "letref",
     "body": [
-      "let ref ${1:alias} = ${2:lvalue}"
+      "定 ref ${1:alias} = ${2:lvalue}"
     ],
     "description": "Immutable ref-aliasing local (ADR-0060 follow-up)."
   },
