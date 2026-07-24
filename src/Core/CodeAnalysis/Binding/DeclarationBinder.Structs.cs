@@ -1032,7 +1032,8 @@ internal sealed partial class DeclarationBinder
                     // Issue #1071: the effective async flag (mirrors
                     // FunctionSymbol.IsAsync below) so override / shadow matching
                     // compares the async-normalized effective return type.
-                    var methodIsAsync = methodSyntax.IsAsync || isAsyncIteratorReturnType(returnType);
+                    var methodIsAsync = methodSyntax.IsAsync
+                        || (isAsyncIteratorReturnType(returnType) && IteratorDetection.ContainsYield(methodSyntax.Body));
 
                     // Issue #2361: now that the parameter list/return type are
                     // bound, validate a data class/struct's ToString shape.
@@ -1191,7 +1192,8 @@ internal sealed partial class DeclarationBinder
                     methodSymbol.ExternalOverrideContainingType = externalOverrideContainingType;
                     methodSymbol.TypeParameters = methodTypeParameters;
                     methodSymbol.ReturnRefKind = methodReturnRefKind;
-                    methodSymbol.IsAsync = methodSyntax.IsAsync || isAsyncIteratorReturnType(returnType);
+                    methodSymbol.IsAsync = methodSyntax.IsAsync
+                        || (isAsyncIteratorReturnType(returnType) && IteratorDetection.ContainsYield(methodSyntax.Body));
                     methodSymbol.AsyncReturnsValueTask = returnTypeIsValueTask;
                     methodSymbol.IsUnsafe = methodSyntax.IsUnsafe || syntax.IsUnsafe;
 
@@ -1702,6 +1704,7 @@ internal sealed partial class DeclarationBinder
                     baseBinding,
                     eventName,
                     handlerType);
+                handlerType = MemberLookup.CanonicalizeWellKnownEventHandler(handlerType);
 
                 var eventAccessibility = resolveAccessibility(eventSyntax.AccessibilityModifier);
                 bool isFieldLike = eventSyntax.OpenBraceToken == null;
@@ -1842,7 +1845,7 @@ internal sealed partial class DeclarationBinder
                 if (eventSyntax.Accessors.Any(a => a.IsRaise))
                 {
                     var raiseParams = ImmutableArray<ParameterSymbol>.Empty;
-                    if (handlerType is FunctionTypeSymbol fnType)
+                    if (MemberLookup.TryGetDelegateFunctionTypeFromSymbol(handlerType, out var fnType))
                     {
                         var builder = ImmutableArray.CreateBuilder<ParameterSymbol>(fnType.ParameterTypes.Length);
                         for (int pi = 0; pi < fnType.ParameterTypes.Length; pi++)
@@ -2237,7 +2240,8 @@ internal sealed partial class DeclarationBinder
                     methodSymbol.StaticOwnerType = structSymbol;
                     methodSymbol.TypeParameters = methodTypeParameters;
                     methodSymbol.ReturnRefKind = methodReturnRefKind;
-                    methodSymbol.IsAsync = methodSyntax.IsAsync || isAsyncIteratorReturnType(returnType);
+                    methodSymbol.IsAsync = methodSyntax.IsAsync
+                        || (isAsyncIteratorReturnType(returnType) && IteratorDetection.ContainsYield(methodSyntax.Body));
                     methodSymbol.AsyncReturnsValueTask = returnTypeIsValueTask;
                     methodSymbol.IsUnsafe = methodSyntax.IsUnsafe || syntax.IsUnsafe;
 
@@ -2547,6 +2551,8 @@ internal sealed partial class DeclarationBinder
                     continue;
                 }
 
+                handlerType = MemberLookup.CanonicalizeWellKnownEventHandler(handlerType);
+
                 var eventAccessibility = resolveAccessibility(eventSyntax.AccessibilityModifier);
                 bool isFieldLike = eventSyntax.OpenBraceToken == null;
 
@@ -2620,7 +2626,7 @@ internal sealed partial class DeclarationBinder
                 if (eventSyntax.Accessors.Any(a => a.IsRaise))
                 {
                     var raiseParams = ImmutableArray<ParameterSymbol>.Empty;
-                    if (handlerType is FunctionTypeSymbol fnType)
+                    if (MemberLookup.TryGetDelegateFunctionTypeFromSymbol(handlerType, out var fnType))
                     {
                         var builder = ImmutableArray.CreateBuilder<ParameterSymbol>(fnType.ParameterTypes.Length);
                         for (int pi = 0; pi < fnType.ParameterTypes.Length; pi++)

@@ -24,7 +24,7 @@ using GSharp.Core.CodeAnalysis.Symbols;
 namespace GSharp.Core.CodeAnalysis.Lowering.Iterators;
 
 /// <summary>
-/// Rewrites async iterator functions (those with <c>yield</c> and returning
+/// Rewrites async iterator functions (explicitly async or containing <c>yield</c>, and returning
 /// <c>IAsyncEnumerable&lt;T&gt;</c> or <c>IAsyncEnumerator&lt;T&gt;</c>)
 /// into state-machine classes. Combines the yield-lowering of
 /// <see cref="IteratorRewriter"/> with the await-lowering of
@@ -49,7 +49,7 @@ public static class AsyncIteratorRewriter
             var function = pair.Key;
             var body = pair.Value;
 
-            if (!IsAsyncIteratorFunction(function))
+            if (!AsyncIteratorDetection.IsAsyncIteratorFunction(function, body))
             {
                 continue;
             }
@@ -66,7 +66,9 @@ public static class AsyncIteratorRewriter
 
             // Run async lowering pipeline on the body: exception handler rewrite,
             // spill, ref-hoist. This lifts awaits to statement level.
-            var exhRewritten = AsyncExceptionHandlerRewriter.Rewrite(loweredBody);
+            var exhRewritten = AsyncExceptionHandlerRewriter.Rewrite(
+                loweredBody,
+                preserveFinallyAcrossSuspension: true);
             var spilledBody = SpillSequenceSpiller.Rewrite(exhRewritten);
             var refHoisted = RefInitializationHoister.Rewrite(spilledBody);
 
@@ -102,16 +104,6 @@ public static class AsyncIteratorRewriter
         return new AsyncIteratorRewriteResult(program, plans.ToImmutable());
     }
 
-    private static bool IsAsyncIteratorFunction(FunctionSymbol function)
-        => AsyncIteratorDetection.IsAsyncIteratorFunction(function);
-
-    private static bool ContainsYield(BoundStatement statement)
-    {
-        var walker = new YieldWalker();
-        walker.Visit(statement);
-        return walker.Found;
-    }
-
     private static TypeSymbol GetAsyncIteratorElementType(TypeSymbol type)
         => AsyncIteratorDetection.GetElementType(type);
 
@@ -144,16 +136,6 @@ public static class AsyncIteratorRewriter
         }
 
         return result.ToImmutable();
-    }
-
-    private sealed class YieldWalker : BoundTreeWalker
-    {
-        public bool Found { get; private set; }
-
-        protected override void VisitYieldStatement(BoundYieldStatement node)
-        {
-            Found = true;
-        }
     }
 
     /// <summary>

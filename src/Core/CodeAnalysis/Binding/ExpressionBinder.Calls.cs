@@ -273,14 +273,12 @@ internal sealed partial class ExpressionBinder
         }
 
         var resultType = target.Type;
-        var clrType = resultType.ClrType;
         var hasNonIndexedElement = syntax.Elements.Any(e => e is not IndexedCollectionElementSyntax);
 
         // A collection initializer requires an accessible instance `Add` for the
         // bare / key:value element forms. Indexed `[k] = v` entries go through
         // the indexer-set path, which reports its own GS0226/indexability errors.
-        var hasAdd = clrType != null && MemberLookup.SafeGetMethodsIncludingSelfAndInterfaces(clrType, "Add").Count > 0;
-        if (clrType == null || (hasNonIndexedElement && !hasAdd))
+        if (hasNonIndexedElement && !HasCollectionAdd(resultType))
         {
             Diagnostics.ReportTypeNotCollectionInitializable(syntax.OpenBraceToken.Location, resultType);
             BindCollectionElementsForDiagnostics(syntax);
@@ -366,10 +364,8 @@ internal sealed partial class ExpressionBinder
             return false;
         }
 
-        var clrType = propRead.Type.ClrType;
         var hasNonIndexedElement = braced.Elements.Any(e => e is not IndexedCollectionElementSyntax);
-        var hasAdd = clrType != null && MemberLookup.SafeGetMethodsIncludingSelfAndInterfaces(clrType, "Add").Count > 0;
-        if (clrType == null || (hasNonIndexedElement && !hasAdd))
+        if (hasNonIndexedElement && !HasCollectionAdd(propRead.Type))
         {
             return false;
         }
@@ -380,6 +376,17 @@ internal sealed partial class ExpressionBinder
         statements.Add(new BoundVariableDeclaration(braced, memberLocal, propRead));
         EmitCollectionElementAddStatements(memberLocal, braced.Elements, statements);
         return true;
+    }
+
+    private static bool HasCollectionAdd(TypeSymbol type)
+    {
+        if (!TypeMemberModel.GetMethods(type, "Add", MemberQuery.Instance(MemberKinds.Method)).IsDefaultOrEmpty)
+        {
+            return true;
+        }
+
+        return type.ClrType is { } clrType
+            && MemberLookup.SafeGetMethodsIncludingSelfAndInterfaces(clrType, "Add").Count > 0;
     }
 
     /// <summary>
@@ -1327,6 +1334,19 @@ internal sealed partial class ExpressionBinder
                 // generic method's type arguments have been inferred.
                 blockedByOpenGenericParameter = true;
                 continue;
+            }
+
+            // Issue #2782: a general Delegate candidate has no Invoke shape with which to
+            // contextually bind the lambda. It can still win overload
+            // resolution, so a sibling's concrete delegate signature must not
+            // pin (and potentially erase) the lambda's natural return type.
+            var parameterFullName = parameterType.FullName;
+            if (string.Equals(parameterFullName, "System.Delegate", StringComparison.Ordinal)
+                || string.Equals(parameterFullName, "System.MulticastDelegate", StringComparison.Ordinal))
+            {
+                target = null;
+                blockedByOpenGenericParameter = false;
+                return false;
             }
 
             if (!MemberLookup.TryGetLambdaTargetFunctionType(parameterType, out var candidate) || candidate == null)
